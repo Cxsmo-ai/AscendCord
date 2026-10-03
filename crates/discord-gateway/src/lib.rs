@@ -1494,7 +1494,7 @@ async fn run_inner(
 										if let Some(friends) = ready.merged_presences.as_ref().and_then(|m| m.friends.as_deref()).or(ready.presences.as_deref()) {
 											direct_presence.friends(friends, Instant::now(), &emit)?;
 										}
-										emit(Event::Voice(client_core::voice::Event::Snapshot { partial: false, guild: None, participants }))?;
+										if !participants.is_empty() { emit(Event::Voice(client_core::voice::Event::Snapshot { partial: false, guild: None, participants }))?; }
 										ready_at = Some(Instant::now());
 									}
 									"GUILD_MEMBERS_CHUNK" => {
