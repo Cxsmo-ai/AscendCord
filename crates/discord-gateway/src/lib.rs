@@ -43,6 +43,25 @@ fn socket_failure(error: tokio_tungstenite::tungstenite::Error) -> Failure {
 	}
 }
 
+fn retain_voice_rows(
+	retained: &mut Vec<client_core::voice::RosterEntry>,
+	rows: Vec<client_core::voice::RosterEntry>,
+	calls: &mut voice::Calls,
+) {
+	for row in rows {
+		if calls.roster_count >= client_core::voice::MAX_ROSTER {
+			break;
+		}
+		let bytes = row.bytes();
+		if calls.roster_bytes.saturating_add(bytes) > client_core::voice::MAX_ROSTER_BYTES {
+			continue;
+		}
+		calls.roster_count += 1;
+		calls.roster_bytes += bytes;
+		retained.push(row);
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reconnect {
 	Resume,
@@ -1421,14 +1440,10 @@ async fn run_inner(
 										calls.remember_users(std::mem::take(&mut ready.users));
 										known_guilds=channel_events::ready_calls(&ready,&mut calls)?;
 										let mut participants = Vec::new();
-										let mut roster_bytes = 0;
 										for guild in &mut ready.guilds {
 											if guild.voice_states.is_empty() { continue; }
-											if let Event::Voice(client_core::voice::Event::Snapshot { participants: mut rows, .. }) = calls.snapshot(guild, false)? {
-												roster_bytes += rows.iter().map(client_core::voice::RosterEntry::bytes).sum::<usize>();
-												if participants.len() + rows.len() > client_core::voice::MAX_ROSTER { return Err(Failure::CapacityAt("Voice roster participant limit exceeded")); }
-												if roster_bytes > client_core::voice::MAX_ROSTER_BYTES { return Err(Failure::CapacityAt("Voice roster byte limit exceeded")); }
-												participants.append(&mut rows);
+											if let Event::Voice(client_core::voice::Event::Snapshot { participants: rows, .. }) = calls.snapshot(guild, false)? {
+												retain_voice_rows(&mut participants, rows, &mut calls);
 											}
 										}
 										let mut message_requests = Vec::new();
@@ -1479,7 +1494,7 @@ async fn run_inner(
 										if let Some(friends) = ready.merged_presences.as_ref().and_then(|m| m.friends.as_deref()).or(ready.presences.as_deref()) {
 											direct_presence.friends(friends, Instant::now(), &emit)?;
 										}
-										if !participants.is_empty() { emit(Event::Voice(client_core::voice::Event::Snapshot { partial: false, guild: None, participants }))?; }
+										emit(Event::Voice(client_core::voice::Event::Snapshot { partial: false, guild: None, participants }))?;
 										ready_at = Some(Instant::now());
 									}
 									"GUILD_MEMBERS_CHUNK" => {
@@ -1499,14 +1514,10 @@ async fn run_inner(
 
 										if extra.guilds.len() > MAX_NAV || extra.merged_members.len() > MAX_NAV { return Err(Failure::CapacityAt("Supplemental login exceeds 131,072 server groups; connection stopped")); }
 										let mut participants = Vec::new();
-										let mut roster_bytes = 0;
 										for (index, guild) in extra.guilds.iter_mut().enumerate() {
 											if let Some(members) = extra.merged_members.get_mut(index) { guild.members.append(members); }
-											if let Event::Voice(client_core::voice::Event::Snapshot { participants: mut rows, .. }) = calls.snapshot(guild, true)? {
-												roster_bytes += rows.iter().map(client_core::voice::RosterEntry::bytes).sum::<usize>();
-												if participants.len() + rows.len() > client_core::voice::MAX_ROSTER { return Err(Failure::CapacityAt("Voice roster participant limit exceeded")); }
-												if roster_bytes > client_core::voice::MAX_ROSTER_BYTES { return Err(Failure::CapacityAt("Voice roster byte limit exceeded")); }
-												participants.append(&mut rows);
+											if let Event::Voice(client_core::voice::Event::Snapshot { participants: rows, .. }) = calls.snapshot(guild, true)? {
+												retain_voice_rows(&mut participants, rows, &mut calls);
 											}
 										}
 										if !participants.is_empty() { emit(Event::Voice(client_core::voice::Event::Snapshot { partial: true, guild: None, participants }))?; }

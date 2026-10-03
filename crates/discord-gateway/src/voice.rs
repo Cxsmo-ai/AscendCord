@@ -49,6 +49,9 @@ pub(super) struct Calls {
 	// Optional metadata, retained until READY_SUPPLEMENTAL or reset within the roster budget.
 	// Overflow leaves participants using the existing user-ID fallback.
 	pub(super) users: BTreeMap<Id, User>,
+	// Bounded roster already sent for this session. Supplemental snapshots share this budget.
+	pub(super) roster_count: usize,
+	pub(super) roster_bytes: usize,
 }
 impl Calls {
 	/// The gateway socket dropped. A RESUME keeps Discord's voice state, so the joined call
@@ -70,6 +73,8 @@ impl Calls {
 		self.stream = None;
 		self.watch = None;
 		self.users.clear();
+		self.roster_count = 0;
+		self.roster_bytes = 0;
 	}
 	pub(super) fn invalidate(&mut self, channel: Id) {
 		self.allowed.remove(&channel);
@@ -97,7 +102,7 @@ impl Calls {
 	}
 	pub(super) fn remember_users(&mut self, users: Vec<UserDto>) {
 		self.users.clear();
-		let mut bytes = 0;
+		let mut bytes: usize = 0;
 		for user in users {
 			if self.users.len() == voice::MAX_ROSTER {
 				break;
@@ -151,7 +156,7 @@ impl Calls {
 	pub(super) fn snapshot(&self, guild: &mut GuildDto, partial: bool) -> Result<Event, Failure> {
 		let members = self.members(std::mem::take(&mut guild.members));
 		let mut participants = Vec::new();
-		let mut bytes = 0;
+		let mut bytes: usize = 0;
 		for mut state in std::mem::take(&mut guild.voice_states) {
 			let _secret = state.session_id.take().map(Zeroizing::new);
 			let Some(channel) = state.channel_id else {
@@ -161,9 +166,7 @@ impl Calls {
 				continue;
 			}
 			if participants.len() == voice::MAX_ROSTER {
-				return Err(Failure::CapacityAt(
-					"Voice roster participant limit exceeded",
-				));
+				break;
 			}
 			let participant = participant(&state);
 			let member = state
@@ -176,10 +179,11 @@ impl Calls {
 				participant,
 				member,
 			};
-			bytes += entry.bytes();
-			if bytes > voice::MAX_ROSTER_BYTES {
-				return Err(Failure::CapacityAt("Voice roster byte limit exceeded"));
+			let entry_bytes = entry.bytes();
+			if bytes.saturating_add(entry_bytes) > voice::MAX_ROSTER_BYTES {
+				continue;
 			}
+			bytes += entry_bytes;
 			participants.push(entry);
 		}
 		Ok(Event::Voice(voice::Event::Snapshot {
@@ -1306,12 +1310,15 @@ mod tests {
 		guild.voice_states = (0..=voice::MAX_ROSTER)
 			.map(|_| decode(br#"{"channel_id":"20","user_id":"2"}"#).unwrap())
 			.collect();
-		assert!(matches!(
-			calls.snapshot(&mut guild, false),
-			Err(Failure::CapacityAt(
-				"Voice roster participant limit exceeded"
-			))
-		));
+		let Event::Voice(voice::Event::Snapshot { participants, .. }) =
+			calls.snapshot(&mut guild, false).unwrap()
+		else {
+			panic!("voice snapshot");
+		};
+		assert_eq!(participants.len(), voice::MAX_ROSTER);
+		assert!(
+			participants.iter().map(RosterEntry::bytes).sum::<usize>() <= voice::MAX_ROSTER_BYTES
+		);
 	}
 
 	#[test]

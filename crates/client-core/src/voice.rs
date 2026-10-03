@@ -769,8 +769,8 @@ impl ClientState {
 				+ entry.bytes()
 				> MAX_ROSTER_BYTES
 		{
-			self.disconnect_voice("Voice roster exceeds safe capacity; reconnect to refresh");
-			self.status = "Voice roster exceeds safe capacity; reconnect to refresh";
+			// Voice roster rows are optional UI data. Keep the current bounded roster and
+			// discard overflow instead of letting an oversized account block authentication.
 			return false;
 		}
 		self.voice.roster.push(entry);
@@ -1022,7 +1022,7 @@ mod tests {
 			participants: vec![oversized],
 		});
 		assert!(state.voice.roster.is_empty());
-		assert!(state.status.contains("capacity"));
+		assert!(!state.status.contains("capacity"));
 		state.apply_voice(Event::Snapshot {
 			guild: None,
 			partial: false,
