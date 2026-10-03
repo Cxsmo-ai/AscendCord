@@ -2112,7 +2112,10 @@ mod tests {
                         assert_eq!(value["d"], json!({"since":null,"status":"dnd","afk":false,"activities":activities}));
                         let now = Instant::now();
                         if let Some(previous) = previous {
-                            assert!(now.duration_since(previous) >= Duration::from_millis(4900));
+                            // Updates are throttled to one per 5 s (exact timing is covered by the
+                            // unit tests in activity.rs). Measured here on arrival, so allow for a
+                            // busy test runner reading one packet late; a burst would be ~0 s.
+                            assert!(now.duration_since(previous) >= Duration::from_secs(4));
                         }
                         previous = Some(now);
                         match name {
