@@ -48,7 +48,7 @@ optdepends=(
   'gst-plugins-bad: hardware screen-share encoding'
   'gst-libav: inline video playback'
 )
-options=('!lto')
+options=('!lto' '!debug')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
@@ -62,6 +62,10 @@ build() {
   cd "AscendCord-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
+  # The release profile's fat LTO in one codegen unit needs a lot of memory for a source
+  # build; thin LTO keeps nearly all of the speed and fits ordinary machines.
+  export CARGO_PROFILE_RELEASE_LTO=thin
+  export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
   cargo build --frozen --release -p ascendcord --bin ascendcord
 }
 
@@ -69,6 +73,8 @@ check() {
   cd "AscendCord-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
+  export CARGO_PROFILE_RELEASE_LTO=thin
+  export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
   cargo test --frozen --release -p local-store -p model
 }
 

@@ -132,6 +132,8 @@ struct ResumeState {
 #[derive(Default)]
 struct Heartbeat {
 	awaiting_since: Option<Instant>,
+	/// One look at already-received frames was spent on the current overdue heartbeat.
+	grace_used: bool,
 }
 impl Heartbeat {
 	fn tick(&mut self, now: Instant, interval: Duration) -> Result<(), Failure> {
@@ -149,6 +151,13 @@ impl Heartbeat {
 	}
 	fn ack(&mut self) {
 		self.awaiting_since = None;
+		self.grace_used = false;
+	}
+	/// An overdue heartbeat gets one chance to be answered by frames that already arrived
+	/// (a busy or stalled client may not have read them yet) before the connection counts
+	/// as silent. Returns whether that chance is still available.
+	fn take_grace(&mut self) -> bool {
+		!std::mem::replace(&mut self.grace_used, true)
 	}
 }
 fn next_attempt(attempt: u32, ready_for: Option<Duration>) -> u32 {
@@ -1097,6 +1106,8 @@ async fn run_inner(
 			continue;
 		}
 		let mut heartbeat = Heartbeat::default();
+		// A frame read early by the heartbeat check, handled by the frame branch next.
+		let mut buffered = None;
 		let interval = Duration::from_millis(hello.heartbeat_interval);
 		let mut timer = interval_at(
 			Instant::now() + Duration::from_millis(jitter_ms(hello.heartbeat_interval)),
@@ -1331,11 +1342,26 @@ async fn run_inner(
 				}
 				_ = tokio::time::sleep_until(ready_deadline), if ready_at.is_none() => break,
 				_ = timer.tick() => {
-					if heartbeat.tick(Instant::now(), interval).is_err() { break; }
+					if heartbeat.tick(Instant::now(), interval).is_err() {
+						// The ACK, or a close, may be waiting behind this timer: handle it before
+						// deciding the connection went silent.
+						if heartbeat.take_grace()
+							&& let Some(frame) = futures_util::FutureExt::now_or_never(socket.next())
+						{
+							buffered = Some(frame);
+							continue;
+						}
+						break;
+					}
 					let packet = serde_json::json!({"op":1,"d":state.sequence}).to_string();
 					if !matches!(timeout(Duration::from_secs(5), socket.send(Frame::Text(packet.into()))).await, Ok(Ok(()))) { break; }
 				}
-				frame = socket.next() => {
+				frame = async {
+					match buffered.take() {
+						Some(frame) => frame,
+						None => socket.next().await,
+					}
+				} => {
 					let frame = match frame {
 						Some(Ok(frame)) => match compression.frame(frame)? {
 							Some(frame) => Some(Ok(frame)),
@@ -1821,6 +1847,89 @@ mod tests {
 		tungstenite::protocol::{CloseFrame, frame::coding::CloseCode},
 	};
 
+	/// Close a synthetic gateway with `code` and keep reading until the client has seen it,
+	/// so the close cannot reach the client as a dropped connection instead.
+	pub(super) async fn close_gateway(socket: &mut WebSocketStream<TcpStream>, code: u16) {
+		socket
+			.close(Some(CloseFrame {
+				code: CloseCode::Library(code),
+				reason: "synthetic stop".into(),
+			}))
+			.await
+			.unwrap();
+		// Heartbeats may still be in flight; anything read here is ignored.
+		let drained = timeout(Duration::from_secs(5), async {
+			while let Some(Ok(_)) = socket.next().await {}
+		})
+		.await;
+		assert!(
+			drained.is_ok(),
+			"the client did not finish the close handshake"
+		);
+	}
+	/// The client's only thread is held up right as the server closes with 4004, so when it
+	/// runs again its heartbeat is overdue and the close frame is already waiting. The close
+	/// must win: an expired session, not a reconnect to a supposedly silent connection.
+	#[test]
+	fn a_waiting_close_beats_an_overdue_heartbeat() {
+		for _ in 0..4 {
+			let server = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.unwrap();
+			let listener = server.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+			let endpoint = format!("ws://{}/", listener.local_addr().unwrap());
+			let (stall, stalled) = tokio::sync::oneshot::channel::<()>();
+			let client = std::thread::spawn(move || {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.unwrap();
+				runtime.block_on(async move {
+					// Occupies the client's only thread, like a starved CI runner.
+					tokio::spawn(async move {
+						if stalled.await.is_ok() {
+							std::thread::sleep(Duration::from_millis(1600));
+						}
+					});
+					let (_controls, receive) = mpsc::channel(8);
+					timeout(
+						Duration::from_secs(20),
+						run_inner(
+							Arc::new(
+								SessionSecret::from_owner_input("synthetic-owner-session".into())
+									.unwrap(),
+							),
+							"wss://gateway.discord.gg/".into(),
+							watch::channel(None).1,
+							receive,
+							None,
+							|_| Ok(()),
+							Some(&endpoint),
+						),
+					)
+					.await
+				})
+			});
+			server.block_on(async {
+				let (stream, _) = listener.accept().await.unwrap();
+				let mut socket = accept_async(stream).await.unwrap();
+				send(
+					&mut socket,
+					json!({"op":10,"d":{"heartbeat_interval":1000}}),
+				)
+				.await;
+				assert_eq!(packet(&mut socket).await["op"], 2);
+				send(&mut socket, ready(1, "synthetic-main-session")).await;
+				// The first heartbeat stays unanswered.
+				while packet(&mut socket).await["op"] != 1 {}
+				stall.send(()).unwrap();
+				tokio::time::sleep(Duration::from_millis(200)).await;
+				close_gateway(&mut socket, 4004).await;
+			});
+			assert_eq!(client.join().unwrap(), Ok(Err(Failure::Expired)));
+		}
+	}
 	async fn packet(socket: &mut WebSocketStream<TcpStream>) -> Value {
 		let frame = timeout(Duration::from_secs(5), socket.next())
 			.await
@@ -2537,7 +2646,7 @@ mod tests {
 						}
 					}
 				}
-				socket.close(Some(CloseFrame { code: CloseCode::Library(4004), reason: "synthetic stop".into() })).await.unwrap();
+				close_gateway(&mut socket, 4004).await;
 			};
 			let client = run_inner(
 				Arc::new(SessionSecret::from_owner_input("synthetic-owner-session".into()).unwrap()),
@@ -2587,7 +2696,7 @@ mod tests {
                         send(&mut socket,json!({"op":0,"t":"VOICE_SERVER_UPDATE","s":3,"d":{"guild_id":null,"channel_id":"2","token":"synthetic-call-token","endpoint":"voice.discord.media:443"}})).await;
                     } else {assert!(p["d"]["channel_id"].is_null());break;}
                 }
-                socket.close(Some(CloseFrame{code:CloseCode::Library(4004),reason:"synthetic stop".into()})).await.unwrap();
+                close_gateway(&mut socket, 4004).await;
             };
             let client=run_inner(Arc::new(SessionSecret::from_owner_input("synthetic-owner-session".into()).unwrap()),"wss://gateway.discord.gg/".into(),watch::channel(None).1,receive,None,|event| {
                 match event {
@@ -2616,6 +2725,11 @@ mod tests {
 		assert!(heartbeat.tick(now + interval, interval).is_err());
 		heartbeat.ack();
 		assert!(heartbeat.tick(now + interval, interval).is_ok());
+		// One look at buffered frames per overdue heartbeat; an ACK renews it.
+		assert!(heartbeat.take_grace());
+		assert!(!heartbeat.take_grace());
+		heartbeat.ack();
+		assert!(heartbeat.take_grace());
 		assert_eq!(next_attempt(5, Some(Duration::from_secs(1))), 6);
 		assert_eq!(next_attempt(5, Some(Duration::from_secs(60))), 1);
 		assert_eq!(next_attempt(5, None), 6);
@@ -3224,11 +3338,9 @@ mod member_tests {
 	}
 	#[tokio::test]
 	async fn visible_member_subscription_uses_local_socket_and_unsubscribes() {
+		use super::tests::close_gateway;
 		use tokio::net::TcpListener;
-		use tokio_tungstenite::{
-			accept_async,
-			tungstenite::protocol::{CloseFrame, frame::coding::CloseCode},
-		};
+		use tokio_tungstenite::accept_async;
 		timeout(Duration::from_secs(30), async {
             let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint=format!("ws://{}/",listener.local_addr().unwrap());
             let (selection,receive)=watch::channel(Some(MemberSubscription {thread:false,guild:Id(1),channel:Id(2),request:7,list_id:"everyone".into(),
@@ -3280,7 +3392,7 @@ mod member_tests {
                         socket.send(Frame::Text(json!({"op":0,"t":"GUILD_MEMBER_LIST_UPDATE","s":7,"d":{"guild_id":"1","id":"everyone","member_count":150,"ops":[{"op":"SYNC","range":[100,199],"items":[{"member":{"user":{"id":"9","username":"Later"}}}]}]}}).to_string().into())).await.unwrap();
                     } else {panic!("unexpected member subscription after the scrolled range");}
                 }
-                socket.close(Some(CloseFrame{code:CloseCode::Library(4004),reason:"synthetic stop".into()})).await.unwrap();
+                close_gateway(&mut socket, 4004).await;
             };
             let client=run_inner(Arc::new(SessionSecret::from_owner_input("synthetic-owner-session".into()).unwrap()),"wss://gateway.discord.gg/".into(),receive,mpsc::channel(1).1,None,|event| {
                 if let Event::Members(list)=&event {
