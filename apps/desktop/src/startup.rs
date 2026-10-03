@@ -98,6 +98,21 @@ impl Startup {
 	}
 }
 
+/// Text for `--version` or `--help`; these print and exit without opening a window.
+pub fn info_flag(mut args: impl Iterator<Item = String>) -> Option<String> {
+	let version = format!("AscendCord {}", env!("CARGO_PKG_VERSION"));
+	args.find_map(|arg| match arg.as_str() {
+		"--version" | "-V" => Some(version.clone()),
+		"--help" | "-h" => Some(format!(
+			"{version}\n\nUsage: ascendcord [--start-minimized]\n\n  \
+			 --start-minimized  Start in the tray (with --autostart)\n  \
+			 -V, --version      Print the version and exit\n  \
+			 -h, --help         Print this help and exit"
+		)),
+		_ => None,
+	})
+}
+
 pub fn minimized_launch(demo: bool, args: impl Iterator<Item = String>) -> bool {
 	let mut autostart = false;
 	let mut minimized = false;
@@ -111,6 +126,23 @@ pub fn minimized_launch(demo: bool, args: impl Iterator<Item = String>) -> bool 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn version_and_help_flags_exit_before_the_window() {
+		let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+		let version = info_flag(args(&["--version"]).into_iter()).unwrap();
+		assert_eq!(version, format!("AscendCord {}", env!("CARGO_PKG_VERSION")));
+		assert_eq!(info_flag(args(&["-V"]).into_iter()), Some(version.clone()));
+		assert!(
+			info_flag(args(&["--help"]).into_iter())
+				.unwrap()
+				.contains("--version")
+		);
+		assert_eq!(
+			info_flag(args(&["--autostart", "--start-minimized"]).into_iter()),
+			None
+		);
+		assert_eq!(info_flag(args(&[]).into_iter()), None);
+	}
 	#[test]
 	fn startup_completion_rolls_back_errors_and_only_autostart_can_minimize() {
 		let mut startup = Startup::default();

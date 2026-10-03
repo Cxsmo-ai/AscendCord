@@ -75,6 +75,11 @@ const SIGN_IN_HEADER_HEIGHT: f32 = if cfg!(target_os = "windows") {
 };
 
 fn main() -> eframe::Result {
+	if let Some(text) = startup::info_flag(std::env::args().skip(1)) {
+		platform::startup::attach_parent_console();
+		println!("{text}");
+		return Ok(());
+	}
 	#[cfg(all(debug_assertions, feature = "demo"))]
 	if std::env::args().any(|arg| arg == "--demo")
 		&& std::env::args().any(|arg| arg == "--demo-check-spotify")

@@ -64,7 +64,8 @@ jobs:
           done
           pacman -U --noconfirm "$package"
           ldd /usr/bin/ascendcord | grep 'not found' && exit 1 || true
-          timeout 10 ascendcord --version || true
+          installed=$(pacman -Q ascendcord | cut -d' ' -f2 | cut -d- -f1)
+          test "$(timeout 10 ascendcord --version)" = "AscendCord $installed"
           cp "$package" .SRCINFO "$GITHUB_WORKSPACE/"
 
       - uses: actions/upload-artifact@v4

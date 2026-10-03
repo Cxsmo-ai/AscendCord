@@ -42,6 +42,7 @@ jobs:
           sudo -u builder makepkg --syncdeps --noconfirm --cleanbuild
           pacman -U --noconfirm ascendcord-*.pkg.tar.zst
           if ldd /usr/bin/ascendcord | grep 'not found'; then exit 1; fi
+          test "$(timeout 10 ascendcord --version)" = "AscendCord ${GITHUB_REF_NAME#v}"
           mkdir -p "$GITHUB_WORKSPACE/arch-out"
           cp ascendcord-*.pkg.tar.zst PKGBUILD "$GITHUB_WORKSPACE/arch-out/"
 

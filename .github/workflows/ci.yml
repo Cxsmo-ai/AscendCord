@@ -30,3 +30,13 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace --locked
+
+      - name: Version flag exits without opening a window
+        shell: pwsh
+        run: |
+          cargo build -p ascendcord --locked
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          $job = Start-Job { & "$using:PWD\target\debug\ascendcord.exe" --version | Out-String }
+          if (-not (Wait-Job $job -Timeout 30)) { throw "ascendcord --version did not exit" }
+          $out = (Receive-Job $job).Trim()
+          if ($out -ne "AscendCord $version") { throw "unexpected output: '$out'" }

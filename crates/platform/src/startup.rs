@@ -11,6 +11,25 @@ pub const fn available() -> bool {
 	cfg!(any(target_os = "windows", target_os = "macos"))
 }
 
+/// Lets `--version`/`--help` output reach the terminal that started the app. Windows builds
+/// use the GUI subsystem, which has no console of its own; elsewhere this does nothing.
+#[allow(unsafe_code)]
+pub fn attach_parent_console() {
+	#[cfg(target_os = "windows")]
+	{
+		const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+		#[link(name = "kernel32")]
+		unsafe extern "system" {
+			fn AttachConsole(process: u32) -> i32;
+		}
+		// SAFETY: AttachConsole takes no pointers; failure (no parent console, or output
+		// already redirected) leaves the process unchanged.
+		unsafe {
+			AttachConsole(ATTACH_PARENT_PROCESS);
+		}
+	}
+}
+
 #[cfg(target_os = "windows")]
 pub use native::{load, save};
 
