@@ -13,19 +13,24 @@ pub const fn available() -> bool {
 
 /// Lets `--version`/`--help` output reach the terminal that started the app. Windows builds
 /// use the GUI subsystem, which has no console of its own; elsewhere this does nothing.
+/// Output that is already piped or redirected is left alone.
 #[allow(unsafe_code)]
 pub fn attach_parent_console() {
 	#[cfg(target_os = "windows")]
 	{
 		const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+		const STD_OUTPUT_HANDLE: u32 = -11_i32 as u32;
 		#[link(name = "kernel32")]
 		unsafe extern "system" {
+			fn GetStdHandle(handle: u32) -> isize;
 			fn AttachConsole(process: u32) -> i32;
 		}
-		// SAFETY: AttachConsole takes no pointers; failure (no parent console, or output
-		// already redirected) leaves the process unchanged.
+		// SAFETY: neither call takes pointers. The handle is only compared, never used or
+		// closed; AttachConsole failing (no parent console) leaves the process unchanged.
 		unsafe {
-			AttachConsole(ATTACH_PARENT_PROCESS);
+			if matches!(GetStdHandle(STD_OUTPUT_HANDLE), 0 | -1) {
+				AttachConsole(ATTACH_PARENT_PROCESS);
+			}
 		}
 	}
 }

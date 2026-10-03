@@ -76,8 +76,15 @@ const SIGN_IN_HEADER_HEIGHT: f32 = if cfg!(target_os = "windows") {
 
 fn main() -> eframe::Result {
 	if let Some(text) = startup::info_flag(std::env::args().skip(1)) {
+		use std::io::Write;
 		platform::startup::attach_parent_console();
-		println!("{text}");
+		let mut stdout = std::io::stdout().lock();
+		if writeln!(stdout, "{text}")
+			.and_then(|()| stdout.flush())
+			.is_err()
+		{
+			std::process::exit(1);
+		}
 		return Ok(());
 	}
 	#[cfg(all(debug_assertions, feature = "demo"))]
