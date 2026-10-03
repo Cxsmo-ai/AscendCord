@@ -1,0 +1,70 @@
+name: Arch package
+
+# Builds packaging/aur/PKGBUILD with makepkg inside the official Arch Linux image, from a
+# source archive of the checked-out commit, and keeps the package as a build artifact.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - packaging/aur/**
+      - packaging/linux/**
+
+permissions:
+  contents: read
+
+jobs:
+  makepkg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container: archlinux:base-devel
+    steps:
+      - name: Prepare the build user
+        run: |
+          pacman -Syu --noconfirm --needed git
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+
+      - uses: actions/checkout@v4
+
+      - name: Source archive and PKGBUILD for this commit
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          mkdir -p /home/builder/pkg
+          git archive --format=tar.gz --prefix="AscendCord-$version/" \
+            -o "/home/builder/pkg/ascendcord-$version.tar.gz" HEAD
+          sum=$(sha256sum "/home/builder/pkg/ascendcord-$version.tar.gz" | cut -d' ' -f1)
+          sed -e "s/^pkgver=.*/pkgver=$version/" \
+              -e "s|^source=.*|source=(\"\$pkgname-\$pkgver.tar.gz\")|" \
+              -e "s/^sha256sums=.*/sha256sums=('$sum')/" \
+              packaging/aur/PKGBUILD > /home/builder/pkg/PKGBUILD
+          chown -R builder:builder /home/builder/pkg
+
+      - name: makepkg
+        run: |
+          cd /home/builder/pkg
+          sudo -u builder makepkg --syncdeps --noconfirm --cleanbuild
+          sudo -u builder makepkg --printsrcinfo > .SRCINFO
+
+      - name: Check the package
+        run: |
+          cd /home/builder/pkg
+          package=$(ls ascendcord-*.pkg.tar.zst)
+          bsdtar -tf "$package" | sort > contents.txt
+          for path in usr/bin/ascendcord \
+                      usr/share/applications/org.ascendcord.AscendCord.desktop \
+                      usr/share/icons/hicolor/256x256/apps/ascendcord.png \
+                      usr/share/licenses/ascendcord/LICENSE-MIT; do
+            grep -qx "$path" contents.txt || { echo "missing $path"; exit 1; }
+          done
+          pacman -U --noconfirm "$package"
+          ldd /usr/bin/ascendcord | grep 'not found' && exit 1 || true
+          timeout 10 ascendcord --version || true
+          cp "$package" .SRCINFO "$GITHUB_WORKSPACE/"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: |
+            ascendcord-*.pkg.tar.zst
+            .SRCINFO

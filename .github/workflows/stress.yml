@@ -1,0 +1,38 @@
+name: Gateway stress
+
+# Manual check for timing-sensitive tests: runs the gateway test suite many times in the
+# same environment as releases (Windows, release profile).
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Number of full test passes
+        default: "100"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the gateway tests
+        run: cargo test --locked --release -p discord-gateway --lib --no-run
+      - name: Run them repeatedly
+        shell: pwsh
+        run: |
+          $failures = 0
+          for ($run = 1; $run -le [int]"${{ inputs.runs }}"; $run++) {
+            $output = cargo test --locked --release -p discord-gateway --lib -- --test-threads 32 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+              $failures++
+              $failed = ($output -split "`n" | Where-Object { $_ -match '^\s{4}[a-z_:]+$' }) -join ' '
+              Write-Output "run $run failed: $failed"
+            }
+          }
+          Write-Output "RESULT: $failures of ${{ inputs.runs }} runs failed"
+          if ($failures -gt 0) { exit 1 }
