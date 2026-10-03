@@ -31,11 +31,13 @@ if ($env:GITHUB_REPOSITORY) {
         -replace '(?m)^pkgver=.*$', "pkgver=$version" `
         -replace "sha256sums=\('SKIP'\)", "sha256sums=('$sum')"
     if ($pkgbuild -match "'SKIP'") { throw 'The release PKGBUILD still skips checksum verification' }
+    $pkgbuild = $pkgbuild -replace "`r`n", "`n"
     [IO.File]::WriteAllText((Join-Path $out 'PKGBUILD'), $pkgbuild, [Text.UTF8Encoding]::new($false))
 }
 
 $lines = Get-ChildItem $out -File | Sort-Object Name | ForEach-Object {
     "$((Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant())  $($_.Name)"
 }
-[IO.File]::WriteAllLines((Join-Path $out 'SHA256SUMS.txt'), [string[]]$lines, [Text.UTF8Encoding]::new($false))
+# LF line endings so `sha256sum -c` works on Linux too.
+[IO.File]::WriteAllText((Join-Path $out 'SHA256SUMS.txt'), (($lines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
 Get-ChildItem $out | Format-Table Name, Length
