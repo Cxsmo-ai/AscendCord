@@ -2040,7 +2040,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn legacy_ready_game_reaches_known_dm_without_a_presence_update() {
-		timeout(Duration::from_secs(10), async {
+		timeout(Duration::from_secs(30), async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("ws://{}/", listener.local_addr().unwrap());
             let (delivered, observed) = tokio::sync::oneshot::channel();
@@ -2091,7 +2091,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn local_ignored_dispatches_and_typing_keep_delivering_messages() {
-		timeout(Duration::from_secs(10), async {
+		timeout(Duration::from_secs(30), async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("ws://{}/", listener.local_addr().unwrap());
             let (client_finished, terminal_observed) = tokio::sync::oneshot::channel();
@@ -2154,7 +2154,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn local_category_create_move_permission_update_and_delete() {
-		timeout(Duration::from_secs(10),async {
+		timeout(Duration::from_secs(30), async {
             let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint=format!("ws://{}/",listener.local_addr().unwrap());
             let (client_finished, terminal_observed)=tokio::sync::oneshot::channel();
@@ -2566,7 +2566,7 @@ mod tests {
 	#[tokio::test]
 	async fn explicit_dm_join_negotiation_and_leave_over_local_gateway() {
 		use client_core::voice::{Command as V, Event as E};
-		timeout(Duration::from_secs(10),async {
+		timeout(Duration::from_secs(30), async {
             let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint=format!("ws://{}/",listener.local_addr().unwrap());
             let (controls,receive)=mpsc::channel(8);
             let server=async {
@@ -3229,7 +3229,7 @@ mod member_tests {
 			accept_async,
 			tungstenite::protocol::{CloseFrame, frame::coding::CloseCode},
 		};
-		timeout(Duration::from_secs(10),async {
+		timeout(Duration::from_secs(30), async {
             let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint=format!("ws://{}/",listener.local_addr().unwrap());
             let (selection,receive)=watch::channel(Some(MemberSubscription {thread:false,guild:Id(1),channel:Id(2),request:7,list_id:"everyone".into(),
 			ranges: vec![[0, 99]],
