@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=AscendCord
+GenericName=Internet Messenger
+Comment=Native Rust Discord client with TestCord plugin ports
+Exec=ascendcord %U
+Icon=ascendcord
+StartupWMClass=org.ascendcord.AscendCord
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=discord;testcord;chat;ascendcord;
+MimeType=x-scheme-handler/discord;

@@ -1,0 +1,6 @@
+/target/
+/dist/
+/.build-check/
+.DS_Store
+node_modules/
+__pycache__/

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/Cxsmo-ai/AscendCord/discussions
+    about: Ask questions and share ideas in GitHub Discussions.
+  - name: Documentation
+    url: https://github.com/Cxsmo-ai/AscendCord#readme
+    about: Read the README and the guides in docs/.

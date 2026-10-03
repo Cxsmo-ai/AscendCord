@@ -1,0 +1,86 @@
+# Maintainer: Cxsmo-ai
+#
+# Builds AscendCord from the tagged source release. Every GitHub release attaches this
+# PKGBUILD with `pkgver` and the source checksum filled in; use that copy (or run
+# `updpkgsums`) rather than building with the placeholder below. For the AUR, regenerate
+# .SRCINFO with `makepkg --printsrcinfo > .SRCINFO`.
+
+pkgname=ascendcord
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Native Discord desktop client written in Rust'
+arch=('x86_64' 'aarch64')
+url='https://github.com/Cxsmo-ai/AscendCord'
+license=('MIT' 'Apache-2.0')
+depends=(
+  'alsa-lib'
+  'at-spi2-core'
+  'cairo'
+  'dbus'
+  'gcc-libs'
+  'gdk-pixbuf2'
+  'glib2'
+  'glibc'
+  'gst-plugins-base'
+  'gst-plugins-base-libs'
+  'gst-plugins-good'
+  'gst-plugin-pipewire'
+  'gstreamer'
+  'gtk3'
+  'libglvnd'
+  'libpulse'
+  'libsoup3'
+  'libx11'
+  'libxcursor'
+  'libxi'
+  'libxkbcommon'
+  'libxkbcommon-x11'
+  'libxrandr'
+  'pango'
+  'vulkan-icd-loader'
+  'wayland'
+  'webkit2gtk-4.1'
+  'xdg-desktop-portal'
+)
+makedepends=('cargo' 'clang' 'cmake' 'pkgconf')
+optdepends=(
+  'gnome-keyring: store the sign-in session (or any Secret Service provider)'
+  'gst-plugins-bad: hardware screen-share encoding'
+  'gst-libav: inline video playback'
+)
+options=('!lto')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "AscendCord-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "AscendCord-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p ascendcord --bin ascendcord
+}
+
+check() {
+  cd "AscendCord-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release -p local-store -p model
+}
+
+package() {
+  cd "AscendCord-$pkgver"
+  install -Dm755 target/release/ascendcord "$pkgdir/usr/bin/ascendcord"
+  install -Dm644 packaging/linux/org.ascendcord.AscendCord.desktop \
+    "$pkgdir/usr/share/applications/org.ascendcord.AscendCord.desktop"
+  for icon in packaging/linux/hicolor/*/apps/ascendcord.png; do
+    size="${icon#packaging/linux/hicolor/}"
+    install -Dm644 "$icon" "$pkgdir/usr/share/icons/hicolor/$size"
+  done
+  install -Dm644 LICENSE-MIT LICENSE-APACHE -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 README.md THIRD_PARTY_NOTICES.md -t "$pkgdir/usr/share/doc/$pkgname/"
+}

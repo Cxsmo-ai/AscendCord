@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows release
+    runs-on: windows-2025
+    timeout-minutes: 150
+    env:
+      # Builds published here update themselves from this repository's releases.
+      ASCENDCORD_RELEASE_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches the crate version
+        shell: pwsh
+        run: ./scripts/release/check-version.ps1 -Tag "${{ github.ref_name }}"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\Program Files (x86)\NSIS\makensis.exe')) {
+            choco install nsis -y --no-progress
+          }
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Build and package
+        run: cargo xtask package
+
+      - name: Collect release assets
+        shell: pwsh
+        run: ./scripts/release/assemble-windows.ps1 -Tag "${{ github.ref_name }}"
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $notes = "docs/releases/$tag.md"
+          $arguments = @('release', 'create', $tag, '--draft', '--verify-tag', '--title', "AscendCord $tag")
+          if (Test-Path $notes) { $arguments += @('--notes-file', $notes) } else { $arguments += '--generate-notes' }
+          if ($tag -match '-') { $arguments += '--prerelease' }
+          $assets = Get-ChildItem release-assets -File | ForEach-Object FullName
+          gh @arguments @assets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Every asset is attached before the release becomes visible.
+          gh release edit $tag --draft=false

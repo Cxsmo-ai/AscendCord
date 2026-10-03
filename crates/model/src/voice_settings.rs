@@ -1,0 +1,187 @@
+//! Device-local microphone processing. Profiles leave the user's custom settings intact.
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputProfile {
+	VoiceIsolation,
+	#[default]
+	Studio,
+	Custom,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoiseSuppression {
+	Off,
+	#[default]
+	RnNoise,
+	WebRtc,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpusApplication {
+	Voip,
+	#[default]
+	Audio,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpusSignal {
+	Auto,
+	Voice,
+	#[default]
+	Music,
+}
+
+/// User-facing Opus controls mirrored from Acheron's voice settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpusSettings {
+	pub application: OpusApplication,
+	/// Target bitrate, in bits per second (8,000–510,000).
+	pub bitrate: u32,
+	/// Encoder complexity (0–10).
+	pub complexity: u8,
+	pub signal: OpusSignal,
+	pub fec: bool,
+	/// Expected packet loss percentage (0–100).
+	pub packet_loss_percent: u8,
+	/// Variable bitrate. Off (the default) locks every 20 ms packet to the target bitrate;
+	/// at 510 kb/s that is the 1,275-byte Opus maximum, so quality never dips on hard passages.
+	pub vbr: bool,
+}
+
+impl Default for OpusSettings {
+	fn default() -> Self {
+		Self {
+			application: OpusApplication::Audio,
+			bitrate: 510_000,
+			complexity: 10,
+			signal: OpusSignal::Music,
+			fec: false,
+			packet_loss_percent: 0,
+			vbr: false,
+		}
+	}
+}
+
+impl OpusSettings {
+	pub fn normalized(mut self) -> Self {
+		self.bitrate = self.bitrate.clamp(8_000, 510_000);
+		self.complexity = self.complexity.min(10);
+		self.packet_loss_percent = self.packet_loss_percent.min(100);
+		self
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Processing {
+	pub suppression: NoiseSuppression,
+	/// WebRTC suppression strength, from low (0) through very high (3).
+	pub suppression_level: u8,
+	pub echo_cancellation: bool,
+	pub automatic_gain: bool,
+	/// None is an open microphone; otherwise a dBFS threshold with a short release hold.
+	pub sensitivity_db: Option<i16>,
+}
+impl Default for Processing {
+	fn default() -> Self {
+		Self {
+			suppression: NoiseSuppression::Off,
+			suppression_level: 0,
+			echo_cancellation: false,
+			automatic_gain: false,
+			sensitivity_db: None,
+		}
+	}
+}
+impl Processing {
+	pub fn is_valid(self) -> bool {
+		self.suppression_level <= 3 && self.sensitivity_db.is_none_or(|db| (-80..=0).contains(&db))
+	}
+	pub fn studio() -> Self {
+		Self {
+			suppression: NoiseSuppression::Off,
+			suppression_level: 0,
+			echo_cancellation: false,
+			automatic_gain: false,
+			sensitivity_db: None,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceProcessing {
+	/// Optional per-channel RNNoise stage, matching Acheron's processing switch.
+	pub noise_suppression: bool,
+	pub profile: InputProfile,
+	pub custom: Processing,
+	/// The Acheron-style RNNoise probability gate. When disabled, the raw RMS
+	/// threshold below controls whether captured audio is sent.
+	pub use_rnnoise_vad: bool,
+	/// Stream continuous stereo audio without speech gating or RNNoise processing.
+	/// This is intended for music and line-level sources rather than open-room mics.
+	pub always_transmit: bool,
+	/// Acheron's signed-16-bit PCM RMS threshold (0–2,000).
+	pub vad_threshold_rms: u16,
+	/// Runtime Opus encoder controls; transport remains the existing Discord DAVE/AEAD path.
+	pub opus: OpusSettings,
+}
+
+impl Default for VoiceProcessing {
+	fn default() -> Self {
+		Self {
+			noise_suppression: false,
+			profile: InputProfile::Studio,
+			custom: Processing::default(),
+			use_rnnoise_vad: false,
+			always_transmit: true,
+			vad_threshold_rms: 0,
+			opus: OpusSettings::default(),
+		}
+	}
+}
+impl VoiceProcessing {
+	pub fn effective(self) -> Processing {
+		match self.profile {
+			InputProfile::VoiceIsolation => Processing::default(),
+			InputProfile::Studio => Processing::studio(),
+			InputProfile::Custom => self.custom,
+		}
+	}
+	pub fn from_legacy(noise_suppression: bool) -> Self {
+		Self {
+			noise_suppression,
+			profile: InputProfile::Custom,
+			custom: Processing {
+				suppression: if noise_suppression {
+					NoiseSuppression::RnNoise
+				} else {
+					NoiseSuppression::Off
+				},
+				echo_cancellation: true,
+				..Processing::studio()
+			},
+			use_rnnoise_vad: false,
+			always_transmit: true,
+			vad_threshold_rms: 0,
+			opus: OpusSettings::default(),
+		}
+	}
+	pub fn normalized(mut self) -> Self {
+		self.custom.suppression_level = self.custom.suppression_level.min(3);
+		self.custom.sensitivity_db = self.custom.sensitivity_db.map(|db| db.clamp(-80, 0));
+		self.vad_threshold_rms = self.vad_threshold_rms.min(2_000);
+		self.opus = self.opus.normalized();
+		self
+	}
+	/// Editing a preset starts from its visible values, rather than hidden custom values.
+	pub fn edit(&mut self) -> &mut Processing {
+		if self.profile != InputProfile::Custom {
+			self.custom = self.effective();
+		}
+		self.profile = InputProfile::Custom;
+		&mut self.custom
+	}
+}

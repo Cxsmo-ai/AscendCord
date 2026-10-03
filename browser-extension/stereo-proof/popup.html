@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tesktop Stereo Proof</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <header>
+      <span class="pulse" aria-hidden="true"></span>
+      <div>
+        <h1>Stereo proof</h1>
+        <p id="connection">Checking local Tesktop…</p>
+      </div>
+      <button id="refresh" title="Refresh receiver stats" aria-label="Refresh">↻</button>
+    </header>
+    <section>
+      <h2>Sender · Tesktop</h2>
+      <pre id="sender">Waiting for Tesktop call status</pre>
+    </section>
+    <section>
+      <h2>Receiver · Discord Web</h2>
+      <div id="receiver" class="empty">Join voice in the browser to expose receive stats.</div>
+      <div id="streams"></div>
+    </section>
+    <footer>Local statistics only · no audio is captured, stored, or relayed.</footer>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

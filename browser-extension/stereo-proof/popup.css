@@ -1,0 +1,22 @@
+:root { color-scheme: dark; font: 13px/1.45 "Segoe UI", system-ui, sans-serif; background: #191a1d; color: #e6e7eb; }
+* { box-sizing: border-box; }
+body { margin: 0; width: 380px; min-height: 220px; }
+main { padding: 16px; }
+header { display: flex; align-items: center; gap: 11px; border-bottom: 1px solid #34363c; padding-bottom: 12px; }
+.pulse { width: 10px; height: 10px; flex: none; border-radius: 50%; background: #777b85; }
+.pulse.live { background: #38c782; box-shadow: 0 0 10px #38c78266; }
+h1,h2,p { margin: 0; }
+h1 { font-size: 16px; font-weight: 650; }
+header p { margin-top: 2px; color: #a8abb4; font-size: 12px; }
+button { margin-left: auto; border: 1px solid #41434a; border-radius: 6px; background: #24262b; color: inherit; font-size: 19px; width: 31px; height: 31px; cursor: pointer; }
+button:hover { background: #33363d; }
+section { padding: 12px 0 4px; }
+h2 { color: #a9adb6; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; margin-bottom: 6px; }
+pre,.empty,.stream { margin: 0; border: 1px solid #33363d; background: #202226; border-radius: 7px; padding: 9px; white-space: pre-wrap; overflow-wrap: anywhere; }
+pre { font: 12px/1.5 "Cascadia Code", Consolas, monospace; }
+.empty { color: #9da1ab; }
+.stream + .stream { margin-top: 6px; }
+.stream strong { color: #f2f3f5; font-weight: 650; }
+.good { color: #50d497; }
+.warn { color: #f2c46d; }
+footer { margin-top: 12px; border-top: 1px solid #34363c; padding-top: 9px; color: #848891; font-size: 11px; }
