@@ -1972,10 +1972,11 @@ pub fn debug_mic_preview_check() {
 		..Default::default()
 	};
 	preferences.apply(&mut view);
-	// Loading always migrates saved voice settings to the raw max-quality profile.
+	// A saved choice is kept: the legacy noise-suppression flag loads as that choice rather
+	// than being reset to the raw default.
 	assert_eq!(
 		view.voice_processing,
-		model::voice_settings::VoiceProcessing::default()
+		model::voice_settings::VoiceProcessing::from_legacy(true)
 	);
 	view.voice_processing.custom.sensitivity_db = Some(-63);
 	preferences.observe(&view);
