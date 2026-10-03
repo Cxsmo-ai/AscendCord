@@ -22,8 +22,12 @@ if (Test-Path $installer) {
     throw "Installer $installer was not built (is NSIS installed?)"
 }
 
-# Arch: a PKGBUILD pinned to this tag's source archive, with its checksum filled in.
-if ($env:GITHUB_REPOSITORY) {
+# Arch: the package and PKGBUILD built and verified by the release's Arch job.
+if (Test-Path 'arch-out') {
+    Copy-Item 'arch-out\*' $out
+}
+# Otherwise a PKGBUILD pinned to this tag's source archive, with its checksum filled in.
+if ($env:GITHUB_REPOSITORY -and -not (Test-Path (Join-Path $out 'PKGBUILD'))) {
     $source = Join-Path $env:RUNNER_TEMP 'source.tar.gz'
     Invoke-WebRequest "https://github.com/$env:GITHUB_REPOSITORY/archive/refs/tags/$Tag.tar.gz" -OutFile $source
     $sum = (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash.ToLowerInvariant()

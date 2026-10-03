@@ -1341,7 +1341,7 @@ async fn run_inner(
 					}
 				}
 				_ = tokio::time::sleep_until(ready_deadline), if ready_at.is_none() => break,
-				_ = timer.tick() => {
+				_ = timer.tick(), if buffered.is_none() => {
 					if heartbeat.tick(Instant::now(), interval).is_err() {
 						// The ACK, or a close, may be waiting behind this timer: handle it before
 						// deciding the connection went silent.
@@ -1857,9 +1857,32 @@ mod tests {
 			}))
 			.await
 			.unwrap();
-		// Heartbeats may still be in flight; anything read here is ignored.
+		// Heartbeats may still be in flight and are ignored. The client ends the connection
+		// right after reading the close, so a reset without a closing reply is expected too;
+		// any other error means something else went wrong.
 		let drained = timeout(Duration::from_secs(5), async {
-			while let Some(Ok(_)) = socket.next().await {}
+			use tokio_tungstenite::tungstenite::{Error, error::ProtocolError};
+			loop {
+				match socket.next().await {
+					None
+					| Some(Err(
+						Error::ConnectionClosed
+						| Error::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+					)) => break,
+					Some(Err(Error::Io(error)))
+						if matches!(
+							error.kind(),
+							std::io::ErrorKind::ConnectionReset
+								| std::io::ErrorKind::ConnectionAborted
+								| std::io::ErrorKind::BrokenPipe
+						) =>
+					{
+						break;
+					}
+					Some(Ok(_)) => {}
+					Some(Err(error)) => panic!("synthetic close failed: {error}"),
+				}
+			}
 		})
 		.await;
 		assert!(
@@ -1872,7 +1895,7 @@ mod tests {
 	/// must win: an expired session, not a reconnect to a supposedly silent connection.
 	#[test]
 	fn a_waiting_close_beats_an_overdue_heartbeat() {
-		for _ in 0..4 {
+		for stall_ms in [1600, 2600, 1600, 2600] {
 			let server = tokio::runtime::Builder::new_current_thread()
 				.enable_all()
 				.build()
@@ -1889,7 +1912,7 @@ mod tests {
 					// Occupies the client's only thread, like a starved CI runner.
 					tokio::spawn(async move {
 						if stalled.await.is_ok() {
-							std::thread::sleep(Duration::from_millis(1600));
+							std::thread::sleep(Duration::from_millis(stall_ms));
 						}
 					});
 					let (_controls, receive) = mpsc::channel(8);
