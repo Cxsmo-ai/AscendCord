@@ -190,9 +190,14 @@ impl Screen {
 			screen::Event::Deleted { reason } => {
 				self.pending = None;
 				self.retire_live();
-				self.closing = None;
-				// A server-side end names its cause, so it is never mistaken for a local stop.
-				self.status = reason.unwrap_or("Screen sharing stopped");
+				// A share this client ended for a reason keeps that reason; Discord's
+				// confirmation of the stop carries none. A server-side end names its own cause.
+				let local_reason = self
+					.closing
+					.take()
+					.map(|_| self.status)
+					.filter(|status| *status != "Stopping screen sharing…");
+				self.status = reason.or(local_reason).unwrap_or("Screen sharing stopped");
 			}
 			screen::Event::Failed(message) => self.request_stop(message),
 		}
