@@ -1688,20 +1688,24 @@ impl Voice {
 			let start = live.camera_clock;
 			let wake = ctx.clone();
 			let on_frame = std::sync::Arc::new(move |frame: discord_voice::camera::Frame| {
-				let (width, height, frames_per_second, bitrate_kbps) = (
+				let (width, height, frames_per_second, bitrate_kbps, index, keyframe) = (
 					frame.width,
 					frame.height,
 					frame.frames_per_second,
 					frame.bitrate_kbps,
+					frame.index,
+					frame.keyframe,
 				);
 				let data = frame.data;
 				let codec = frame.codec;
 				if data.len() > discord_voice::camera_video::MAX_FRAME_BYTES {
 					return;
 				}
-				let _ = send.try_send(discord_voice::camera_video::Frame {
+				let queued = send.try_send(discord_voice::camera_video::Frame {
 					generation,
+					index,
 					timestamp: (start.elapsed().as_micros() * 90 / 1000) as u32,
+					keyframe,
 					width,
 					height,
 					frames_per_second,
@@ -1709,7 +1713,11 @@ impl Voice {
 					codec,
 					data,
 				});
-				frame_received.store(true, std::sync::atomic::Ordering::Release);
+				if queued.is_ok() {
+					frame_received.store(true, std::sync::atomic::Ordering::Release);
+				} else {
+					discord_voice::camera::request_keyframe();
+				}
 				if let Some(rgb) = frame.rgb.as_deref()
 					&& let Ok(mut slot) = preview.try_lock()
 					&& store_camera_frame(&mut slot, rgb, width, height)

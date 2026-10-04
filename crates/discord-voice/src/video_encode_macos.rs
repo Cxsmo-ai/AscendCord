@@ -544,7 +544,7 @@ mod tests {
 	}
 
 	#[test]
-	fn encodes_packed_rgb_camera_pictures_as_independent_keyframes() {
+	fn encodes_packed_rgb_camera_keyframes_when_requested() {
 		let Ok(mut encoder) = Encoder::new(CAMERA, SourceFormat::Rgb) else {
 			return;
 		};
@@ -552,16 +552,18 @@ mod tests {
 		for (index, pixel) in pixels.as_chunks_mut::<3>().0.iter_mut().enumerate() {
 			*pixel = [(index % 251) as u8, (index / 640 % 253) as u8, 60];
 		}
-		// The camera sender drops to the latest frame, so every picture must stand alone.
-		for _ in 0..4 {
+		for (index, force_keyframe) in [true, false, false, true].into_iter().enumerate() {
 			let (data, keyframe) = encoder
-				.encode(&pixels, (640, 480), true)
+				.encode(&pixels, (640, 480), force_keyframe)
 				.expect("hardware encode");
 			if data.is_empty() {
 				continue;
 			}
-			assert!(keyframe && crate::video_receive::is_keyframe(&data));
-			assert!(crate::video_receive::has_parameter_sets(&data));
+			assert_eq!(keyframe, crate::video_receive::is_keyframe(&data));
+			if force_keyframe {
+				assert!(keyframe, "forced keyframe honored at frame {index}");
+				assert!(crate::video_receive::has_parameter_sets(&data));
+			}
 			crate::video::validate_source(&data).expect("valid Annex B");
 			assert!(data.len() <= CAMERA.max_bytes);
 		}
