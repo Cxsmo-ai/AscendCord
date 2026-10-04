@@ -41,8 +41,12 @@ struct VoiceTarget {
 enum BridgeCommand {
 	Start(Option<u64>),
 	Stop,
-	Camera { on: bool, device: Option<String> },
-	Screen(bool),
+	Camera {
+		on: bool,
+		device: Option<String>,
+	},
+	/// On or off; when on, the first source whose name contains the text, else the first.
+	Screen(bool, Option<String>),
 }
 
 /// Private same-user files let the owner inspect/control the live client through local tools.
@@ -116,9 +120,14 @@ impl VoiceBridge {
 					.filter(|device| device.len() <= 4096 && !device.contains('\0'))
 					.map(str::to_owned),
 			},
-			"screen" => {
-				BridgeCommand::Screen(value.get("on").and_then(|on| on.as_bool()).unwrap_or(true))
-			}
+			"screen" => BridgeCommand::Screen(
+				value.get("on").and_then(|on| on.as_bool()).unwrap_or(true),
+				value
+					.get("source")
+					.and_then(|source| source.as_str())
+					.filter(|source| source.len() <= 256)
+					.map(str::to_lowercase),
+			),
 			_ => return None,
 		};
 		let _ = std::fs::remove_file(path);
@@ -805,13 +814,20 @@ impl Voice {
 						return Some(command);
 					}
 				}
-				BridgeCommand::Screen(on) => {
+				BridgeCommand::Screen(on, wanted) => {
 					if let Some(call) = state.voice.active.as_ref() {
 						ui.screen.context = Some((state.generation, call.channel, call.request));
 						ui.screen.request = if on {
 							discord_voice::screen::sources()
 								.ok()
-								.and_then(|sources| sources.into_iter().next())
+								.and_then(|sources| {
+									let named = wanted.as_ref().and_then(|wanted| {
+										sources.iter().position(|source| {
+											source.name.to_lowercase().contains(wanted)
+										})
+									});
+									sources.into_iter().nth(named.unwrap_or(0))
+								})
 								.map(|source| {
 									ui::screen::Request::Start(discord_voice::screen::Settings {
 										source: source.id,
