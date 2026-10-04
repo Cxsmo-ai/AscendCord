@@ -34,10 +34,10 @@ mod notification_sounds;
 mod pointer;
 #[cfg(feature = "demo")]
 mod post_menu_demo;
+mod probe;
 mod reading_settings;
 #[cfg(feature = "demo")]
 mod rendering_demo;
-mod probe;
 mod screen;
 #[cfg(feature = "demo")]
 mod screenshot;

@@ -200,7 +200,10 @@ mod tests {
 			heard.extend(play(&mut jitter, 20));
 			let audible: Vec<_> = heard.iter().filter(|packet| !packet.is_empty()).collect();
 			assert_eq!(audible.len(), 200, "pause of {pause} ticks lost speech");
-			assert!(jitter.target <= 3, "pause of {pause} ticks widened the cushion");
+			assert!(
+				jitter.target <= 3,
+				"pause of {pause} ticks widened the cushion"
+			);
 		}
 	}
 

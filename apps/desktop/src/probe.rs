@@ -15,7 +15,10 @@ const CAMERA_LIMIT: Duration = Duration::from_secs(8);
 const SCREEN_LIMIT: Duration = Duration::from_secs(5);
 
 pub fn run(selected: Option<&str>, mut print: impl FnMut(String)) {
-	print(format!("AscendCord {} media probe", env!("CARGO_PKG_VERSION")));
+	print(format!(
+		"AscendCord {} media probe",
+		env!("CARGO_PKG_VERSION")
+	));
 	match camera::devices() {
 		Ok(devices) => {
 			print(format!("cameras: {}", devices.len()));
@@ -28,7 +31,10 @@ pub fn run(selected: Option<&str>, mut print: impl FnMut(String)) {
 						resolution,
 						..Default::default()
 					};
-					print(format!("camera \"{name}\" [{id}] {}", probe_camera(id, quality)));
+					print(format!(
+						"camera \"{name}\" [{id}] {}",
+						probe_camera(id, quality)
+					));
 				}
 			}
 		}
@@ -41,7 +47,10 @@ pub fn run(selected: Option<&str>, mut print: impl FnMut(String)) {
 
 /// `--video-probe FILE…`: decodes the start of each file as the inline player would.
 pub fn videos(files: impl Iterator<Item = String>, mut print: impl FnMut(String)) {
-	print(format!("AscendCord {} video probe", env!("CARGO_PKG_VERSION")));
+	print(format!(
+		"AscendCord {} video probe",
+		env!("CARGO_PKG_VERSION")
+	));
 	for file in files {
 		print(format!("video \"{file}\" {}", probe_video(&file)));
 	}
@@ -112,26 +121,25 @@ fn probe_camera(id: &str, quality: model::CameraQuality) -> String {
 	let frames = Arc::new(AtomicUsize::new(0));
 	let pictures = Arc::new(AtomicUsize::new(0));
 	let bytes = Arc::new(AtomicUsize::new(0));
-	let on_frame = {
-		let (frames, pictures, bytes) = (frames.clone(), pictures.clone(), bytes.clone());
-		Arc::new(move |frame: camera::Frame| {
-			frames.fetch_add(1, Ordering::Relaxed);
-			bytes.fetch_add(frame.data.len(), Ordering::Relaxed);
-			if frame
-				.rgb
-				.as_ref()
-				.is_some_and(|rgb| rgb.len() == frame.width as usize * frame.height as usize * 3)
-			{
-				pictures.fetch_add(1, Ordering::Relaxed);
-			}
-		})
-	};
+	let on_frame =
+		{
+			let (frames, pictures, bytes) = (frames.clone(), pictures.clone(), bytes.clone());
+			Arc::new(move |frame: camera::Frame| {
+				frames.fetch_add(1, Ordering::Relaxed);
+				bytes.fetch_add(frame.data.len(), Ordering::Relaxed);
+				if frame.rgb.as_ref().is_some_and(|rgb| {
+					rgb.len() == frame.width as usize * frame.height as usize * 3
+				}) {
+					pictures.fetch_add(1, Ordering::Relaxed);
+				}
+			})
+		};
 	let started = Instant::now();
-	let camera = match camera::Camera::start(Some(id.to_owned()), quality, on_frame, Arc::new(|| {}))
-	{
-		Ok(camera) => camera,
-		Err(error) => return format!("{width}x{height}: did not start: {error}"),
-	};
+	let camera =
+		match camera::Camera::start(Some(id.to_owned()), quality, on_frame, Arc::new(|| {})) {
+			Ok(camera) => camera,
+			Err(error) => return format!("{width}x{height}: did not start: {error}"),
+		};
 	while started.elapsed() < CAMERA_LIMIT
 		&& !camera.stopped()
 		&& frames.load(Ordering::Relaxed) < CAMERA_FRAMES
