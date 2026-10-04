@@ -21,6 +21,15 @@ const PRESENT_SCROLL_SECS: f32 = 0.32;
 /// Screens of history a reader must leave behind before the control appears.
 const PRESENT_CONTROL_SCREENS: f32 = 6.0;
 
+/// Scale only the chat body's text style; interface controls keep their normal size.
+pub(crate) fn message_text_style(style: &egui::Style, percent: u8) -> egui::Style {
+	let mut scaled = style.clone();
+	if let Some(body) = scaled.text_styles.get_mut(&egui::TextStyle::Body) {
+		body.size *= f32::from(percent.clamp(80, 150)) / 100.0;
+	}
+	scaled
+}
+
 #[derive(Clone, Copy)]
 struct RevealScroll {
 	target: Id,
@@ -534,7 +543,9 @@ fn starter_row(
 									.size(12.0)
 									.color(colors.muted),
 							)
-							.on_hover_text_with(|| format!("{time} UTC"));
+							.on_hover_text_with(|| {
+								crate::local_time::message_tooltip(time, &display)
+							});
 						},
 					);
 					ui.add(
@@ -643,7 +654,8 @@ fn grouped(previous: Option<&Message>, message: &Message, boundary: Option<Id>) 
 			&& !message.extra_content.any()
 			&& !previous.extra_content.any()
 			&& boundary != Some(message.id)
-			&& timestamp(previous.id).date() == timestamp(message.id).date()
+			&& crate::local_time::local(timestamp(previous.id)).date()
+				== crate::local_time::local(timestamp(message.id)).date()
 			&& (timestamp(message.id) - timestamp(previous.id)).whole_seconds() < 300
 	})
 }
@@ -675,7 +687,10 @@ fn row_key(
 	layout_key(message).hash(&mut key);
 	grouped(previous, message, boundary).hash(&mut key);
 	previous
-		.is_none_or(|previous| timestamp(previous.id).date() != timestamp(message.id).date())
+		.is_none_or(|previous| {
+			crate::local_time::local(timestamp(previous.id)).date()
+				!= crate::local_time::local(timestamp(message.id)).date()
+		})
 		.hash(&mut key);
 	(boundary == Some(message.id)).hash(&mut key);
 	crate::mentions::presentation_fingerprint(state, message).hash(&mut key);
@@ -1223,11 +1238,11 @@ fn show_system(
 			ui.add_space(8.0);
 			let stamp = ui
 				.label(
-					RichText::new(format!("{:02}:{:02}", time.hour(), time.minute()))
+					RichText::new(crate::local_time::clock(time, &display))
 						.size(12.0)
 						.color(colors.muted),
 				)
-				.on_hover_text_with(|| format!("{time} UTC"));
+				.on_hover_text_with(|| crate::local_time::message_tooltip(time, &display));
 			surface.exclude(stamp.rect);
 		});
 	}
@@ -1985,11 +2000,13 @@ impl TimelineView {
 				}
 
 				let compact = grouped(previous, message, self.unread_boundary);
-				let new_day = previous
-					.is_none_or(|previous| timestamp(previous.id).date() != timestamp(id).date());
+				let new_day = previous.is_none_or(|previous| {
+					crate::local_time::local(timestamp(previous.id)).date()
+						!= crate::local_time::local(timestamp(id)).date()
+				});
 				let response = ui.scope_builder(egui::UiBuilder::new().scope_id(row_id), |ui| {
 					if new_day {
-						let date = timestamp(id);
+						let date = crate::local_time::local(timestamp(id));
 						divider(
 							ui,
 							format!("{} {}, {}", date.month(), date.day(), date.year()),
@@ -2289,15 +2306,19 @@ impl TimelineView {
 												let time = timestamp(id);
 												let time = ui
 													.label(
-														RichText::new(format!(
-															"{:02}:{:02}",
-															time.hour(),
-															time.minute()
+														RichText::new(crate::local_time::clock(
+															time,
+															&self.display,
 														))
 														.size(12.0)
 														.color(colors.muted),
 													)
-													.on_hover_text_with(|| format!("{} UTC", time));
+													.on_hover_text_with(|| {
+														crate::local_time::message_tooltip(
+															time,
+															&self.display,
+														)
+													});
 												surface.exclude(time.rect);
 											},
 										);
@@ -2840,7 +2861,7 @@ impl TimelineView {
 							ui.painter().text(
 								rect.center(),
 								egui::Align2::CENTER_CENTER,
-								format!("{:02}:{:02}", time.hour(), time.minute()),
+								crate::local_time::clock(time, &self.display),
 								egui::FontId::proportional(11.0),
 								colors.muted,
 							);
@@ -2849,7 +2870,9 @@ impl TimelineView {
 								ui.scope_id().with("timestamp"),
 								egui::Sense::hover(),
 							)
-							.on_hover_text_with(|| format!("{} UTC", time));
+							.on_hover_text_with(|| {
+								crate::local_time::message_tooltip(time, &self.display)
+							});
 						}
 						let own = state
 							.user
@@ -8384,6 +8407,23 @@ e f g h"
 		assert_eq!(
 			word_and_characters("one two three four five \u{1F1E6}\u{1F1FA}"),
 			Some("6 words, 25 characters".to_string())
+		);
+	}
+
+	#[test]
+	fn message_text_scale_changes_only_the_chat_body_style() {
+		let ctx = egui::Context::default();
+		let style = ctx.style_of(egui::Theme::Dark);
+		let body = egui::TextStyle::Body.resolve(&style).size;
+		let button = egui::TextStyle::Button.resolve(&style).size;
+		let scaled = super::message_text_style(&style, 125);
+		assert!((egui::TextStyle::Body.resolve(&scaled).size - body * 1.25).abs() < 0.01);
+		assert_eq!(egui::TextStyle::Button.resolve(&scaled).size, button);
+		assert_eq!(
+			egui::TextStyle::Body
+				.resolve(&super::message_text_style(&style, 0))
+				.size,
+			body * 0.8
 		);
 	}
 }

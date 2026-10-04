@@ -69,12 +69,22 @@ impl MessagingUi {
 		clicked
 	}
 
-	/// Zoom, sidebar width and member list: the Layout group of the Appearance page.
+	/// Zoom, text size, navigation and people layout for the Appearance page.
 	pub fn layout_settings(&mut self, ui: &mut egui::Ui, demo: bool) {
 		let mut value = self.reading_preferences;
+		let mut member_width = self.member_list_width;
 		let reset = Self::header_with_reset(ui, "Layout", "Reset layout");
 		design::card(ui, |ui| {
 			self.zoom_row(ui, &mut value);
+			ui.add_space(10.0);
+			design::slider_row(
+				ui,
+				"Message text size",
+				Some("Scales message content independently from the rest of the interface."),
+				&mut self.message_text_scale,
+				80..=150,
+				"%",
+			);
 			ui.add_space(10.0);
 			design::slider_row(
 				ui,
@@ -83,6 +93,22 @@ impl MessagingUi {
 				&mut value.sidebar_width,
 				190..=360,
 				" px",
+			);
+			design::card_divider(ui);
+			design::slider_row(
+				ui,
+				"Member list width",
+				Some("Width of the people list in wide chat windows."),
+				&mut member_width,
+				180..=360,
+				" px",
+			);
+			design::card_divider(ui);
+			design::switch(
+				ui,
+				"12-hour message times (AM/PM)",
+				Some("Use local AM/PM times in message headers and hover timestamps."),
+				&mut self.twelve_hour_time,
 			);
 			design::card_divider(ui);
 			design::switch(
@@ -97,11 +123,19 @@ impl MessagingUi {
 			value.zoom_percent = defaults.zoom_percent;
 			value.sidebar_width = defaults.sidebar_width;
 			value.show_members = defaults.show_members;
+			member_width = 232;
+			self.member_list_width = member_width;
+			self.twelve_hour_time = true;
+			self.message_text_scale = 100;
 			self.reading_save_requested = true;
 		}
 		self.reading_save_notice(ui, demo);
 		if value != self.reading_preferences {
 			self.apply_reading_preferences(ui.ctx(), value);
+		}
+		if member_width != self.member_list_width {
+			self.member_list_width = member_width;
+			self.member_sidebar_applied = None;
 		}
 	}
 
@@ -205,6 +239,35 @@ impl MessagingUi {
 		{
 			self.reading_preferences.sidebar_width = width.round() as u16;
 			self.reading_sidebar_applied = Some(self.reading_preferences.sidebar_width);
+		}
+	}
+
+	/// Keep the resizable people panel inside the usable chat width without replacing the
+	/// owner's saved preference when a smaller window temporarily constrains it.
+	pub(super) fn prepare_member_sidebar(&mut self, ui: &egui::Ui) -> f32 {
+		let maximum = (ui.available_width() - 280.0).clamp(180.0, 360.0);
+		let constrained = f32::from(self.member_list_width) > maximum;
+		if self.member_sidebar_applied != Some(self.member_list_width)
+			|| self.member_sidebar_constrained != constrained
+		{
+			ui.ctx().data_mut(|data| {
+				data.remove::<PanelState>(ui.scope_id().with("people-pane"));
+			});
+			self.member_sidebar_applied = Some(self.member_list_width);
+		}
+		self.member_sidebar_constrained = constrained;
+		maximum
+	}
+
+	pub(super) fn record_member_sidebar(&mut self, width: f32, resizing: bool) {
+		if !self.member_sidebar_constrained
+			&& !resizing
+			&& self.member_sidebar_applied == Some(self.member_list_width)
+			&& width.is_finite()
+			&& (180.0..=360.0).contains(&width.round())
+		{
+			self.member_list_width = width.round() as u16;
+			self.member_sidebar_applied = Some(self.member_list_width);
 		}
 	}
 }
@@ -479,5 +542,72 @@ mod tests {
 		sidebar_frame(&mut view, 900.0, vec![]);
 		assert_eq!(view.reading_preferences.zoom_percent, 150);
 		assert!((ctx.zoom_factor() - 1.5).abs() < 0.001);
+	}
+
+	#[test]
+	fn member_sidebar_width_is_resizable_and_survives_temporary_constraints() {
+		let ctx = egui::Context::default();
+		let mut view = MessagingUi {
+			member_list_width: 340,
+			..Default::default()
+		};
+		let frame = |view: &mut MessagingUi, width, events| {
+			let mut rendered = 0.0;
+			ctx.run_ui(
+				egui::RawInput {
+					screen_rect: Some(egui::Rect::from_min_size(
+						egui::Pos2::ZERO,
+						egui::vec2(width, 400.0),
+					)),
+					events,
+					..Default::default()
+				},
+				|ui| {
+					let maximum = view.prepare_member_sidebar(ui);
+					let people = egui::Panel::right("people-pane")
+						.resizable(true)
+						.default_size(f32::from(view.member_list_width).min(maximum))
+						.size_range(180.0..=maximum)
+						.show(ui, |ui| {
+							ui.label("Synthetic members");
+						});
+					rendered = people.response.rect.width();
+					view.record_member_sidebar(rendered, people.response.dragged());
+				},
+			)
+			.drop_without_applying_deltas();
+			rendered
+		};
+		for width in [900.0, 480.0, 900.0] {
+			let actual = frame(&mut view, width, vec![]);
+			assert_eq!(view.member_list_width, 340);
+			assert!((actual - if width < 600.0 { 200.0 } else { 340.0 }).abs() < 1.0);
+		}
+		let edge = egui::pos2(560.0, 200.0);
+		let resized = egui::pos2(620.0, 200.0);
+		frame(&mut view, 900.0, vec![egui::Event::PointerMoved(edge)]);
+		frame(
+			&mut view,
+			900.0,
+			vec![egui::Event::PointerButton {
+				pos: edge,
+				button: egui::PointerButton::Primary,
+				pressed: true,
+				modifiers: egui::Modifiers::NONE,
+			}],
+		);
+		frame(&mut view, 900.0, vec![egui::Event::PointerMoved(resized)]);
+		frame(
+			&mut view,
+			900.0,
+			vec![egui::Event::PointerButton {
+				pos: resized,
+				button: egui::PointerButton::Primary,
+				pressed: false,
+				modifiers: egui::Modifiers::NONE,
+			}],
+		);
+		frame(&mut view, 900.0, vec![]);
+		assert_eq!(view.member_list_width, 280);
 	}
 }

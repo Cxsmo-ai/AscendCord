@@ -3,9 +3,11 @@ use client_core::{Command, State};
 use egui::{Align2, Color32, FontId};
 use model::Id;
 
-/// Fixed width of the server rail column. Matches the reference client, which sizes this
-/// as a 40px icon plus 16px of padding on each side.
-pub(super) const RAIL_WIDTH: f32 = 72.0;
+/// Fixed width of the server rail column. The 38px icons and 9px inset keep it compact
+/// while leaving a comfortable pointer target.
+pub(super) const RAIL_WIDTH: f32 = 60.0;
+pub(super) const RAIL_ICON_SIZE: f32 = 38.0;
+const RAIL_ROW_HEIGHT: f32 = 49.0;
 
 #[derive(Default)]
 pub(super) struct RailCache {
@@ -128,7 +130,7 @@ pub(super) fn rail_indicator(
 		return;
 	};
 	let pill = egui::Rect::from_center_size(
-		egui::pos2(rect.left() - 10.0, rect.center().y),
+		egui::pos2(rect.left() - 5.0, rect.center().y),
 		egui::vec2(8.0, height),
 	);
 	ui.painter()
@@ -200,8 +202,8 @@ impl MessagingUi {
 						design::ImageSection::ServerList,
 					))
 					.inner_margin(egui::Margin {
-						left: 11,
-						right: 11,
+						left: 9,
+						right: 9,
 						top: 4,
 						bottom: 8,
 					}),
@@ -210,7 +212,7 @@ impl MessagingUi {
 				ui.spacing_mut().item_spacing.y = 11.0;
 				let home = self.guild.is_none();
 				let (rect, response) =
-					ui.allocate_exact_size(egui::Vec2::splat(46.0), egui::Sense::click());
+					ui.allocate_exact_size(egui::Vec2::splat(RAIL_ICON_SIZE), egui::Sense::click());
 				let hovered = response.hovered() || response.has_focus();
 				crate::icons::paint(
 					ui.painter(),
@@ -270,7 +272,7 @@ impl MessagingUi {
 							egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
 						),
 					)
-					.show_rows(ui, 46.0, row_count, |ui, range| {
+					.show_rows(ui, RAIL_ROW_HEIGHT, row_count, |ui, range| {
 						ui.spacing_mut().item_spacing.y = 11.0;
 						// Your own call keeps its conversation on the rail, like Discord's.
 						// Copy one ID at a time so row actions can borrow the UI without cloning the cache.
@@ -280,15 +282,20 @@ impl MessagingUi {
 							};
 							let in_call = Some(channel.id) == call;
 							let response = if channel.kind == 3 {
-								self.avatars.show_group_rail(ui, channel, 46.0, state.demo)
+								self.avatars.show_group_rail(
+									ui,
+									channel,
+									RAIL_ICON_SIZE,
+									state.demo,
+								)
 							} else if let Some(user) = channel.recipients.first() {
-								self.avatars.show_rail(ui, user, 46.0, state.demo)
+								self.avatars.show_rail(ui, user, RAIL_ICON_SIZE, state.demo)
 							} else {
 								let (rect, response) = ui.allocate_exact_size(
-									egui::Vec2::splat(46.0),
+									egui::Vec2::splat(RAIL_ICON_SIZE),
 									egui::Sense::click(),
 								);
-								design::paint_avatar(ui, &channel.name, 46.0, rect);
+								design::paint_avatar(ui, &channel.name, RAIL_ICON_SIZE, rect);
 								response
 							};
 							if channel.kind == 1
@@ -333,8 +340,10 @@ impl MessagingUi {
 							}
 						}
 						if range.contains(&separator) {
-							let (rect, _) = ui
-								.allocate_exact_size(egui::Vec2::splat(46.0), egui::Sense::hover());
+							let (rect, _) = ui.allocate_exact_size(
+								egui::Vec2::splat(RAIL_ICON_SIZE),
+								egui::Sense::hover(),
+							);
 							ui.painter().rect_filled(
 								egui::Rect::from_center_size(rect.center(), egui::vec2(32.0, 2.0)),
 								1,
@@ -350,8 +359,10 @@ impl MessagingUi {
 								..folders.end.saturating_sub(server_start),
 						);
 						if range.contains(&add_server) {
-							let (rect, response) = ui
-								.allocate_exact_size(egui::Vec2::splat(46.0), egui::Sense::click());
+							let (rect, response) = ui.allocate_exact_size(
+								egui::Vec2::splat(RAIL_ICON_SIZE),
+								egui::Sense::click(),
+							);
 							let hovered = response.hovered() || response.has_focus();
 							ui.painter().rect_filled(
 								rect,
@@ -383,8 +394,10 @@ impl MessagingUi {
 						if let Some(sync_row) = sync_row
 							&& range.contains(&sync_row)
 						{
-							let (rect, response) = ui
-								.allocate_exact_size(egui::Vec2::splat(46.0), egui::Sense::hover());
+							let (rect, response) = ui.allocate_exact_size(
+								egui::Vec2::splat(RAIL_ICON_SIZE),
+								egui::Sense::hover(),
+							);
 							ui.painter().text(
 								rect.center(),
 								egui::Align2::CENTER_CENTER,
@@ -401,8 +414,10 @@ impl MessagingUi {
 								.folders_error
 								.unwrap_or("Folder sync failed")
 								.to_owned();
-							let (rect, _) = ui
-								.allocate_exact_size(egui::Vec2::splat(46.0), egui::Sense::hover());
+							let (rect, _) = ui.allocate_exact_size(
+								egui::Vec2::splat(RAIL_ICON_SIZE),
+								egui::Sense::hover(),
+							);
 							ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
 								ui.set_min_size(rect.size());
 								ui.with_layout(

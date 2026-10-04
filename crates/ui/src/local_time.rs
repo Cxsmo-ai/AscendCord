@@ -1,5 +1,14 @@
 //! Converts UTC instants to the user's local zone for display.
 use crate::testcord::HourFormat;
+#[cfg(not(test))]
+use std::{cell::RefCell, collections::HashMap};
+
+#[cfg(not(test))]
+thread_local! {
+	/// Quarter-hour offsets avoid querying the OS once per visible message while handling
+	/// modern time-zone changes that occur on the half hour.
+	static OFFSET_CACHE: RefCell<HashMap<i64, time::UtcOffset>> = RefCell::new(HashMap::new());
+}
 
 /// What the bundled ports changed about clocks and markers. `Default` is the client's own look.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -31,26 +40,57 @@ pub struct Counter {
 
 /// The clock a message row shows, with the owner's own format and offset applied.
 pub fn clock(instant: time::OffsetDateTime, display: &Display) -> String {
-	let at = instant + time::Duration::minutes(i64::from(display.offset_minutes));
+	let at = displayed_local(instant, display);
 	match display.hour {
 		HourFormat::Keep | HourFormat::TwentyFour => format!("{:02}:{:02}", at.hour(), at.minute()),
 		HourFormat::Twelve => {
-			let (suffix, twelve) = match at.hour() % 12 {
-				0 => ("AM", 12),
-				hour => ("PM", hour),
+			let twelve = match at.hour() % 12 {
+				0 => 12,
+				hour => hour,
 			};
+			let suffix = if at.hour() < 12 { "AM" } else { "PM" };
 			format!("{twelve}:{:02} {suffix}", at.minute())
 		}
 	}
 }
 
+/// Full, localized context for a message timestamp. The short clock stays beside the
+/// author (or in the compact-row gutter); this is available on hover for the exact date.
+pub fn message_tooltip(instant: time::OffsetDateTime, display: &Display) -> String {
+	let at = displayed_local(instant, display);
+	format!(
+		"{} {}, {} · {}",
+		at.month(),
+		at.day(),
+		at.year(),
+		clock(instant, display)
+	)
+}
+
+fn displayed_local(instant: time::OffsetDateTime, display: &Display) -> time::OffsetDateTime {
+	local(instant) + time::Duration::minutes(i64::from(display.offset_minutes))
+}
+
 /// Shifts `instant` to the local offset in effect at that moment; falls back to UTC.
 pub fn local(instant: time::OffsetDateTime) -> time::OffsetDateTime {
 	// Tests pin UTC so date-boundary assertions hold on every machine.
-	let offset = if cfg!(test) {
-		time::UtcOffset::UTC
-	} else {
-		time::UtcOffset::local_offset_at(instant).unwrap_or(time::UtcOffset::UTC)
+	#[cfg(test)]
+	let offset = time::UtcOffset::UTC;
+	#[cfg(not(test))]
+	let offset = {
+		let quarter_hour = instant.unix_timestamp().div_euclid(900);
+		OFFSET_CACHE.with(|cache| {
+			if let Some(offset) = cache.borrow().get(&quarter_hour).copied() {
+				return offset;
+			}
+			let offset = time::UtcOffset::local_offset_at(instant).unwrap_or(time::UtcOffset::UTC);
+			let mut cache = cache.borrow_mut();
+			if cache.len() >= 512 {
+				cache.clear();
+			}
+			cache.insert(quarter_hour, offset);
+			offset
+		})
 	};
 	instant.to_offset(offset)
 }
@@ -209,6 +249,49 @@ mod tests {
 			super::clock(instant, &super::Display::default()),
 			"22:13",
 			"the default stays on the 24-hour clock"
+		);
+	}
+	#[test]
+	fn message_tooltips_show_a_local_date_and_the_selected_clock() {
+		let instant = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+		let twelve = super::Display {
+			hour: super::HourFormat::Twelve,
+			..Default::default()
+		};
+		assert_eq!(
+			super::message_tooltip(instant, &twelve),
+			"November 14, 2023 · 10:13 PM"
+		);
+	}
+	#[test]
+	fn twelve_hour_clock_marks_midnight_noon_and_meridiem() {
+		let display = super::Display {
+			hour: super::HourFormat::Twelve,
+			..Default::default()
+		};
+		for (seconds, expected) in [
+			(0, "12:00 AM"),
+			(3_600, "1:00 AM"),
+			(43_200, "12:00 PM"),
+			(46_800, "1:00 PM"),
+			(86_340, "11:59 PM"),
+		] {
+			let instant = time::OffsetDateTime::from_unix_timestamp(seconds).unwrap();
+			assert_eq!(super::clock(instant, &display), expected);
+		}
+	}
+	#[test]
+	fn display_offset_changes_the_message_date_and_time_together() {
+		let instant = time::OffsetDateTime::from_unix_timestamp(0).unwrap();
+		let display = super::Display {
+			hour: super::HourFormat::Twelve,
+			offset_minutes: -300,
+			..Default::default()
+		};
+		assert_eq!(super::clock(instant, &display), "7:00 PM");
+		assert_eq!(
+			super::message_tooltip(instant, &display),
+			"December 31, 1969 · 7:00 PM"
 		);
 	}
 

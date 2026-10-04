@@ -92,6 +92,12 @@ pub struct AppPreferences {
 	pub reduce_saturation: bool,
 	/// Interface text scale as a percentage of the base size.
 	pub font_scale: u8,
+	/// Message body text scale, independent of the rest of the interface.
+	pub message_text_scale: u8,
+	/// Width of the server member list in wide chat layouts.
+	pub member_list_width: u16,
+	/// Show message timestamps with AM/PM instead of a 24-hour clock.
+	pub twelve_hour_time: bool,
 	/// Play animated avatars and emoji while the window has focus.
 	pub animate_emoji: bool,
 	/// Prefer the classic composer instead of the newer chat input.
@@ -145,6 +151,9 @@ impl Default for AppPreferences {
 			high_contrast: false,
 			reduce_saturation: false,
 			font_scale: 100,
+			message_text_scale: 100,
+			member_list_width: 232,
+			twelve_hour_time: true,
 			animate_emoji: true,
 			legacy_chat_input: false,
 			show_shortcuts_list: true,
@@ -161,7 +170,9 @@ impl AppPreferences {
 			&& self.blur <= 100
 			&& self.input_percent <= 200
 			&& self.output_percent <= 200
+			&& (180..=360).contains(&self.member_list_width)
 			&& self.camera_quality.is_valid()
+			&& (80..=150).contains(&self.message_text_scale)
 			&& self
 				.voice_processing
 				.is_none_or(|value| value.custom.is_valid())
@@ -1754,6 +1765,9 @@ mod tests {
 			serde_json::from_str(r#"{"notifications_enabled":true}"#).unwrap();
 		let fresh = AppPreferences::default();
 		assert_eq!(legacy.font_scale, fresh.font_scale);
+		assert_eq!(legacy.message_text_scale, fresh.message_text_scale);
+		assert_eq!(legacy.member_list_width, fresh.member_list_width);
+		assert_eq!(legacy.twelve_hour_time, fresh.twelve_hour_time);
 		assert_eq!(legacy.locale, fresh.locale);
 		assert!(legacy.animate_emoji);
 		assert!(legacy.reduce_motion_sync);
@@ -1762,9 +1776,12 @@ mod tests {
 		assert!(!legacy.high_contrast);
 		// And an explicit stored value still wins over the default.
 		let chosen: AppPreferences =
-			serde_json::from_str(r#"{"font_scale":125,"locale":"de","high_contrast":true}"#)
+			serde_json::from_str(r#"{"font_scale":125,"message_text_scale":140,"member_list_width":320,"twelve_hour_time":false,"locale":"de","high_contrast":true}"#)
 				.unwrap();
 		assert_eq!(chosen.font_scale, 125);
+		assert_eq!(chosen.message_text_scale, 140);
+		assert_eq!(chosen.member_list_width, 320);
+		assert!(!chosen.twelve_hour_time);
 		assert_eq!(chosen.locale, "de");
 		assert!(chosen.high_contrast);
 	}
@@ -1797,6 +1814,9 @@ mod tests {
 			voice_deafened: true,
 			voice_input: Some("synthetic microphone".into()),
 			output_percent: 75,
+			message_text_scale: 125,
+			member_list_width: 340,
+			twelve_hour_time: false,
 			gpu_preference: model::GpuPreference::PowerSaving,
 			..Default::default()
 		};
@@ -1809,6 +1829,12 @@ mod tests {
 			.custom
 			.sensitivity_db = Some(-81);
 		assert!(store.save_app_preferences(&value).is_err());
+		value.member_list_width = 179;
+		assert!(store.save_app_preferences(&value).is_err());
+		value.member_list_width = 340;
+		value.message_text_scale = 151;
+		assert!(store.save_app_preferences(&value).is_err());
+		value.message_text_scale = 100;
 		value
 			.voice_processing
 			.as_mut()

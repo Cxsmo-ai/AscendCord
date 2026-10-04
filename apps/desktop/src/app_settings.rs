@@ -60,6 +60,9 @@ impl Settings {
 			high_contrast: ui.high_contrast,
 			reduce_saturation: ui.reduce_saturation,
 			font_scale: ui.font_scale,
+			message_text_scale: ui.message_text_scale,
+			member_list_width: ui.member_list_width,
+			twelve_hour_time: ui.twelve_hour_time,
 			animate_emoji: ui.animate_emoji,
 			legacy_chat_input: ui.legacy_chat_input,
 			show_shortcuts_list: ui.show_shortcuts_list,
@@ -118,6 +121,17 @@ impl Settings {
 		} else {
 			AppPreferences::default().font_scale
 		};
+		ui.message_text_scale = if (80..=150).contains(&value.message_text_scale) {
+			value.message_text_scale
+		} else {
+			AppPreferences::default().message_text_scale
+		};
+		ui.member_list_width = if (180..=360).contains(&value.member_list_width) {
+			value.member_list_width
+		} else {
+			AppPreferences::default().member_list_width
+		};
+		ui.twelve_hour_time = value.twelve_hour_time;
 		ui.animate_emoji = value.animate_emoji;
 		ui.legacy_chat_input = value.legacy_chat_input;
 		ui.show_shortcuts_list = value.show_shortcuts_list;
@@ -144,6 +158,9 @@ mod tests {
 		let mut ui = ui::MessagingUi::default();
 		settings.apply(&mut ui);
 		assert_eq!(ui.font_scale, defaults.font_scale);
+		assert_eq!(ui.member_list_width, defaults.member_list_width);
+		assert_eq!(ui.twelve_hour_time, defaults.twelve_hour_time);
+		assert_eq!(ui.message_text_scale, defaults.message_text_scale);
 		assert_eq!(ui.locale, defaults.locale);
 		settings.observe(&ui);
 		assert!(
@@ -175,6 +192,9 @@ mod tests {
 		let mut ui = ui::MessagingUi::default();
 		settings.apply(&mut ui);
 		assert_eq!(ui.font_scale, 100);
+		assert_eq!(ui.member_list_width, 232);
+		assert!(ui.twelve_hour_time);
+		assert_eq!(ui.message_text_scale, 100);
 		assert_eq!(ui.locale, "en-US");
 		assert_eq!(ui.app_icon, model::AppIcon::Sakura);
 	}

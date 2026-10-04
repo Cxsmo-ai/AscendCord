@@ -288,6 +288,8 @@ pub struct MessagingUi {
 	pub game_activity_status: &'static str,
 	reading_sidebar_applied: Option<u16>,
 	reading_sidebar_constrained: bool,
+	member_sidebar_applied: Option<u16>,
+	member_sidebar_constrained: bool,
 	reading_zoom_pending: bool,
 	/// Slider value while the pointer is still down; zoom is applied on release so the
 	/// slider does not rescale under the cursor mid-drag.
@@ -447,6 +449,9 @@ pub struct MessagingUi {
 	pub reduce_saturation: bool,
 	/// Interface text scale as a percentage of the base size.
 	pub font_scale: u8,
+	pub message_text_scale: u8,
+	pub member_list_width: u16,
+	pub twelve_hour_time: bool,
 	pub animate_emoji: bool,
 	pub legacy_chat_input: bool,
 	/// A line each message should carry under it, rebuilt by the app every tick. Empty
@@ -3797,10 +3802,12 @@ impl MessagingUi {
 				commands.push(command);
 			}
 			if wide_members {
-				egui::Panel::right("people-pane")
-					.resizable(false)
+				let member_max = self.prepare_member_sidebar(ui);
+				let people = egui::Panel::right("people-pane")
+					.resizable(true)
 					.show_separator_line(!design::has_window_background(ui))
-					.exact_size(232.0)
+					.default_size(f32::from(self.member_list_width).min(member_max))
+					.size_range(180.0..=member_max)
 					.frame(
 						egui::Frame::new()
 							.fill(design::section_surface(
@@ -3818,6 +3825,7 @@ impl MessagingUi {
 					.show(ui, |ui| {
 						self.member_rows(ui, state, &mut commands);
 					});
+				self.record_member_sidebar(people.response.rect.width(), people.response.dragged());
 			} else {
 				let response = dialog::Dialog::new("members-narrow", "Members")
 					.subtitle("Everyone with access to this conversation.")
@@ -4044,6 +4052,11 @@ impl MessagingUi {
 						self.timeline.extension_actions = self.extensions.message_actions();
 						self.timeline.plugin_actions = self.testcord_message_actions.clone();
 						self.timeline.display = self.testcord_display;
+						self.timeline.display.hour = if self.twelve_hour_time {
+							crate::testcord::HourFormat::Twelve
+						} else {
+							crate::testcord::HourFormat::TwentyFour
+						};
 						self.timeline.message_markers = self.message_markers.clone();
 						self.reaction_picker
 							.quick_reactions(&mut self.timeline.quick_reactions);
@@ -4063,15 +4076,25 @@ impl MessagingUi {
 						if let Some(command) = state.request_author_members(&author_lookup) {
 							commands.push(command);
 						}
-						self.timeline.show_with_scroll(
-							ui,
-							state,
-							&mut self.editing,
-							&mut self.deleting,
-							(&mut self.avatars, &mut self.profile),
-							self.pending_upload.as_ref(),
-							&mut self.scroll,
-						);
+						ui.scope(|ui| {
+							let text_scale = if (80..=150).contains(&self.message_text_scale) {
+								self.message_text_scale
+							} else {
+								100
+							};
+							if text_scale != 100 {
+								ui.set_style(timeline::message_text_style(ui.style(), text_scale));
+							}
+							self.timeline.show_with_scroll(
+								ui,
+								state,
+								&mut self.editing,
+								&mut self.deleting,
+								(&mut self.avatars, &mut self.profile),
+								self.pending_upload.as_ref(),
+								&mut self.scroll,
+							);
+						});
 						if let Some(id) = self.timeline.sticker_request.take() {
 							if let Some(command) = state.request_sticker(id) {
 								commands.push(command);
