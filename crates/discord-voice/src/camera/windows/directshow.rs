@@ -326,14 +326,15 @@ fn configure(
 				let (target_width, target_height) = (target_width as usize, target_height as usize);
 				let exact = width == target_width && height == target_height;
 				let covers = width >= target_width && height >= target_height;
+				let same_shape = width * target_height == height * target_width;
 				// Without the exact mode, prefer the smallest one that covers the selected size
-				// (scaled down), else the largest smaller one (scaled up).
+				// (scaled down), else the largest smaller one (scaled up); same shape first.
 				let area = if covers {
 					width * height
 				} else {
 					usize::MAX - width * height
 				};
-				choices.push(((!exact, !covers, area), media));
+				choices.push(((!exact, !covers, !same_shape, area), media));
 			}
 		}
 		choices.sort_by_key(|(rank, _)| *rank);

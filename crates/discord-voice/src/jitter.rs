@@ -230,6 +230,25 @@ mod tests {
 	}
 
 	#[test]
+	fn wrap_reordering_and_duplicates_play_in_order_once() {
+		let order = [65533u16, 65535, 65534, 1, 0, 0, 65535, 2, 3, 4, 5, 6, 7];
+		let mut jitter = Jitter::default();
+		let mut heard = Vec::new();
+		for sequence in order {
+			jitter.push(sequence, sequence.to_le_bytes().to_vec());
+			heard.extend(play(&mut jitter, 1));
+		}
+		heard.extend(play(&mut jitter, 10));
+		let played: Vec<u16> = heard
+			.iter()
+			.filter(|packet| !packet.is_empty())
+			.map(|packet| u16::from_le_bytes([packet[0], packet[1]]))
+			.collect();
+		assert_eq!(played, [65533, 65534, 65535, 0, 1, 2, 3, 4, 5, 6, 7]);
+		assert_eq!(jitter.target, 3);
+	}
+
+	#[test]
 	fn a_sender_restart_or_long_stall_restarts_playout() {
 		let mut jitter = Jitter::default();
 		for sequence in 0..5u16 {
