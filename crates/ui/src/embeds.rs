@@ -147,17 +147,27 @@ fn gallery_len(embeds: &[Embed]) -> usize {
 fn gallery_rect(count: usize, index: usize, width: f32) -> egui::Rect {
 	let gap = 4.0_f32.min(width / 4.0);
 	let half = (width - gap) / 2.0;
+	let rows = if count == 3 { 2 } else { count.div_ceil(2) };
+	let tile_height = half.min(
+		((crate::avatars::media::MEDIA_MAX_HEIGHT - gap * rows.saturating_sub(1) as f32)
+			/ rows as f32)
+			.max(1.0),
+	);
 	let (x, y, height) = if count == 3 {
 		if index == 0 {
-			(0.0, 0.0, width)
+			(0.0, 0.0, tile_height * 2.0 + gap)
 		} else {
-			(half + gap, (index - 1) as f32 * (half + gap), half)
+			(
+				half + gap,
+				(index - 1) as f32 * (tile_height + gap),
+				tile_height,
+			)
 		}
 	} else {
 		(
 			(index % 2) as f32 * (half + gap),
-			(index / 2) as f32 * (half + gap),
-			half,
+			(index / 2) as f32 * (tile_height + gap),
+			tile_height,
 		)
 	};
 	egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(half, height))
@@ -938,10 +948,19 @@ mod tests {
 						assert!(rects[..i].iter().all(|other| !rect.intersects(*other)));
 					}
 					if count == 3 {
-						assert_eq!(rects[0].height(), width);
+						assert_eq!(
+							rects[0].height(),
+							rects[1].height() * 2.0 + (width / 4.0).min(4.0)
+						);
 						assert_eq!(rects[0].bottom(), rects[2].bottom());
 						assert_eq!(rects[1].left(), rects[2].left());
 					}
+					assert!(
+						rects
+							.iter()
+							.all(|rect| rect.bottom() <= crate::avatars::media::MEDIA_MAX_HEIGHT),
+						"Gallery with {count} images exceeded the media height limit at width {width}"
+					);
 					let ctx = egui::Context::default();
 					ctx.set_theme(theme);
 					let embeds = gallery_embeds(count);
