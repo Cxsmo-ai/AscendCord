@@ -1468,19 +1468,9 @@ impl MessagingUi {
 		let mut open = trigger
 			.ctx
 			.data_mut(|data| *data.get_temp_mut_or_default::<bool>(id));
-		let secondary_clicked = trigger.ctx.input(|input| {
-			let pointer = &input.pointer;
-			let secondary_pressed = pointer.button_pressed(egui::PointerButton::Secondary)
-				|| pointer.button_clicked(egui::PointerButton::Secondary);
-			secondary_pressed
-				&& pointer
-					.latest_pos()
-					.is_some_and(|position| trigger.interact_rect.contains(position))
-		});
+		let secondary_clicked = trigger.container_secondary_clicked();
 
-		if secondary_clicked {
-			open = true;
-		} else if primary_opens && trigger.clicked() {
+		if primary_opens && trigger.clicked() {
 			open = !open;
 		}
 		// Device dropdowns use egui's popup memory; keep the parent independently open.
@@ -1489,8 +1479,12 @@ impl MessagingUi {
 		} else {
 			egui::PopupCloseBehavior::CloseOnClickOutside
 		};
-		egui::Popup::menu(trigger)
-			.open_bool(&mut open)
+		let popup = if primary_opens {
+			egui::Popup::menu(trigger).id(id).open_bool(&mut open)
+		} else {
+			egui::Popup::context_menu(trigger).id(id)
+		};
+		popup
 			.style(|_: &mut egui::Style| {})
 			.width(340.0)
 			.close_behavior(close_behavior)

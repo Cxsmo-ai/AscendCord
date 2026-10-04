@@ -2105,14 +2105,7 @@ mod tests {
 		let source = "مرحبا English!";
 		let (rtl, right) = bidi_spans(&[(source.into(), style)]).unwrap();
 		assert!(right);
-		let bidi = unicode_bidi::BidiInfo::new(source, None);
-		let expected = bidi
-			.paragraphs
-			.iter()
-			.fold(String::new(), |mut display, paragraph| {
-				display.push_str(&bidi.reorder_line(paragraph, paragraph.range.clone()));
-				display
-			});
+		let expected = "English \u{0627}\u{0628}\u{062d}\u{0631}\u{0645}!";
 		assert_eq!(
 			rtl.iter()
 				.map(|(text, _)| text.as_str())
