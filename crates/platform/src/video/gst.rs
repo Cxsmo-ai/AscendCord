@@ -139,11 +139,30 @@ impl Decoder {
 					if has_video.swap(true, Ordering::AcqRel) {
 						return;
 					}
+					// Larger videos are scaled into the 1080p texture budget instead of refused.
+					let size = caps.structure(0).and_then(|caps| {
+						let width = u32::try_from(caps.get::<i32>("width").ok()?).ok()?;
+						let height = u32::try_from(caps.get::<i32>("height").ok()?).ok()?;
+						Some(super::fit((width, height)))
+					});
+					let scaled = size.map_or_else(
+						|| "video/x-raw".to_owned(),
+						|(width, height)| format!("video/x-raw,width={width},height={height}"),
+					);
 					link_branch(
 						&pipeline,
 						pad,
-						&["queue", "videoflip", "videoconvert"],
-						&[("videoflip", "video-direction", "auto")],
+						&[
+							"queue",
+							"videoscale",
+							"capsfilter",
+							"videoflip",
+							"videoconvert",
+						],
+						&[
+							("videoflip", "video-direction", "auto"),
+							("capsfilter", "caps", &scaled),
+						],
 						video.upcast_ref(),
 					)
 				} else if name.starts_with("audio/x-raw") {

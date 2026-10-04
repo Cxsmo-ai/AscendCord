@@ -14,8 +14,10 @@ pub use media_foundation::Decoder;
 
 #[cfg(target_os = "macos")]
 mod apple;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod mp4;
+#[cfg(target_os = "windows")]
+mod opus_track;
 #[cfg(target_os = "macos")]
 pub use apple::Decoder;
 
@@ -98,6 +100,20 @@ impl Decoder {
 	}
 }
 
+/// The largest even size with the same shape that fits the inline texture budget.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn fit((width, height): (u32, u32)) -> (u32, u32) {
+	if check_dimensions(width, height).is_ok() {
+		return (width, height);
+	}
+	let (w, h) = (f64::from(width), f64::from(height));
+	let scale = (1920.0 / w)
+		.min(1920.0 / h)
+		.min((1920.0 * 1080.0 / (w * h)).sqrt());
+	let even = |value: f64| ((value * scale / 2.0).floor() as u32 * 2).max(2);
+	(even(w), even(h))
+}
+
 /// The shared inline-player texture bound: 1080p worth of pixels within a 1920 px square.
 pub fn check_dimensions(width: u32, height: u32) -> Result<(), &'static str> {
 	if width == 0 || height == 0 {
@@ -166,5 +182,31 @@ mod tests {
 			rotate_rgba(&frame, 2, 1, 270),
 			(1, 2, vec![2, 2, 2, 255, 1, 1, 1, 255])
 		);
+	}
+}
+
+#[cfg(test)]
+mod fit_tests {
+	use super::{check_dimensions, fit};
+
+	#[test]
+	fn large_videos_are_scaled_into_the_inline_budget_keeping_their_shape() {
+		assert_eq!(fit((1920, 1080)), (1920, 1080));
+		assert_eq!(fit((1080, 1920)), (1080, 1920));
+		assert_eq!(fit((3840, 2160)), (1920, 1080));
+		assert_eq!(fit((2560, 1440)), (1920, 1080));
+		assert_eq!(fit((1080, 2048)), (1012, 1920));
+		assert_eq!(fit((1920, 1920)), (1440, 1440));
+		for size in [
+			(7680, 4320),
+			(8192, 2),
+			(2, 8192),
+			(4096, 2160),
+			(1440, 3120),
+		] {
+			let (width, height) = fit(size);
+			assert!(check_dimensions(width, height).is_ok(), "{size:?}");
+			assert!(width % 2 == 0 && height % 2 == 0);
+		}
 	}
 }

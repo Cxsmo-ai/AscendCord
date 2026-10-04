@@ -44,6 +44,8 @@ webkit6 = { package = "webkit2gtk", version = "=0.19.2", features = ["v2_38"] }
 unsafe_code = "deny"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# Opus audio in MP4 attachments; Media Foundation on Windows 10 has no Opus decoder.
+opus2 = { version = "=0.4.0", default-features = false, features = ["backend-libopus", "static", "bundled"] }
 tauri-winrt-notification = "=0.7.3"
 windows-core = "=0.61.2"
 windows = { version = "=0.61.3", features = ["UI_Notifications", "Win32_Security_Authorization", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant"] }

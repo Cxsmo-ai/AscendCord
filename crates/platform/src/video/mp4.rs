@@ -2,6 +2,8 @@
 //! are read into memory; media bytes stay in the caller's seekable stream. Every table length
 //! is capped, every offset is range-checked and nothing here can allocate from a size field
 //! alone. Fragmented files, external data references and unknown codecs are rejected.
+//! Windows uses only its Opus audio tracks, which Media Foundation cannot decode there.
+#![cfg_attr(target_os = "windows", allow(dead_code))]
 use super::{INVALID, MAX_BYTES, MAX_SECONDS, ReadSeek, TOO_LONG, UNSUPPORTED};
 use std::io::SeekFrom;
 
@@ -26,6 +28,8 @@ pub(super) enum VideoCodec {
 pub(super) enum AudioCodec {
 	/// MPEG-4 AAC with its AudioSpecificConfig.
 	Aac { config: Vec<u8> },
+	/// Opus in ISO BMFF, always decoded at 48 kHz; `pre_skip` samples precede the content.
+	Opus { pre_skip: u16 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -575,6 +579,9 @@ fn parse_audio_entry(stsd: &[u8]) -> Result<Option<(AudioCodec, u32, u16)>, &'st
 	let Some((kind, body)) = Boxes::new(stsd.get(8..).ok_or(INVALID)?).next() else {
 		return Ok(None);
 	};
+	if &kind == b"Opus" {
+		return parse_opus_entry(body).map(Some);
+	}
 	if &kind != b"mp4a" {
 		return Err(UNSUPPORTED);
 	}
@@ -600,6 +607,20 @@ fn parse_audio_entry(stsd: &[u8]) -> Result<Option<(AudioCodec, u32, u16)>, &'st
 		return Err(UNSUPPORTED);
 	}
 	Ok(Some((AudioCodec::Aac { config }, sample_rate, channels)))
+}
+
+/// Opus sample entry: an AudioSampleEntry whose `dOps` child carries the Opus header.
+/// Only mono and stereo (channel mapping family 0) are played.
+fn parse_opus_entry(body: &[u8]) -> Result<(AudioCodec, u32, u16), &'static str> {
+	let children = body.get(28..).ok_or(INVALID)?;
+	let ops = find_box(children, b"dOps").ok_or(UNSUPPORTED)?;
+	let channels = u16::from(*ops.get(1).ok_or(INVALID)?);
+	let pre_skip = read_u16(ops, 2)?;
+	let family = *ops.get(10).ok_or(INVALID)?;
+	if *ops.first().ok_or(INVALID)? != 0 || family != 0 || !(1..=2).contains(&channels) {
+		return Err(UNSUPPORTED);
+	}
+	Ok((AudioCodec::Opus { pre_skip }, 48_000, channels))
 }
 
 /// MPEG-4 elementary stream descriptor: the ES_Descriptor wraps a DecoderConfigDescriptor

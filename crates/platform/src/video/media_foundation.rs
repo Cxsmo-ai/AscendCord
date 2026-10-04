@@ -36,7 +36,7 @@ const ALL: u32 = MF_SOURCE_READER_ALL_STREAMS.0 as u32;
 const UNSUPPORTED: &str = "This video format or codec is not supported by Windows.";
 const INVALID: &str = "The video could not be decoded safely.";
 
-use super::{Info, ReadSeek, Sample};
+use super::{Info, ReadSeek, Sample, opus_track::OpusTrack};
 
 // Keep the reader and byte stream ahead of Runtime: COM objects must be released
 // before MFShutdown/CoUninitialize. Rc also makes this actor thread-affine.
@@ -57,6 +57,8 @@ pub struct Decoder {
 	buffer_height: u32,
 	crop: (u32, u32),
 	rotation: u32,
+	/// Opus audio decoded outside Media Foundation, which cannot decode it on Windows 10.
+	opus: Option<OpusTrack>,
 }
 
 /// A negotiated reader before the decoder takes ownership.
@@ -145,8 +147,9 @@ impl Decoder {
 		}
 		source.seek(SeekFrom::Start(0)).map_err(|_| INVALID)?;
 		let runtime = Runtime::open()?;
+		let source = Arc::new(Mutex::new(source));
 		let stream: IStream = ReadStream {
-			source: Arc::new(Mutex::new(source)),
+			source: source.clone(),
 			position: Mutex::new(0),
 			length,
 		}
@@ -167,7 +170,18 @@ impl Decoder {
 				.filter(|_| accelerated)
 				.map(|(_, manager)| manager);
 			match Self::configure(&stream, manager) {
-				Ok(parts) => {
+				Ok(mut parts) => {
+					// Media Foundation could not decode the audio track. Opus is decoded here;
+					// any other codec plays the picture without sound rather than failing.
+					let opus = if parts.audio_index.is_none() {
+						OpusTrack::open(&source, length)?
+					} else {
+						None
+					};
+					if opus.is_some() {
+						parts.info.sample_rate = 48_000;
+						parts.info.channels = 2;
+					}
 					let (device, manager) = match (accelerated, hardware.take()) {
 						(true, Some((device, manager))) => (Some(device), Some(manager)),
 						_ => (None, None),
@@ -189,6 +203,7 @@ impl Decoder {
 						buffer_height: parts.height,
 						crop: (0, 0),
 						rotation: parts.rotation,
+						opus,
 					});
 				}
 				Err(failure) => error = failure,
@@ -219,8 +234,9 @@ impl Decoder {
 					.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, manager)
 					.map_err(|_| UNSUPPORTED)?;
 			} else {
+				// The advanced processor also scales, which videos above 1080p need.
 				attributes
-					.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
+					.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)
 					.map_err(|_| UNSUPPORTED)?;
 			}
 			let reader = MFCreateSourceReaderFromByteStream(&stream, &attributes)
@@ -229,7 +245,8 @@ impl Decoder {
 			let native = reader
 				.GetNativeMediaType(VIDEO, 0)
 				.map_err(|_| UNSUPPORTED)?;
-			let (width, height) = dimensions(&native)?;
+			// Larger videos are scaled into the 1080p texture budget instead of refused.
+			let (width, height) = super::fit(native_dimensions(&native)?);
 			let rotation = native.GetUINT32(&MF_MT_VIDEO_ROTATION).unwrap_or(0);
 			if !matches!(rotation, 0 | 90 | 180 | 270) {
 				return Err(UNSUPPORTED);
@@ -313,44 +330,56 @@ impl Decoder {
 			validate_stride(width, height, stride)?;
 			let mut sample_rate = 0;
 			let mut channels = 0;
-			if let Some(index) = audio_index {
-				let audio = reader.GetNativeMediaType(index, 0).map_err(|_| INVALID)?;
-				sample_rate = audio
-					.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)
-					.map_err(|_| UNSUPPORTED)?;
-				channels = audio
-					.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)
-					.map_err(|_| UNSUPPORTED)?;
-				if !(1..=96_000).contains(&sample_rate) || !(1..=2).contains(&channels) {
-					return Err(UNSUPPORTED);
+			let audio_format = audio_index.and_then(|index| {
+				let format = (|| -> Result<(u32, u32), &'static str> {
+					let audio = reader.GetNativeMediaType(index, 0).map_err(|_| INVALID)?;
+					let sample_rate = audio
+						.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)
+						.map_err(|_| UNSUPPORTED)?;
+					let channels = audio
+						.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)
+						.map_err(|_| UNSUPPORTED)?;
+					if !(1..=96_000).contains(&sample_rate) || !(1..=2).contains(&channels) {
+						return Err(UNSUPPORTED);
+					}
+					let audio = MFCreateMediaType().map_err(|_| INVALID)?;
+					audio
+						.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
+						.map_err(|_| INVALID)?;
+					audio
+						.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float)
+						.map_err(|_| INVALID)?;
+					reader
+						.SetCurrentMediaType(index, None, &audio)
+						.map_err(|_| UNSUPPORTED)?;
+					reader
+						.SetStreamSelection(index, true)
+						.map_err(|_| INVALID)?;
+					let audio = reader.GetCurrentMediaType(index).map_err(|_| INVALID)?;
+					if audio
+						.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)
+						.map_err(|_| INVALID)?
+						!= sample_rate || audio
+						.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)
+						.map_err(|_| INVALID)?
+						!= channels || audio
+						.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE)
+						.map_err(|_| INVALID)?
+						!= 32
+					{
+						return Err(UNSUPPORTED);
+					}
+					Ok((sample_rate, channels))
+				})();
+				if format.is_err() {
+					let _ = reader.SetStreamSelection(index, false);
 				}
-				let audio = MFCreateMediaType().map_err(|_| INVALID)?;
-				audio
-					.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
-					.map_err(|_| INVALID)?;
-				audio
-					.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float)
-					.map_err(|_| INVALID)?;
-				reader
-					.SetCurrentMediaType(index, None, &audio)
-					.map_err(|_| UNSUPPORTED)?;
-				reader
-					.SetStreamSelection(index, true)
-					.map_err(|_| INVALID)?;
-				let audio = reader.GetCurrentMediaType(index).map_err(|_| INVALID)?;
-				if audio
-					.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)
-					.map_err(|_| INVALID)?
-					!= sample_rate || audio
-					.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)
-					.map_err(|_| INVALID)?
-					!= channels || audio
-					.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE)
-					.map_err(|_| INVALID)?
-					!= 32
-				{
-					return Err(UNSUPPORTED);
-				}
+				format.ok()
+			});
+			let audio_index = audio_index.filter(|_| audio_format.is_some());
+			if let Some((rate, count)) = audio_format {
+				sample_rate = rate;
+				channels = count;
 			}
 			let duration = reader
 				.GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
@@ -409,6 +438,9 @@ impl Decoder {
 		}
 		self.video_done = false;
 		self.audio_done = self.audio_index.is_none();
+		if let Some(opus) = &mut self.opus {
+			opus.seek(seconds);
+		}
 		Ok(())
 	}
 
@@ -417,6 +449,9 @@ impl Decoder {
 	}
 
 	pub fn read_audio(&mut self) -> Result<Option<Sample>, &'static str> {
+		if let Some(opus) = &mut self.opus {
+			return opus.read();
+		}
 		match self.audio_index {
 			Some(index) => self.read_from(index),
 			None => Ok(None),
@@ -613,6 +648,17 @@ impl Decoder {
 		}
 		convert(&sample_bytes(sample)?, self.stride)
 	}
+}
+
+/// The source picture size, before any scaling. 8K is the largest accepted.
+fn native_dimensions(media: &IMFMediaType) -> Result<(u32, u32), &'static str> {
+	// SAFETY: Reading an integer attribute from a live media type.
+	let size = unsafe { media.GetUINT64(&MF_MT_FRAME_SIZE) }.map_err(|_| INVALID)?;
+	let (width, height) = ((size >> 32) as u32, size as u32);
+	if width == 0 || height == 0 || width > 8192 || height > 8192 {
+		return Err(UNSUPPORTED);
+	}
+	Ok((width, height))
 }
 
 fn dimensions(media: &IMFMediaType) -> Result<(u32, u32), &'static str> {

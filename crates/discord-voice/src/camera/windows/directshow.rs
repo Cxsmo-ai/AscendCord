@@ -1,6 +1,6 @@
 //! Compatibility path for virtual cameras registered only with DirectShow.
 #![allow(non_snake_case)] // Custom COM interfaces preserve the Qedit.h method names.
-use super::{INVALID, Shared, TIMEOUT, UNAVAILABLE};
+use super::{INVALID, Shared, TIMEOUT, UNAVAILABLE, invalid};
 use model::CameraQuality;
 use std::{
 	ffi::c_void,
@@ -24,6 +24,23 @@ use windows::{
 const SAMPLE_GRABBER: GUID = GUID::from_u128(0xc1f400a0_3f08_11d3_9f0b_006008039e37);
 const NULL_RENDERER: GUID = GUID::from_u128(0xc1f400a4_3f08_11d3_9f0b_006008039e37);
 const MAX_BYTES: usize = 3840 * 2160 * 4;
+// The graph's allocator is bounded by its total memory, not an assumed buffer count: virtual
+// cameras and colour converters commonly negotiate four or more samples.
+const MAX_ALLOCATOR_BYTES: usize = MAX_BYTES * 8;
+const FORMAT_CHANGED: &str = "Camera changed its video format; restart the camera";
+
+fn allocator_fits(buffers: i32, buffer_bytes: i32, prefix: i32, frame_bytes: usize) -> bool {
+	let (Ok(buffers), Ok(buffer_bytes)) = (usize::try_from(buffers), usize::try_from(buffer_bytes))
+	else {
+		return false;
+	};
+	buffers >= 1
+		&& (0..=4096).contains(&prefix)
+		&& (frame_bytes..=MAX_BYTES).contains(&buffer_bytes)
+		&& buffers
+			.checked_mul(buffer_bytes)
+			.is_some_and(|total| total <= MAX_ALLOCATOR_BYTES)
+}
 
 // Qedit.h interfaces are absent from windows-rs metadata. Keep the SDK ABI order.
 #[interface("6b652fff-11fe-4fce-92ad-0266b5d7c78f")]
@@ -48,7 +65,7 @@ struct Callback {
 	send: mpsc::SyncSender<Result<Vec<u8>, &'static str>>,
 	last: Mutex<(Instant, bool)>,
 	bytes: usize,
-	dimensions: (usize, usize, bool),
+	format: ((usize, usize, bool), GUID),
 	interval: Duration,
 }
 impl ISampleGrabberCB_Impl for Callback_Impl {
@@ -61,35 +78,38 @@ impl ISampleGrabberCB_Impl for Callback_Impl {
 		let result = unsafe {
 			(|| {
 				if last.1 {
-					return Err(INVALID);
+					return Err("after an earlier error");
 				}
-				let sample = IMediaSample::from_raw_borrowed(&sample).ok_or(INVALID)?;
+				let sample = IMediaSample::from_raw_borrowed(&sample).ok_or("sample pointer")?;
 				let length = sample.GetActualDataLength();
 				let capacity = sample.GetSize();
+				// A sample may carry tail bytes after the picture; only the picture is copied.
 				if length < 0
 					|| capacity < length
 					|| capacity as usize > MAX_BYTES
-					|| length as usize != self.bytes
+					|| (length as usize) < self.bytes
 				{
-					return Err(INVALID);
+					return Err("sample size");
 				}
-				let changed = sample.GetMediaType().map_err(|_| INVALID)?;
+				let changed = sample.GetMediaType().map_err(|_| "sample media type")?;
 				if !changed.is_null() {
 					let media = Media::take(changed);
-					if rgb_dimensions(&media.0)? != self.dimensions {
-						return Err("Camera changed its video format; restart the camera");
+					if (dimensions(&media.0).ok(), media.0.subtype)
+						!= (Some(self.format.0), self.format.1)
+					{
+						return Err(FORMAT_CHANGED);
 					}
 				}
 				if last.0.elapsed() < self.interval {
 					return Ok(None);
 				}
 				last.0 = Instant::now();
-				let pointer = sample.GetPointer().map_err(|_| INVALID)?;
+				let pointer = sample.GetPointer().map_err(|_| "sample pointer")?;
 				if pointer.is_null() {
-					return Err(INVALID);
+					return Err("sample pointer");
 				}
 				Ok(Some(
-					std::slice::from_raw_parts(pointer, length as usize).to_vec(),
+					std::slice::from_raw_parts(pointer, self.bytes).to_vec(),
 				))
 			})()
 		};
@@ -244,6 +264,188 @@ fn dimensions(media: &AM_MEDIA_TYPE) -> Result<(usize, usize, bool), &'static st
 	))
 }
 
+/// Pictures taken from the camera as they are. Converting these here avoids Windows' own
+/// converters, some of which accept a large YUV picture and then never deliver a frame.
+/// Anything else is still requested as RGB24 through those converters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pixels {
+	Rgb24,
+	Rgb32,
+	Yuy2,
+	Nv12,
+	I420,
+}
+
+impl Pixels {
+	fn of(subtype: &GUID) -> Option<Self> {
+		let fourcc = |code: &[u8; 4]| {
+			GUID::from_values(
+				u32::from_le_bytes(*code),
+				0,
+				0x10,
+				[0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71],
+			)
+		};
+		Some(match *subtype {
+			kind if kind == MEDIASUBTYPE_RGB24 => Self::Rgb24,
+			kind if kind == MEDIASUBTYPE_RGB32 => Self::Rgb32,
+			kind if kind == fourcc(b"YUY2") => Self::Yuy2,
+			kind if kind == fourcc(b"NV12") => Self::Nv12,
+			kind if kind == fourcc(b"I420") || kind == fourcc(b"IYUV") => Self::I420,
+			_ => return None,
+		})
+	}
+
+	/// Bytes in one picture: RGB and packed YUV rows are padded to four bytes, planes are not.
+	fn bytes(self, width: usize, height: usize) -> usize {
+		match self {
+			Self::Rgb24 => (width * 3).next_multiple_of(4) * height,
+			Self::Rgb32 => width * 4 * height,
+			Self::Yuy2 => (width * 2).next_multiple_of(4) * height,
+			Self::Nv12 | Self::I420 => width * height + 2 * width.div_ceil(2) * height.div_ceil(2),
+		}
+	}
+
+	/// RGB rows keep the bitmap orientation; YUV pictures are always stored top-down.
+	fn bottom_up(self, bitmap_bottom_up: bool) -> bool {
+		matches!(self, Self::Rgb24 | Self::Rgb32) && bitmap_bottom_up
+	}
+}
+
+/// Studio-range YUV to blue, green, red: BT.709 for HD pictures, BT.601 for SD, as
+/// Windows recommends when a camera does not say.
+fn bgr(y: u8, u: u8, v: u8, hd: bool) -> [u8; 3] {
+	let (c, d, e) = (
+		298 * (i32::from(y) - 16),
+		i32::from(u) - 128,
+		i32::from(v) - 128,
+	);
+	let (red_v, green_u, green_v, blue_u) = if hd {
+		(459, 55, 136, 541)
+	} else {
+		(409, 100, 208, 516)
+	};
+	let channel = |value: i32| ((value + 128) >> 8).clamp(0, 255) as u8;
+	[
+		channel(c + blue_u * d),
+		channel(c - green_u * d - green_v * e),
+		channel(c + red_v * e),
+	]
+}
+
+/// Where one connected picture lives in a sample: rows of `stride` pixels, `rows` of them,
+/// of which the top-left `width` by `height` are the picture (`rcSource`).
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+	pixels: Pixels,
+	stride: usize,
+	rows: usize,
+	width: usize,
+	height: usize,
+}
+
+impl Layout {
+	fn new(
+		pixels: Pixels,
+		(stride, rows, bottom_up): (usize, usize, bool),
+		visible: Option<(usize, usize)>,
+	) -> Self {
+		let (width, height) = visible
+			.filter(|&(width, height)| width <= stride && height <= rows)
+			.unwrap_or((stride, rows));
+		// A bottom-up picture keeps its top rows last in memory, so only its width is cropped.
+		let height = if pixels.bottom_up(bottom_up) {
+			rows
+		} else {
+			height
+		};
+		Self {
+			pixels,
+			stride,
+			rows,
+			width,
+			height,
+		}
+	}
+
+	fn bytes(self) -> usize {
+		self.pixels.bytes(self.stride, self.rows)
+	}
+}
+
+/// The visible picture as 24-bit rows padded to four bytes, the layout `rgb_frame` reads.
+fn bgr24(bytes: &[u8], layout: Layout) -> Vec<u8> {
+	let Layout {
+		pixels,
+		stride,
+		rows,
+		width,
+		height,
+	} = layout;
+	let pitch = (width * 3).next_multiple_of(4);
+	let source_pitch = (stride * 3).next_multiple_of(4);
+	if pixels == Pixels::Rgb24 && pitch == source_pitch {
+		return bytes[..pitch * height].to_vec();
+	}
+	let hd = height > 576;
+	let mut out = vec![0; pitch * height];
+	let chroma_stride = stride.div_ceil(2);
+	let luma = stride * rows;
+	for (y, row) in out.chunks_exact_mut(pitch).enumerate() {
+		for (x, pixel) in row[..width * 3]
+			.as_chunks_mut::<3>()
+			.0
+			.iter_mut()
+			.enumerate()
+		{
+			*pixel = match pixels {
+				Pixels::Rgb24 => {
+					let at = y * source_pitch + x * 3;
+					[bytes[at], bytes[at + 1], bytes[at + 2]]
+				}
+				Pixels::Rgb32 => {
+					let at = (y * stride + x) * 4;
+					[bytes[at], bytes[at + 1], bytes[at + 2]]
+				}
+				Pixels::Yuy2 => {
+					let at = y * (stride * 2).next_multiple_of(4) + (x & !1) * 2;
+					bgr(bytes[at + (x & 1) * 2], bytes[at + 1], bytes[at + 3], hd)
+				}
+				Pixels::Nv12 => {
+					let at = luma + (y / 2) * chroma_stride * 2 + (x / 2) * 2;
+					bgr(bytes[y * stride + x], bytes[at], bytes[at + 1], hd)
+				}
+				Pixels::I420 => {
+					let plane = chroma_stride * rows.div_ceil(2);
+					let at = luma + (y / 2) * chroma_stride + x / 2;
+					bgr(bytes[y * stride + x], bytes[at], bytes[at + plane], hd)
+				}
+			};
+		}
+	}
+	out
+}
+
+/// The picture area (`rcSource`) and frame interval of a video format, when it states them.
+fn source_area(media: &AM_MEDIA_TYPE) -> (Option<(usize, usize)>, Option<i64>) {
+	if dimensions(media).is_err() {
+		return (None, None);
+	}
+	// SAFETY: dimensions validated the complete header allocation for either layout.
+	let (area, interval) = unsafe {
+		if media.formattype == FORMAT_VideoInfo {
+			let header = media.pbFormat.cast::<VIDEOINFOHEADER>().read_unaligned();
+			(header.rcSource, header.AvgTimePerFrame)
+		} else {
+			let header = media.pbFormat.cast::<VIDEOINFOHEADER2>().read_unaligned();
+			(header.rcSource, header.AvgTimePerFrame)
+		}
+	};
+	let visible = (area.left == 0 && area.top == 0 && area.right > 0 && area.bottom > 0)
+		.then_some((area.right as usize, area.bottom as usize));
+	(visible, (interval > 0).then_some(interval))
+}
+
 fn rgb_dimensions(media: &AM_MEDIA_TYPE) -> Result<(usize, usize, bool), &'static str> {
 	let dimensions = dimensions(media)?;
 	if media.subtype != MEDIASUBTYPE_RGB24 || media.formattype != FORMAT_VideoInfo {
@@ -263,11 +465,52 @@ fn rgb_dimensions(media: &AM_MEDIA_TYPE) -> Result<(usize, usize, bool), &'stati
 	Ok(dimensions)
 }
 
+/// FourCC subtypes print as their four letters, others as the GUID.
+fn subtype_name(subtype: &GUID) -> String {
+	let code = subtype.data1.to_le_bytes();
+	if code.iter().all(u8::is_ascii_alphanumeric) {
+		String::from_utf8_lossy(&code).into_owned()
+	} else if *subtype == MEDIASUBTYPE_RGB24 {
+		"RGB24".into()
+	} else if *subtype == MEDIASUBTYPE_RGB32 {
+		"RGB32".into()
+	} else {
+		format!("{subtype:?}")
+	}
+}
+
+/// Names of the filters DirectShow connected, for reports about a camera that stays silent.
+fn filter_names(graph: &IGraphBuilder) -> String {
+	let mut names = Vec::new();
+	// SAFETY: Worker-owned graph. Each FILTER_INFO graph reference is released after reading.
+	unsafe {
+		let Ok(filters) = graph.EnumFilters() else {
+			return "unknown filters".into();
+		};
+		for _ in 0..16 {
+			let mut filter = [None];
+			if filters.Next(&mut filter, None) != HRESULT(0) {
+				break;
+			}
+			let Some(filter) = filter[0].take() else {
+				break;
+			};
+			let mut info = FILTER_INFO::default();
+			if filter.QueryFilterInfo(&mut info).is_ok() {
+				let length = info.achName.iter().position(|&c| c == 0).unwrap_or(128);
+				names.push(String::from_utf16_lossy(&info.achName[..length]));
+				ManuallyDrop::drop(&mut info.pGraph);
+			}
+		}
+	}
+	names.join(" / ")
+}
+
 fn configure(
 	builder: &ICaptureGraphBuilder2,
 	source: &IBaseFilter,
 	quality: CameraQuality,
-) -> Result<(), &'static str> {
+) -> Result<(String, GUID), &'static str> {
 	let (target_width, target_height) = quality.dimensions();
 	// SAFETY: Owned worker graph, only bounded native formats may be selected.
 	unsafe {
@@ -305,19 +548,32 @@ fn configure(
 				continue;
 			}
 			if let Ok((width, height, _)) = dimensions(&media.0) {
-				choices.push((
-					(
-						width != target_width as usize || height != target_height as usize,
-						width * height,
-					),
-					media,
-				));
+				let (target_width, target_height) = (target_width as usize, target_height as usize);
+				let exact = width == target_width && height == target_height;
+				let covers = width >= target_width && height >= target_height;
+				let same_shape = width * target_height == height * target_width;
+				// Without the exact mode, prefer the smallest one that covers the selected size
+				// (scaled down), else the largest smaller one (scaled up); same shape first.
+				let area = if covers {
+					width * height
+				} else {
+					usize::MAX - width * height
+				};
+				// Among equal sizes, the frame rate closest to the selected one.
+				let rate = source_area(&media.0).1.map_or(u64::MAX, |interval| {
+					(10_000_000 / interval as u64).abs_diff(u64::from(quality.frames_per_second))
+				});
+				choices.push(((!exact, !covers, !same_shape, area, rate), media));
 			}
 		}
 		choices.sort_by_key(|(rank, _)| *rank);
 		for (_, media) in choices {
 			if config.SetFormat(&media.0).is_ok() {
-				return Ok(());
+				let (width, height, _) = dimensions(&media.0)?;
+				return Ok((
+					format!("{} {width}x{height}", subtype_name(&media.0.subtype)),
+					media.0.subtype,
+				));
 			}
 		}
 		Err("Camera does not offer a supported capture mode up to 3840×2160")
@@ -355,7 +611,7 @@ pub(super) fn run(
 		.ok_or("Selected Windows camera is no longer available")?;
 	// SAFETY: This is the only activation path, called after an explicit camera-on
 	// gesture. Graph, format negotiation and teardown all remain on this worker.
-	let (capture, receive, width, height, bottom_up) = unsafe {
+	let (capture, receive, width, height, bottom_up, layout, mode, filters) = unsafe {
 		let source: IBaseFilter = moniker.BindToObject(None, None).map_err(|_| UNAVAILABLE)?;
 		let graph: IGraphBuilder = CoCreateInstance(&CLSID_FilterGraph, None, CLSCTX_INPROC_SERVER)
 			.map_err(|_| UNAVAILABLE)?;
@@ -366,7 +622,7 @@ pub(super) fn run(
 		graph
 			.AddFilter(&source, w!("Camera"))
 			.map_err(|_| UNAVAILABLE)?;
-		configure(&builder, &source, quality)?;
+		let (mode, native) = configure(&builder, &source, quality)?;
 		let filter: IBaseFilter = CoCreateInstance(&SAMPLE_GRABBER, None, CLSCTX_INPROC_SERVER)
 			.map_err(|_| UNAVAILABLE)?;
 		let grabber: ISampleGrabber = filter.cast().map_err(|_| UNAVAILABLE)?;
@@ -375,11 +631,19 @@ pub(super) fn run(
 			grabber,
 			callback: None,
 		};
-		let requested = AM_MEDIA_TYPE {
-			majortype: MEDIATYPE_Video,
-			subtype: MEDIASUBTYPE_RGB24,
-			formattype: FORMAT_VideoInfo,
-			..Default::default()
+		let requested = if Pixels::of(&native).is_some() {
+			AM_MEDIA_TYPE {
+				majortype: MEDIATYPE_Video,
+				subtype: native,
+				..Default::default()
+			}
+		} else {
+			AM_MEDIA_TYPE {
+				majortype: MEDIATYPE_Video,
+				subtype: MEDIASUBTYPE_RGB24,
+				formattype: FORMAT_VideoInfo,
+				..Default::default()
+			}
 		};
 		capture
 			.grabber
@@ -408,21 +672,40 @@ pub(super) fn run(
 				&sink,
 			)
 			.map_err(|_| "Windows could not convert this camera to RGB video")?;
+		// Deliver samples as they arrive. Some virtual cameras stamp samples with their own
+		// clock, and a clocked graph would hold every one of them back.
+		if let Ok(filter) = graph.cast::<IMediaFilter>() {
+			let _ = filter.SetSyncSource(None::<&windows::Win32::Media::IReferenceClock>);
+		}
+		let filters = filter_names(&graph);
 		let mut media = Media(AM_MEDIA_TYPE::default());
 		capture
 			.grabber
 			.GetConnectedMediaType(&mut media.0)
 			.ok()
 			.map_err(|_| INVALID)?;
-		let (width, height, bottom_up) = rgb_dimensions(&media.0)?;
-		if (width, height)
-			!= (
-				quality.dimensions().0 as usize,
-				quality.dimensions().1 as usize,
-			) {
-			return Err("Selected Windows camera mode did not match the requested resolution");
+		let pixels = Pixels::of(&media.0.subtype);
+		let connected = match pixels {
+			Some(Pixels::Rgb24) => rgb_dimensions(&media.0),
+			Some(_) => dimensions(&media.0),
+			None => Err(INVALID),
 		}
-		let bytes = (width * 3).next_multiple_of(4) * height;
+		.map_err(|_| {
+			invalid(
+				shared,
+				format!(
+					"connected format {} / {:?}",
+					subtype_name(&media.0.subtype),
+					media.0.formattype
+				),
+			)
+		})?;
+		let pixels = pixels.expect("checked above");
+		let layout = Layout::new(pixels, connected, source_area(&media.0).0);
+		let bottom_up = pixels.bottom_up(connected.2);
+		let (width, height) = (layout.width, layout.height);
+		// rgb_frame scales a camera without the exact mode to the selected size.
+		let bytes = layout.bytes();
 		// Check the actual negotiated allocator before any filter starts delivering.
 		let pins = filter.EnumPins().map_err(|_| INVALID)?;
 		let mut bounded_allocator = false;
@@ -436,19 +719,26 @@ pub(super) fn run(
 				let properties = input
 					.GetAllocator()
 					.and_then(|allocator| allocator.GetProperties())
-					.map_err(|_| INVALID)?;
-				if !(1..=3).contains(&properties.cBuffers)
-					|| properties.cbBuffer < bytes as i32
-					|| properties.cbBuffer as usize > MAX_BYTES
-					|| !(0..=4096).contains(&properties.cbPrefix)
-				{
-					return Err(INVALID);
+					.map_err(|error| invalid(shared, format!("allocator properties: {error}")))?;
+				if !allocator_fits(
+					properties.cBuffers,
+					properties.cbBuffer,
+					properties.cbPrefix,
+					bytes,
+				) {
+					return Err(invalid(
+						shared,
+						format!(
+							"allocator: {} buffers of {} bytes, prefix {}; {width}x{height} needs {bytes}",
+							properties.cBuffers, properties.cbBuffer, properties.cbPrefix
+						),
+					));
 				}
 				bounded_allocator = true;
 			}
 		}
 		if !bounded_allocator {
-			return Err(INVALID);
+			return Err(invalid(shared, "no frame grabber allocator".into()));
 		}
 		let (send, receive) = mpsc::sync_channel(1);
 		let interval = Duration::from_secs_f64(1.0 / f64::from(quality.frames_per_second));
@@ -456,7 +746,7 @@ pub(super) fn run(
 			send,
 			last: Mutex::new((Instant::now() - interval, false)),
 			bytes,
-			dimensions: (width, height, bottom_up),
+			format: (connected, media.0.subtype),
 			interval,
 		}
 		.into();
@@ -469,15 +759,21 @@ pub(super) fn run(
 		if !shared.stopped.load(Ordering::Acquire) {
 			capture.control.Run().map_err(|_| UNAVAILABLE)?;
 		}
-		(capture, receive, width, height, bottom_up)
+		(
+			capture, receive, width, height, bottom_up, layout, mode, filters,
+		)
 	};
 	let mut last = Instant::now();
 	while !shared.stopped.load(Ordering::Acquire) {
 		match receive.recv_timeout(Duration::from_millis(50)) {
 			Ok(bytes) => {
+				let bytes = bytes.map_err(|reason| match reason {
+					FORMAT_CHANGED => reason,
+					reason => invalid(shared, format!("{reason}, {layout:?}")),
+				})?;
 				let target = quality.dimensions();
 				let rgb = rgb_frame(
-					&bytes?,
+					&bgr24(&bytes, layout),
 					width,
 					height,
 					bottom_up,
@@ -489,7 +785,12 @@ pub(super) fn run(
 				}
 			}
 			Err(mpsc::RecvTimeoutError::Timeout) if last.elapsed() < Duration::from_secs(5) => {}
-			_ => return Err(TIMEOUT),
+			_ => {
+				shared.set_error_detail(format!(
+					"{TIMEOUT} (no frames from {mode} through {filters})"
+				));
+				return Err(TIMEOUT);
+			}
 		}
 	}
 	drop(capture);
@@ -550,6 +851,54 @@ mod tests {
 	use super::*;
 	use crate::camera::{HEIGHT, WIDTH};
 	#[test]
+	fn native_yuv_and_rgb32_pictures_convert_in_bounds() {
+		for hd in [false, true] {
+			assert_eq!(bgr(235, 128, 128, hd), [255, 255, 255]);
+			assert_eq!(bgr(16, 128, 128, hd), [0, 0, 0]);
+		}
+		// Pure red encoded with each matrix decodes back to red.
+		for red in [bgr(81, 90, 240, false), bgr(63, 102, 240, true)] {
+			assert!(red[2] > 250 && red[0] < 6 && red[1] < 6, "{red:?}");
+		}
+		let yuy2 = [235u8, 128, 16, 128, 235, 128, 16, 128].repeat(2);
+		let layout = Layout::new(Pixels::Yuy2, (4, 2, true), None);
+		assert_eq!(layout.bytes(), yuy2.len());
+		assert_eq!(&bgr24(&yuy2, layout)[..6], &[255, 255, 255, 0, 0, 0]);
+		for (width, height) in [(5, 3), (1, 1), (2560, 1440)] {
+			for pixels in [
+				Pixels::Nv12,
+				Pixels::I420,
+				Pixels::Yuy2,
+				Pixels::Rgb32,
+				Pixels::Rgb24,
+			] {
+				let layout = Layout::new(pixels, (width, height, false), None);
+				let bytes = vec![128; layout.bytes()];
+				assert_eq!(
+					bgr24(&bytes, layout).len(),
+					(width * 3).next_multiple_of(4) * height
+				);
+			}
+		}
+		// A 1920-wide NV12 picture in 2048-pixel rows: the chroma plane follows the padded
+		// luma plane and the padding is cropped away.
+		let (stride, rows) = (2048, 1080);
+		let layout = Layout::new(Pixels::Nv12, (stride, rows, true), Some((1920, 1080)));
+		let mut nv12 = vec![16u8; layout.bytes()];
+		for row in 0..rows {
+			nv12[row * stride..row * stride + 1920].fill(235);
+		}
+		nv12[stride * rows..].fill(128);
+		let out = bgr24(&nv12, layout);
+		assert_eq!(out.len(), 1920 * 3 * 1080);
+		assert!(out.iter().all(|&value| value == 255));
+		assert_eq!(Pixels::of(&MEDIASUBTYPE_RGB32), Some(Pixels::Rgb32));
+		assert_eq!(Pixels::of(&MEDIASUBTYPE_NV12), Some(Pixels::Nv12));
+		assert_eq!(Pixels::of(&MEDIASUBTYPE_YUY2), Some(Pixels::Yuy2));
+		assert_eq!(Pixels::of(&MEDIASUBTYPE_MJPG), None);
+	}
+
+	#[test]
 	fn rgb_conversion_bounds_padding_orientation_and_resize() {
 		let mut header = VIDEOINFOHEADER::default();
 		header.bmiHeader.biWidth = WIDTH as i32;
@@ -580,6 +929,15 @@ mod tests {
 		let end = (HEIGHT - 1) * WIDTH * 3 + center;
 		assert_eq!(&top[end..end + 3], &[6, 5, 4]);
 		assert_eq!(&top[..3], &[0, 0, 0]);
+		let frame = 1920 * 1080 * 3;
+		for buffers in [1, 3, 4, 8, 12] {
+			assert!(allocator_fits(buffers, frame as i32, 0, frame));
+		}
+		assert!(!allocator_fits(0, frame as i32, 0, frame));
+		assert!(!allocator_fits(-1, frame as i32, 0, frame));
+		assert!(!allocator_fits(4, frame as i32 - 1, 0, frame));
+		assert!(!allocator_fits(1, frame as i32, 4097, frame));
+		assert!(!allocator_fits(9, MAX_BYTES as i32, 0, frame));
 		let wide = rgb_frame(&vec![255; 16 * 3 * 9], 16, 9, false, target).unwrap();
 		assert_eq!(&wide[..WIDTH * 60 * 3], &vec![0; WIDTH * 60 * 3]);
 		assert_eq!(

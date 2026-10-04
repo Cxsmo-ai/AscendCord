@@ -31,6 +31,21 @@ const INVALID: &str = "Camera did not provide the selected bounded RGB frame";
 const UNAVAILABLE: &str = "Camera is busy or unavailable. Check Windows Settings > Privacy & security > Camera and allow desktop apps to access your camera.";
 const TIMEOUT: &str = "Camera stopped delivering frames; check the device and try again";
 
+/// Records which native contract failed; the short message stays the same for the UI.
+pub(super) fn invalid(shared: &Shared, detail: String) -> &'static str {
+	shared.set_error_detail(format!("{INVALID} ({detail})"));
+	INVALID
+}
+
+/// Padded rows are fine as long as the whole mapped picture stays within the frame budget.
+fn valid_stride(stride: i32, (width, height): (usize, usize)) -> bool {
+	let pitch = stride.unsigned_abs() as usize;
+	width.checked_mul(4).is_some_and(|row| pitch >= row)
+		&& pitch
+			.checked_mul(height)
+			.is_some_and(|bytes| bytes <= MAX_FRAME_BYTES)
+}
+
 // Like the attachment decoder, balance COM/MF on their owning worker. Locals holding
 // COM objects are declared after this guard and therefore released before it.
 struct Runtime(PhantomData<Rc<()>>);
@@ -76,9 +91,14 @@ struct ReadResult {
 	rgb: Option<Vec<u8>>,
 }
 
+enum ReadError {
+	Unavailable,
+	Invalid(String),
+}
+
 #[implement(IMFSourceReaderCallback)]
 struct Callback {
-	send: SyncSender<Result<ReadResult, &'static str>>,
+	send: SyncSender<Result<ReadResult, ReadError>>,
 	stride: Arc<AtomicI32>,
 	dimensions: (usize, usize),
 }
@@ -96,7 +116,7 @@ impl IMFSourceReaderCallback_Impl for Callback_Impl {
 			| MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED.0;
 		let changed = flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32 != 0;
 		let result = if status.is_err() || flags & failed as u32 != 0 {
-			Err(UNAVAILABLE)
+			Err(ReadError::Unavailable)
 		} else if changed {
 			// Some decoders finish negotiation on their first sample. Do not touch
 			// that sample until the worker has revalidated the resulting media type.
@@ -123,7 +143,7 @@ impl IMFSourceReaderCallback_Impl for Callback_Impl {
 		if let Some(event) = event.as_ref()
 			&& unsafe { event.GetStatus() }.is_ok_and(|status| status.is_err())
 		{
-			let _ = self.send.try_send(Err(UNAVAILABLE));
+			let _ = self.send.try_send(Err(ReadError::Unavailable));
 		}
 		Ok(())
 	}
@@ -204,7 +224,10 @@ pub(super) fn run(
 		reader
 			.SetCurrentMediaType(VIDEO, None, &output)
 			.map_err(|_| "Windows could not convert this camera to RGB video")?;
-		stride.store(output_stride(&reader, dimensions)?, Ordering::Release);
+		stride.store(
+			output_stride(&reader, dimensions).map_err(|detail| invalid(shared, detail))?,
+			Ordering::Release,
+		);
 		reader
 			.SetStreamSelection(VIDEO, true)
 			.map_err(|_| UNAVAILABLE)?;
@@ -224,13 +247,18 @@ pub(super) fn run(
 				return Err(TIMEOUT);
 			}
 			match receive.recv_timeout(Duration::from_millis(50)) {
-				Ok(result) => break result?,
+				Ok(Ok(result)) => break result,
+				Ok(Err(ReadError::Unavailable)) => return Err(UNAVAILABLE),
+				Ok(Err(ReadError::Invalid(detail))) => return Err(invalid(shared, detail)),
 				Err(mpsc::RecvTimeoutError::Timeout) => continue,
 				Err(mpsc::RecvTimeoutError::Disconnected) => return Err(TIMEOUT),
 			}
 		};
 		if result.changed {
-			stride.store(output_stride(&reader, dimensions)?, Ordering::Release);
+			stride.store(
+				output_stride(&reader, dimensions).map_err(|detail| invalid(shared, detail))?,
+				Ordering::Release,
+			);
 		}
 		if let Some(rgb) = result.rgb {
 			last_frame = Instant::now();
@@ -372,17 +400,22 @@ fn selected_camera(
 	}
 }
 
-fn output_stride(
-	reader: &IMFSourceReader,
-	dimensions: (usize, usize),
-) -> Result<i32, &'static str> {
+fn output_stride(reader: &IMFSourceReader, dimensions: (usize, usize)) -> Result<i32, String> {
 	// SAFETY: Worker-owned reader. Check type and dimensions before using its stride.
 	unsafe {
-		let media = reader.GetCurrentMediaType(VIDEO).map_err(|_| INVALID)?;
-		if media.GetUINT64(&MF_MT_FRAME_SIZE).map_err(|_| INVALID)? != frame_size(dimensions)
-			|| media.GetGUID(&MF_MT_SUBTYPE).map_err(|_| INVALID)? != MFVideoFormat_RGB32
-		{
-			return Err(INVALID);
+		let media = reader
+			.GetCurrentMediaType(VIDEO)
+			.map_err(|error| format!("current media type: {error}"))?;
+		let size = media.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
+		let subtype = media.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default();
+		if size != frame_size(dimensions) || subtype != MFVideoFormat_RGB32 {
+			return Err(format!(
+				"output {}x{} {subtype:?}, wanted {}x{} RGB32",
+				size >> 32,
+				size & 0xffff_ffff,
+				dimensions.0,
+				dimensions.1
+			));
 		}
 		let stride = media
 			.GetUINT32(&MF_MT_DEFAULT_STRIDE)
@@ -390,10 +423,9 @@ fn output_stride(
 			.or_else(|_| {
 				MFGetStrideForBitmapInfoHeader(MFVideoFormat_RGB32.data1, dimensions.0 as u32)
 			})
-			.map_err(|_| INVALID)?;
-		if !(dimensions.0 * 4..=dimensions.0 * 4 + 4096).contains(&(stride.unsigned_abs() as usize))
-		{
-			return Err(INVALID);
+			.map_err(|error| format!("stride: {error}"))?;
+		if !valid_stride(stride, dimensions) {
+			return Err(format!("stride {stride} for width {}", dimensions.0));
 		}
 		Ok(stride)
 	}
@@ -403,19 +435,25 @@ fn copy_sample(
 	sample: &IMFSample,
 	stride: i32,
 	dimensions: (usize, usize),
-) -> Result<Vec<u8>, &'static str> {
+) -> Result<Vec<u8>, ReadError> {
+	let fail = |what: &str| ReadError::Invalid(what.to_owned());
 	// SAFETY: Sample is borrowed only during its callback. Validate native byte
 	// budgets before mapping/copying; every successful lock is unlocked on all paths.
 	unsafe {
-		if sample.GetBufferCount().map_err(|_| INVALID)? != 1
-			|| sample.GetTotalLength().map_err(|_| INVALID)? as usize > MAX_FRAME_BYTES
-		{
-			return Err(INVALID);
+		let count = sample.GetBufferCount().map_err(|_| fail("buffer count"))?;
+		let total = sample.GetTotalLength().map_err(|_| fail("sample length"))? as usize;
+		if count == 0 || total == 0 || total > MAX_FRAME_BYTES {
+			return Err(ReadError::Invalid(format!(
+				"sample of {count} buffers, {total} bytes"
+			)));
 		}
-		let buffer = sample.GetBufferByIndex(0).map_err(|_| INVALID)?;
-		if buffer.GetMaxLength().map_err(|_| INVALID)? as usize > MAX_FRAME_BYTES {
-			return Err(INVALID);
+		// Media Foundation may split one picture across buffers; join them before mapping.
+		let buffer = if count == 1 {
+			sample.GetBufferByIndex(0)
+		} else {
+			sample.ConvertToContiguousBuffer()
 		}
+		.map_err(|_| fail("sample buffer"))?;
 		if let Ok(buffer2d) = buffer.cast::<IMF2DBuffer2>() {
 			let (mut top, mut base, mut pitch, mut length) =
 				(std::ptr::null_mut(), std::ptr::null_mut(), 0, 0);
@@ -427,9 +465,9 @@ fn copy_sample(
 					&mut base,
 					&mut length,
 				)
-				.map_err(|_| INVALID)?;
+				.map_err(|_| fail("2D lock"))?;
 			let result = if base.is_null() || top.is_null() || length as usize > MAX_FRAME_BYTES {
-				Err(INVALID)
+				Err(ReadError::Invalid(format!("2D buffer of {length} bytes")))
 			} else if let Some(first) = (top as usize).checked_sub(base as usize) {
 				rgb_rows(
 					std::slice::from_raw_parts(base, length as usize),
@@ -437,18 +475,26 @@ fn copy_sample(
 					pitch,
 					dimensions,
 				)
+				.map_err(|_| {
+					ReadError::Invalid(format!(
+						"2D buffer pitch {pitch}, {length} bytes, first row at {first}"
+					))
+				})
 			} else {
-				Err(INVALID)
+				Err(fail("2D buffer scanline before its start"))
 			};
-			buffer2d.Unlock2D().map_err(|_| INVALID)?;
+			buffer2d.Unlock2D().map_err(|_| fail("2D unlock"))?;
 			return result;
 		}
 		let (mut base, mut capacity, mut length) = (std::ptr::null_mut(), 0, 0);
 		buffer
 			.Lock(&mut base, Some(&mut capacity), Some(&mut length))
-			.map_err(|_| INVALID)?;
-		let result = if base.is_null() || length > capacity || capacity as usize > MAX_FRAME_BYTES {
-			Err(INVALID)
+			.map_err(|_| fail("buffer lock"))?;
+		// Only the bytes actually read are bounded; the allocation itself may be larger.
+		let result = if base.is_null() || length > capacity || length as usize > MAX_FRAME_BYTES {
+			Err(ReadError::Invalid(format!(
+				"buffer of {length} bytes, capacity {capacity}"
+			)))
 		} else {
 			let first = if stride < 0 {
 				stride.unsigned_abs() as usize * (dimensions.1 - 1)
@@ -461,8 +507,9 @@ fn copy_sample(
 				stride,
 				dimensions,
 			)
+			.map_err(|_| ReadError::Invalid(format!("stride {stride}, buffer of {length} bytes")))
 		};
-		buffer.Unlock().map_err(|_| INVALID)?;
+		buffer.Unlock().map_err(|_| fail("buffer unlock"))?;
 		result
 	}
 }
@@ -473,10 +520,7 @@ fn rgb_rows(
 	stride: i32,
 	dimensions: (usize, usize),
 ) -> Result<Vec<u8>, &'static str> {
-	let pitch = stride.unsigned_abs() as usize;
-	if !(dimensions.0 * 4..=dimensions.0 * 4 + 4096).contains(&pitch)
-		|| bytes.len() > MAX_FRAME_BYTES
-	{
+	if !valid_stride(stride, dimensions) || bytes.len() > MAX_FRAME_BYTES {
 		return Err(INVALID);
 	}
 	let last = first
@@ -545,5 +589,9 @@ mod tests {
 		assert!(rgb_rows(&bytes, usize::MAX, pitch as i32, (WIDTH, HEIGHT)).is_err());
 		assert!(rgb_rows(&bytes, 0, i32::MIN, (WIDTH, HEIGHT)).is_err());
 		assert!(rgb_rows(&bytes, 0, WIDTH as i32 * 4 - 1, (WIDTH, HEIGHT)).is_err());
+		// Wide driver row alignment is accepted while the mapped picture stays bounded.
+		assert!(valid_stride(8192, (WIDTH, HEIGHT)));
+		assert!(valid_stride(-(WIDTH as i32 * 4), (WIDTH, HEIGHT)));
+		assert!(!valid_stride(i32::MAX, (3840, 2160)));
 	}
 }

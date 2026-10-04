@@ -34,6 +34,7 @@ mod notification_sounds;
 mod pointer;
 #[cfg(feature = "demo")]
 mod post_menu_demo;
+mod probe;
 mod reading_settings;
 #[cfg(feature = "demo")]
 mod rendering_demo;
@@ -84,6 +85,19 @@ fn main() -> eframe::Result {
 			.is_err()
 		{
 			std::process::exit(1);
+		}
+		return Ok(());
+	}
+	if let Some(mode @ ("--media-probe" | "--video-probe")) = std::env::args().nth(1).as_deref() {
+		use std::io::Write;
+		platform::startup::attach_parent_console();
+		let print = |line: String| {
+			let _ = writeln!(std::io::stdout(), "{line}");
+		};
+		if mode == "--media-probe" {
+			probe::run(std::env::args().nth(2).as_deref(), print);
+		} else {
+			probe::videos(std::env::args().skip(2), print);
 		}
 		return Ok(());
 	}
