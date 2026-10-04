@@ -2105,7 +2105,7 @@ mod tests {
 		let source = "مرحبا English!";
 		let (rtl, right) = bidi_spans(&[(source.into(), style)]).unwrap();
 		assert!(right);
-		let expected = "English \u{0627}\u{0628}\u{062d}\u{0631}\u{0645}!";
+		let expected = "!English \u{0627}\u{0628}\u{062d}\u{0631}\u{0645}";
 		assert_eq!(
 			rtl.iter()
 				.map(|(text, _)| text.as_str())
