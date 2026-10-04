@@ -332,13 +332,11 @@ impl Decoder {
 			let mut channels = 0;
 			let audio_format = audio_index.and_then(|index| {
 				let format = (|| -> Result<(u32, u32), &'static str> {
-					let sample_rate;
-					let channels;
 					let audio = reader.GetNativeMediaType(index, 0).map_err(|_| INVALID)?;
-					sample_rate = audio
+					let sample_rate = audio
 						.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)
 						.map_err(|_| UNSUPPORTED)?;
-					channels = audio
+					let channels = audio
 						.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)
 						.map_err(|_| UNSUPPORTED)?;
 					if !(1..=96_000).contains(&sample_rate) || !(1..=2).contains(&channels) {
