@@ -520,7 +520,6 @@ fn rgb_rows(
 	stride: i32,
 	dimensions: (usize, usize),
 ) -> Result<Vec<u8>, &'static str> {
-	let pitch = stride.unsigned_abs() as usize;
 	if !valid_stride(stride, dimensions) || bytes.len() > MAX_FRAME_BYTES {
 		return Err(INVALID);
 	}
