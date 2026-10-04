@@ -41,10 +41,13 @@ struct VoiceTarget {
 enum BridgeCommand {
 	Start(Option<u64>),
 	Stop,
+	Camera { on: bool, device: Option<String> },
+	Screen(bool),
 }
 
 /// Private same-user files let the owner inspect/control the live client through local tools.
-/// The bridge never carries Discord credentials and accepts only start/stop for the saved call.
+/// The bridge never carries Discord credentials. It starts and stops the saved call and turns
+/// the camera or a screen share on and off in it, so media can be tested unattended.
 struct VoiceBridge {
 	root: Option<std::path::PathBuf>,
 	last_status: Option<Instant>,
@@ -105,6 +108,17 @@ impl VoiceBridge {
 			}
 			"start" => return None,
 			"stop" => BridgeCommand::Stop,
+			"camera" => BridgeCommand::Camera {
+				on: value.get("on").and_then(|on| on.as_bool()).unwrap_or(true),
+				device: value
+					.get("device")
+					.and_then(|device| device.as_str())
+					.filter(|device| device.len() <= 4096 && !device.contains('\0'))
+					.map(str::to_owned),
+			},
+			"screen" => {
+				BridgeCommand::Screen(value.get("on").and_then(|on| on.as_bool()).unwrap_or(true))
+			}
 			_ => return None,
 		};
 		let _ = std::fs::remove_file(path);
@@ -184,6 +198,14 @@ impl VoiceBridge {
 			"microphone_dbfs": live.map(|live| live.audio.preview_level_db()),
 			"microphone": live.map(|live| live.audio.capture_diagnostic()),
 			"stereo_proof": self.interconnect.snapshot(),
+			"camera_on": call.map(|call| call.camera),
+			"camera_device": ui.voice_camera_device,
+			"camera_status": ui.voice_camera_status,
+			"camera_preview": ui.voice_camera_preview.as_ref().map(|texture| texture.size()),
+			"screen_busy": ui.screen.busy,
+			"screen_status": ui.screen.status,
+			"screen_capture_status": ui.screen.capture_status,
+			"screen_preview": ui.screen.preview.as_ref().map(|texture| texture.size()),
 			"status": soak.map(|soak| soak.status.as_str()).unwrap_or(ui.voice_soak_status.as_str()),
 		});
 		self.write_json("status.json", body);
@@ -775,6 +797,36 @@ impl Voice {
 				&& state.user.is_some(),
 		) {
 			match command {
+				BridgeCommand::Camera { on, device } => {
+					if device.is_some() {
+						ui.voice_camera_device = device;
+					}
+					if let Some(command) = state.set_call_camera(on) {
+						return Some(command);
+					}
+				}
+				BridgeCommand::Screen(on) => {
+					if let Some(call) = state.voice.active.as_ref() {
+						ui.screen.context = Some((state.generation, call.channel, call.request));
+						ui.screen.request = if on {
+							discord_voice::screen::sources()
+								.ok()
+								.and_then(|sources| sources.into_iter().next())
+								.map(|source| {
+									ui::screen::Request::Start(discord_voice::screen::Settings {
+										source: source.id,
+										width: 1280,
+										height: 720,
+										fps: 30,
+										cursor: true,
+										audio: false,
+									})
+								})
+						} else {
+							Some(ui::screen::Request::Stop)
+						};
+					}
+				}
 				BridgeCommand::Stop => {
 					self.stop();
 					ui.voice_soak_requested = false;
