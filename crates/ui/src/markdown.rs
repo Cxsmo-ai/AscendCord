@@ -48,8 +48,8 @@ struct Style {
 	block: Option<u8>,
 }
 
-/// Split styled text into Unicode BiDi runs in visual order. The text inside each run stays in
-/// logical order so egui's shaper can still join Arabic-family scripts correctly.
+/// Split styled text into Unicode BiDi runs in visual order. Egui's text layout does not reorder
+/// bidirectional text, so reverse grapheme clusters within RTL runs before building its job.
 fn bidi_spans(spans: &[(String, Style)]) -> Option<(Vec<(String, Style)>, bool)> {
 	if spans.iter().all(|(text, _)| text.is_ascii()) {
 		return None;
@@ -80,25 +80,24 @@ fn bidi_spans(spans: &[(String, Style)]) -> Option<(Vec<(String, Style)>, bool)>
 		let (levels, runs) = bidi.visual_runs(paragraph, paragraph.range.clone());
 		for run in runs {
 			let rtl = levels.get(run.start).is_some_and(|level| level.is_rtl());
-			let mut parts: Vec<_> = styled
-				.iter()
-				.filter_map(|(range, style)| {
-					let start = range.start.max(run.start);
-					let end = range.end.min(run.end);
-					(start < end).then_some((start..end, *style))
-				})
+			let mut graphemes: Vec<_> = text[run.clone()]
+				.grapheme_indices(true)
+				.map(|(offset, grapheme)| (run.start + offset, grapheme))
 				.collect();
 			if rtl {
-				parts.reverse();
+				graphemes.reverse();
 			}
-			for (range, style) in parts {
-				let value = text[range].to_owned();
+			for (start, grapheme) in graphemes {
+				let style_index = styled.partition_point(|(range, _)| range.end <= start);
+				let style = styled
+					.get(style_index)
+					.map_or(Style::default(), |(_, style)| *style);
 				if let Some((last, last_style)) = visual.last_mut()
 					&& *last_style == style
 				{
-					last.push_str(&value);
+					last.push_str(grapheme);
 				} else {
-					visual.push((value, style));
+					visual.push((grapheme.to_owned(), style));
 				}
 			}
 		}
@@ -2101,15 +2100,24 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn bidi_runs_keep_each_script_logical_and_follow_paragraph_direction() {
+	fn bidi_runs_render_in_visual_order_and_follow_paragraph_direction() {
 		let style = Style::default();
-		let (rtl, right) = bidi_spans(&[("مرحبا English!".into(), style)]).unwrap();
+		let source = "مرحبا English!";
+		let (rtl, right) = bidi_spans(&[(source.into(), style)]).unwrap();
 		assert!(right);
+		let bidi = unicode_bidi::BidiInfo::new(source, None);
+		let expected = bidi
+			.paragraphs
+			.iter()
+			.fold(String::new(), |mut display, paragraph| {
+				display.push_str(&bidi.reorder_line(paragraph, paragraph.range.clone()));
+				display
+			});
 		assert_eq!(
 			rtl.iter()
 				.map(|(text, _)| text.as_str())
 				.collect::<String>(),
-			"!Englishمرحبا "
+			expected
 		);
 
 		let (ltr, right) = bidi_spans(&[("English مرحبا!".into(), style)]).unwrap();
