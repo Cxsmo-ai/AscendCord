@@ -4,7 +4,7 @@
 use discord_voice::{camera, screen};
 use std::{
 	sync::{
-		Arc,
+		Arc, Mutex,
 		atomic::{AtomicUsize, Ordering},
 	},
 	time::{Duration, Instant},
@@ -33,7 +33,7 @@ pub fn run(selected: Option<&str>, mut print: impl FnMut(String)) {
 					};
 					print(format!(
 						"camera \"{name}\" [{id}] {}",
-						probe_camera(id, quality)
+						probe_camera(id, name, quality)
 					));
 				}
 			}
@@ -116,14 +116,16 @@ fn probe_video(file: &str) -> String {
 	report
 }
 
-fn probe_camera(id: &str, quality: model::CameraQuality) -> String {
+fn probe_camera(id: &str, name: &str, quality: model::CameraQuality) -> String {
 	let (width, height) = quality.dimensions();
+	let latest = Arc::new(Mutex::new(None));
 	let frames = Arc::new(AtomicUsize::new(0));
 	let pictures = Arc::new(AtomicUsize::new(0));
 	let bytes = Arc::new(AtomicUsize::new(0));
 	let on_frame =
 		{
 			let (frames, pictures, bytes) = (frames.clone(), pictures.clone(), bytes.clone());
+			let latest = latest.clone();
 			Arc::new(move |frame: camera::Frame| {
 				frames.fetch_add(1, Ordering::Relaxed);
 				bytes.fetch_add(frame.data.len(), Ordering::Relaxed);
@@ -131,6 +133,9 @@ fn probe_camera(id: &str, quality: model::CameraQuality) -> String {
 					rgb.len() == frame.width as usize * frame.height as usize * 3
 				}) {
 					pictures.fetch_add(1, Ordering::Relaxed);
+					if let Ok(mut slot) = latest.try_lock() {
+						*slot = frame.rgb.map(|rgb| (frame.width, frame.height, rgb));
+					}
 				}
 			})
 		};
@@ -155,6 +160,19 @@ fn probe_camera(id: &str, quality: model::CameraQuality) -> String {
 		std::thread::sleep(Duration::from_millis(20));
 	}
 	let frames = frames.load(Ordering::Relaxed);
+	// ASCENDCORD_PROBE_PICTURES=<folder> keeps each camera's last picture for a visual check.
+	if let Some(folder) = std::env::var_os("ASCENDCORD_PROBE_PICTURES")
+		&& let Some((picture_width, picture_height, rgb)) =
+			latest.lock().ok().and_then(|mut slot| slot.take())
+		&& let Some(image) = image::RgbImage::from_raw(picture_width, picture_height, rgb)
+	{
+		let file: String = name
+			.chars()
+			.map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+			.collect();
+		let _ =
+			image.save(std::path::Path::new(&folder).join(format!("{file}-{width}x{height}.png")));
+	}
 	let mut report = format!(
 		"{width}x{height}: {frames} frames in {:.1} s, {} with a local preview picture, {} KiB encoded",
 		elapsed.as_secs_f32(),
