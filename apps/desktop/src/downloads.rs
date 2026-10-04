@@ -463,10 +463,13 @@ fn attachment_url(
 	{
 		return Err("link path is not this attachment");
 	}
-	if !url
-		.query_pairs()
-		.all(|(name, _)| matches!(name.as_ref(), "ex" | "is" | "hm"))
-	{
+	// Discord adds signing parameters over time; only ones that change the file are refused.
+	if url.query_pairs().any(|(name, _)| {
+		matches!(
+			name.to_ascii_lowercase().as_str(),
+			"width" | "height" | "size" | "format" | "quality" | "animated" | "passthrough"
+		)
+	}) {
 		return Err("link asks for a resized or converted file");
 	}
 	Ok(url)
@@ -1005,6 +1008,10 @@ mod tests {
 		image.media.proxy_url = Some("https://media.discordapp.net/attachments/1/9/a.png".into());
 		assert_eq!(playback_url(&image).err(), Some("no link"));
 		image.media.proxy_url = None;
+		// New signing parameters are accepted; transformations are not.
+		image.media.url =
+			Some("https://cdn.discordapp.com/attachments/1/2/a.png?ex=1&is=2&hm=3&sig=4&".into());
+		assert!(original_url(&image).is_some());
 		for url in [
 			"http://cdn.discordapp.com/attachments/1/2/a.png",
 			"https://cdn.discordapp.com.evil.test/attachments/1/2/a.png",
@@ -1012,6 +1019,7 @@ mod tests {
 			"https://cdn.discordapp.com:444/attachments/1/2/a.png",
 			"https://cdn.discordapp.com/attachments/1/99/a.png",
 			"https://cdn.discordapp.com/attachments/1/2/a.png?width=1",
+			"https://cdn.discordapp.com/attachments/1/2/a.png?ex=1&format=webp",
 			"https://cdn.discordapp.com/attachments/1/2/%2fapi",
 			"https://cdn.discordapp.com/attachments/1/2/a.png#fragment",
 			"https://127.0.0.1/attachments/1/2/a.png",

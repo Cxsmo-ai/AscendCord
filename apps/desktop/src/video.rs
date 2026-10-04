@@ -128,18 +128,26 @@ impl Video {
 			Some(
 				crate::downloads::playback_url(&attachment).map_err(|reason| {
 					if std::env::var_os("ASCENDCORD_VOICE_DIAGNOSTICS").is_some_and(|v| v == "1") {
+						// Parameter names only: their values are the link's signature.
+						let shape = |link: Option<&str>| {
+							link.and_then(|link| url::Url::parse(link).ok())
+								.map(|link| {
+									let names: Vec<_> = link
+										.query_pairs()
+										.map(|(name, _)| name.into_owned())
+										.collect();
+									format!(
+										"{}{} ?{}",
+										link.host_str().unwrap_or(""),
+										link.path(),
+										names.join("&")
+									)
+								})
+						};
 						eprintln!(
 							"[AscendCord video] unavailable={reason} link={:?} proxy={:?} size={}",
-							attachment
-								.media
-								.url
-								.as_deref()
-								.map(|link| link.split('?').next()),
-							attachment
-								.media
-								.proxy_url
-								.as_deref()
-								.map(|link| link.split('?').next()),
+							shape(attachment.media.url.as_deref()),
+							shape(attachment.media.proxy_url.as_deref()),
 							attachment.size
 						);
 					}
