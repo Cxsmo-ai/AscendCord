@@ -219,8 +219,9 @@ impl Decoder {
 					.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, manager)
 					.map_err(|_| UNSUPPORTED)?;
 			} else {
+				// The advanced processor also scales, which videos above 1080p need.
 				attributes
-					.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)
+					.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)
 					.map_err(|_| UNSUPPORTED)?;
 			}
 			let reader = MFCreateSourceReaderFromByteStream(&stream, &attributes)
@@ -229,7 +230,8 @@ impl Decoder {
 			let native = reader
 				.GetNativeMediaType(VIDEO, 0)
 				.map_err(|_| UNSUPPORTED)?;
-			let (width, height) = dimensions(&native)?;
+			// Larger videos are scaled into the 1080p texture budget instead of refused.
+			let (width, height) = super::fit(native_dimensions(&native)?);
 			let rotation = native.GetUINT32(&MF_MT_VIDEO_ROTATION).unwrap_or(0);
 			if !matches!(rotation, 0 | 90 | 180 | 270) {
 				return Err(UNSUPPORTED);
@@ -613,6 +615,17 @@ impl Decoder {
 		}
 		convert(&sample_bytes(sample)?, self.stride)
 	}
+}
+
+/// The source picture size, before any scaling. 8K is the largest accepted.
+fn native_dimensions(media: &IMFMediaType) -> Result<(u32, u32), &'static str> {
+	// SAFETY: Reading an integer attribute from a live media type.
+	let size = unsafe { media.GetUINT64(&MF_MT_FRAME_SIZE) }.map_err(|_| INVALID)?;
+	let (width, height) = ((size >> 32) as u32, size as u32);
+	if width == 0 || height == 0 || width > 8192 || height > 8192 {
+		return Err(UNSUPPORTED);
+	}
+	Ok((width, height))
 }
 
 fn dimensions(media: &IMFMediaType) -> Result<(u32, u32), &'static str> {
