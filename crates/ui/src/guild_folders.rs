@@ -373,6 +373,7 @@ impl MessagingUi {
 								guild,
 								self.guild == Some(id),
 								state.demo,
+								super::notifications::RAIL_ICON_SIZE,
 							);
 							let (unread, count) = self.rail_cache.guild_badge(id);
 							rail_indicator(
@@ -415,7 +416,7 @@ impl MessagingUi {
 							let tint =
 								Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
 							let (rect, response) = ui.allocate_exact_size(
-								egui::Vec2::splat(46.0),
+								egui::Vec2::splat(super::notifications::RAIL_ICON_SIZE),
 								Sense::click_and_drag(),
 							);
 							let open = self.folder_ui.expanded.contains(&id);
@@ -658,8 +659,13 @@ impl MessagingUi {
 		{
 			let clip = ui.clip_rect();
 			let top = clip.top();
-			let bottom = (clip.bottom() - 46.0).max(top);
-			let position = egui::pos2(ui.max_rect().left(), (pointer.y - 23.0).clamp(top, bottom));
+			let icon_size = super::notifications::RAIL_ICON_SIZE;
+			let half_icon = icon_size / 2.0;
+			let bottom = (clip.bottom() - icon_size).max(top);
+			let position = egui::pos2(
+				ui.max_rect().left(),
+				(pointer.y - half_icon).clamp(top, bottom),
+			);
 			ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
 			egui::Area::new(egui::Id::unique("server-drag-preview"))
 				.order(egui::Order::Tooltip)
@@ -671,7 +677,7 @@ impl MessagingUi {
 						Item::Server(id) => {
 							if let Some(guild) = state.guilds.iter().find(|g| g.id == id) {
 								self.avatars
-									.show_guild_sized(ui, guild, false, state.demo, 46.0);
+									.show_guild_sized(ui, guild, false, state.demo, icon_size);
 							}
 						}
 						Item::Folder(id) => {
@@ -686,8 +692,10 @@ impl MessagingUi {
 									(rgb >> 8) as u8,
 									rgb as u8,
 								);
-								let (rect, _) =
-									ui.allocate_exact_size(egui::Vec2::splat(46.0), Sense::hover());
+								let (rect, _) = ui.allocate_exact_size(
+									egui::Vec2::splat(icon_size),
+									Sense::hover(),
+								);
 								paint_folder_tile(
 									ui,
 									&mut self.avatars,

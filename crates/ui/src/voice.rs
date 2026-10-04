@@ -1452,7 +1452,7 @@ impl MessagingUi {
 	pub(super) fn voice_settings(&mut self, ui: &mut egui::Ui, demo: bool, active: bool) {
 		let trigger =
 			crate::icons::button(ui, crate::icons::Icon::Headphones, 32.0, "Output settings");
-		self.voice_settings_popup(&trigger, demo, active, false);
+		self.voice_settings_popup(&trigger, demo, active, false, true);
 	}
 
 	/// Input or output half of Discord's voice popout, matching the chevron that opened it.
@@ -1462,23 +1462,29 @@ impl MessagingUi {
 		demo: bool,
 		active: bool,
 		input: bool,
+		primary_opens: bool,
 	) {
 		let id = trigger.id.with("voice-settings-open");
 		let mut open = trigger
 			.ctx
 			.data_mut(|data| *data.get_temp_mut_or_default::<bool>(id));
+		let secondary_clicked = trigger.container_secondary_clicked();
 
-		if trigger.clicked() {
+		if primary_opens && trigger.clicked() {
 			open = !open;
 		}
 		// Device dropdowns use egui's popup memory; keep the parent independently open.
-		let close_behavior = if egui::Popup::is_any_open(&trigger.ctx) {
+		let close_behavior = if egui::Popup::is_any_open(&trigger.ctx) || secondary_clicked {
 			egui::PopupCloseBehavior::IgnoreClicks
 		} else {
 			egui::PopupCloseBehavior::CloseOnClickOutside
 		};
-		egui::Popup::menu(trigger)
-			.open_bool(&mut open)
+		let popup = if primary_opens {
+			egui::Popup::menu(trigger).id(id).open_bool(&mut open)
+		} else {
+			egui::Popup::context_menu(trigger).id(id)
+		};
+		popup
 			.style(|_: &mut egui::Style| {})
 			.width(340.0)
 			.close_behavior(close_behavior)
@@ -2516,8 +2522,9 @@ impl MessagingUi {
 					"Voice settings",
 					"Microphone and speaker settings",
 				);
-				self.voice_settings_popup(&settings, state.demo, true, true);
-				deafen_clicked = control(
+				self.voice_settings_popup(&settings, state.demo, true, true, true);
+				self.voice_settings_popup(&mic, state.demo, true, true, false);
+				let deafen = control(
 					ui,
 					if deafened {
 						crate::icons::Icon::HeadphonesSlash
@@ -2533,8 +2540,9 @@ impl MessagingUi {
 					} else {
 						"Turn off incoming audio"
 					},
-				)
-				.clicked();
+				);
+				deafen_clicked = deafen.clicked();
+				self.voice_settings_popup(&deafen, state.demo, true, false, false);
 				camera_clicked = control(
 					ui,
 					if camera {
@@ -3162,8 +3170,21 @@ impl MessagingUi {
 				"Input settings"
 			},
 		);
-		self.voice_settings_popup(&chevron, state.demo, state.voice.active.is_some(), !deafen);
-		self.mute_toggle(ui, state, commands, deafen, 32.0);
+		self.voice_settings_popup(
+			&chevron,
+			state.demo,
+			state.voice.active.is_some(),
+			!deafen,
+			true,
+		);
+		let toggle = self.mute_toggle(ui, state, commands, deafen, 32.0);
+		self.voice_settings_popup(
+			&toggle,
+			state.demo,
+			state.voice.active.is_some(),
+			!deafen,
+			false,
+		);
 	}
 }
 
@@ -4238,7 +4259,7 @@ mod tests {
 				},
 				|ui| {
 					let trigger = ui.button("Open voice");
-					messaging.voice_settings_popup(&trigger, demo, false, true);
+					messaging.voice_settings_popup(&trigger, demo, false, true, true);
 				},
 			);
 			output.textures_delta.clear();
@@ -4712,5 +4733,51 @@ mod tests {
 		);
 		messaging.voice_available = true;
 		assert!(messaging.call_unavailable(&state, Id(1)).is_none());
+	}
+
+	#[test]
+	fn right_clicking_a_voice_toggle_opens_its_settings_popup() {
+		let ctx = egui::Context::default();
+		let mut messaging = MessagingUi::default();
+		let frame = |messaging: &mut MessagingUi, events| {
+			let mut is_open = false;
+			let mut pos = egui::Pos2::ZERO;
+			ctx.run_ui(
+				egui::RawInput {
+					screen_rect: Some(egui::Rect::from_min_size(
+						egui::Pos2::ZERO,
+						egui::vec2(800.0, 600.0),
+					)),
+					events,
+					..Default::default()
+				},
+				|ui| {
+					let mic = ui.button("Microphone toggle");
+					pos = mic.rect.center();
+					messaging.voice_settings_popup(&mic, false, false, true, false);
+					is_open = egui::Popup::is_any_open(ui.ctx());
+				},
+			)
+			.drop_without_applying_deltas();
+			(pos, is_open)
+		};
+		let (pos, _) = frame(&mut messaging, vec![]);
+		let mut is_open = false;
+		for pressed in [true, false] {
+			let (_, open) = frame(
+				&mut messaging,
+				vec![
+					egui::Event::PointerMoved(pos),
+					egui::Event::PointerButton {
+						pos,
+						button: egui::PointerButton::Secondary,
+						pressed,
+						modifiers: egui::Modifiers::NONE,
+					},
+				],
+			);
+			is_open = open;
+		}
+		assert!(is_open && egui::Popup::is_any_open(&ctx));
 	}
 }

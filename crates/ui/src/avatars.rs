@@ -835,8 +835,9 @@ impl Avatars {
 		guild: &model::Guild,
 		selected: bool,
 		demo: bool,
+		size: f32,
 	) -> egui::Response {
-		self.guild_avatar(ui, guild, selected, demo, 46.0, false)
+		self.guild_avatar(ui, guild, selected, demo, size, false)
 	}
 	pub fn paint_guild(
 		&mut self,

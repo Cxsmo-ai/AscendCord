@@ -1005,11 +1005,11 @@ impl MessagingUi {
 			"Accessibility",
 			Some("Adjust how much of the interface animates, and how it reads."),
 		);
-		design::group(ui, "Text readability", |ui| {
+		design::group(ui, "Text accessibility", |ui| {
 			design::slider_row(
 				ui,
-				"Text size",
-				Some("Scales message text, labels and controls together."),
+				"Interface text size",
+				Some("Scales labels and controls across the app."),
 				&mut self.font_scale,
 				80..=125,
 				"%",

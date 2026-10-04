@@ -1342,6 +1342,16 @@ mod tests {
 		let call = state.voice.active.as_ref().unwrap();
 		assert!(call.participants.is_empty());
 		assert_ne!(call.phase, Phase::Failed);
+		// A call roster update after the departure must leave the local connection active.
+		state.apply_voice(Event::Call {
+			channel: Id(2),
+			ringing: None,
+			participants: Some(vec![]),
+			unavailable: false,
+		});
+		let call = state.voice.active.as_ref().unwrap();
+		assert!(call.participants.is_empty());
+		assert_ne!(call.phase, Phase::Failed);
 		// Their state while this device is not in the call still updates the known membership.
 		assert!(state.leave_call().is_some());
 		state.apply_voice(Event::State {
