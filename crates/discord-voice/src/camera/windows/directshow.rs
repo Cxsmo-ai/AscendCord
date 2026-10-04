@@ -281,11 +281,52 @@ fn rgb_dimensions(media: &AM_MEDIA_TYPE) -> Result<(usize, usize, bool), &'stati
 	Ok(dimensions)
 }
 
+/// FourCC subtypes print as their four letters, others as the GUID.
+fn subtype_name(subtype: &GUID) -> String {
+	let code = subtype.data1.to_le_bytes();
+	if code.iter().all(u8::is_ascii_alphanumeric) {
+		String::from_utf8_lossy(&code).into_owned()
+	} else if *subtype == MEDIASUBTYPE_RGB24 {
+		"RGB24".into()
+	} else if *subtype == MEDIASUBTYPE_RGB32 {
+		"RGB32".into()
+	} else {
+		format!("{subtype:?}")
+	}
+}
+
+/// Names of the filters DirectShow connected, for reports about a camera that stays silent.
+fn filter_names(graph: &IGraphBuilder) -> String {
+	let mut names = Vec::new();
+	// SAFETY: Worker-owned graph. Each FILTER_INFO graph reference is released after reading.
+	unsafe {
+		let Ok(filters) = graph.EnumFilters() else {
+			return "unknown filters".into();
+		};
+		for _ in 0..16 {
+			let mut filter = [None];
+			if filters.Next(&mut filter, None) != HRESULT(0) {
+				break;
+			}
+			let Some(filter) = filter[0].take() else {
+				break;
+			};
+			let mut info = FILTER_INFO::default();
+			if filter.QueryFilterInfo(&mut info).is_ok() {
+				let length = info.achName.iter().position(|&c| c == 0).unwrap_or(128);
+				names.push(String::from_utf16_lossy(&info.achName[..length]));
+				ManuallyDrop::drop(&mut info.pGraph);
+			}
+		}
+	}
+	names.join(" / ")
+}
+
 fn configure(
 	builder: &ICaptureGraphBuilder2,
 	source: &IBaseFilter,
 	quality: CameraQuality,
-) -> Result<(), &'static str> {
+) -> Result<String, &'static str> {
 	let (target_width, target_height) = quality.dimensions();
 	// SAFETY: Owned worker graph, only bounded native formats may be selected.
 	unsafe {
@@ -340,7 +381,11 @@ fn configure(
 		choices.sort_by_key(|(rank, _)| *rank);
 		for (_, media) in choices {
 			if config.SetFormat(&media.0).is_ok() {
-				return Ok(());
+				let (width, height, _) = dimensions(&media.0)?;
+				return Ok(format!(
+					"{} {width}x{height}",
+					subtype_name(&media.0.subtype)
+				));
 			}
 		}
 		Err("Camera does not offer a supported capture mode up to 3840×2160")
@@ -378,7 +423,7 @@ pub(super) fn run(
 		.ok_or("Selected Windows camera is no longer available")?;
 	// SAFETY: This is the only activation path, called after an explicit camera-on
 	// gesture. Graph, format negotiation and teardown all remain on this worker.
-	let (capture, receive, width, height, bottom_up) = unsafe {
+	let (capture, receive, width, height, bottom_up, mode, filters) = unsafe {
 		let source: IBaseFilter = moniker.BindToObject(None, None).map_err(|_| UNAVAILABLE)?;
 		let graph: IGraphBuilder = CoCreateInstance(&CLSID_FilterGraph, None, CLSCTX_INPROC_SERVER)
 			.map_err(|_| UNAVAILABLE)?;
@@ -389,7 +434,7 @@ pub(super) fn run(
 		graph
 			.AddFilter(&source, w!("Camera"))
 			.map_err(|_| UNAVAILABLE)?;
-		configure(&builder, &source, quality)?;
+		let mode = configure(&builder, &source, quality)?;
 		let filter: IBaseFilter = CoCreateInstance(&SAMPLE_GRABBER, None, CLSCTX_INPROC_SERVER)
 			.map_err(|_| UNAVAILABLE)?;
 		let grabber: ISampleGrabber = filter.cast().map_err(|_| UNAVAILABLE)?;
@@ -431,6 +476,12 @@ pub(super) fn run(
 				&sink,
 			)
 			.map_err(|_| "Windows could not convert this camera to RGB video")?;
+		// Deliver samples as they arrive. Some virtual cameras stamp samples with their own
+		// clock, and a clocked graph would hold every one of them back.
+		if let Ok(filter) = graph.cast::<IMediaFilter>() {
+			let _ = filter.SetSyncSource(None::<&windows::Win32::Media::IReferenceClock>);
+		}
+		let filters = filter_names(&graph);
 		let mut media = Media(AM_MEDIA_TYPE::default());
 		capture
 			.grabber
@@ -501,7 +552,7 @@ pub(super) fn run(
 		if !shared.stopped.load(Ordering::Acquire) {
 			capture.control.Run().map_err(|_| UNAVAILABLE)?;
 		}
-		(capture, receive, width, height, bottom_up)
+		(capture, receive, width, height, bottom_up, mode, filters)
 	};
 	let mut last = Instant::now();
 	while !shared.stopped.load(Ordering::Acquire) {
@@ -525,7 +576,12 @@ pub(super) fn run(
 				}
 			}
 			Err(mpsc::RecvTimeoutError::Timeout) if last.elapsed() < Duration::from_secs(5) => {}
-			_ => return Err(TIMEOUT),
+			_ => {
+				shared.set_error_detail(format!(
+					"{TIMEOUT} (no frames from {mode} through {filters})"
+				));
+				return Err(TIMEOUT);
+			}
 		}
 	}
 	drop(capture);
