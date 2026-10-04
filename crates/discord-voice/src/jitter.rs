@@ -220,10 +220,8 @@ mod tests {
 		jitter.push(10, vec![1]);
 		jitter.push(11, vec![1]);
 		assert_eq!(jitter.target, 4);
-		let mut sequence = 13u16;
-		for _ in 0..(SHRINK_AFTER as usize + 10) {
+		for sequence in 13..13 + SHRINK_AFTER + 10 {
 			jitter.push(sequence, vec![1]);
-			sequence += 1;
 			play(&mut jitter, 1);
 		}
 		assert_eq!(jitter.target, 3);
