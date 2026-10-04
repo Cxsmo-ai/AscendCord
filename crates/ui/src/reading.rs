@@ -574,6 +574,7 @@ mod tests {
 						.default_size(f32::from(view.member_list_width).min(maximum))
 						.size_range(180.0..=maximum)
 						.show(ui, |ui| {
+							ui.take_available_space();
 							ui.label("Synthetic members");
 						});
 					rendered = people.response.rect.width();

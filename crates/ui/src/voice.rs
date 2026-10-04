@@ -1470,7 +1470,9 @@ impl MessagingUi {
 			.data_mut(|data| *data.get_temp_mut_or_default::<bool>(id));
 		let secondary_clicked = trigger.container_secondary_clicked();
 
-		if (primary_opens && trigger.clicked()) || secondary_clicked {
+		if secondary_clicked {
+			open = true;
+		} else if primary_opens && trigger.clicked() {
 			open = !open;
 		}
 		// Device dropdowns use egui's popup memory; keep the parent independently open.
