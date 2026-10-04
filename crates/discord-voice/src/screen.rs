@@ -114,7 +114,6 @@ pub struct Worker {
 	ready: Arc<AtomicBool>,
 	preview: Arc<Mutex<Option<image::RgbaImage>>>,
 	done: Option<mpsc::Receiver<Result<(), &'static str>>>,
-	#[cfg(target_os = "linux")]
 	status: Arc<Mutex<&'static str>>,
 	#[cfg(target_os = "linux")]
 	preview_visible: Arc<AtomicBool>,
@@ -137,10 +136,18 @@ impl Worker {
 		let worker_bitrate = bitrate.clone();
 		let preview = Arc::new(Mutex::new(None));
 		let worker_preview = preview.clone();
-		#[cfg(target_os = "linux")]
-		let status = Arc::new(Mutex::new("Choose a screen or window in the system picker"));
-		#[cfg(target_os = "linux")]
+		let status = Arc::new(Mutex::new(if cfg!(target_os = "linux") {
+			"Choose a screen or window in the system picker"
+		} else {
+			""
+		}));
 		let worker_status = status.clone();
+		if std::env::var_os("ASCENDCORD_VOICE_DIAGNOSTICS").is_some_and(|value| value == "1") {
+			eprintln!(
+				"[AscendCord voice Screen] capture_source={:?} {}x{}@{}",
+				settings.source, settings.width, settings.height, settings.fps
+			);
+		}
 		#[cfg(target_os = "linux")]
 		let preview_visible = Arc::new(AtomicBool::new(true));
 		#[cfg(target_os = "linux")]
@@ -186,6 +193,7 @@ impl Worker {
 					audio_send,
 					worker_audio_epoch,
 					worker_preview,
+					worker_status,
 					&wake,
 				);
 				finished_ready.store(false, Ordering::Release);
@@ -211,7 +219,6 @@ impl Worker {
 				ready: ready.clone(),
 				preview,
 				done: Some(done),
-				#[cfg(target_os = "linux")]
 				status,
 				#[cfg(target_os = "linux")]
 				preview_visible,
@@ -234,10 +241,11 @@ impl Worker {
 	}
 
 	pub fn capture_status(&self) -> Option<&'static str> {
-		#[cfg(target_os = "linux")]
-		return self.status.try_lock().ok().map(|status| *status);
-		#[cfg(not(target_os = "linux"))]
-		None
+		self.status
+			.try_lock()
+			.ok()
+			.map(|status| *status)
+			.filter(|status| !status.is_empty())
 	}
 
 	pub fn result(&self) -> Option<Result<(), &'static str>> {
@@ -273,6 +281,7 @@ fn encode_loop(
 	audio: Option<tokio::sync::mpsc::Sender<AudioChunk>>,
 	audio_epoch: Arc<AtomicU64>,
 	preview: Arc<Mutex<Option<image::RgbaImage>>>,
+	status: Arc<Mutex<&'static str>>,
 	wake: &impl Fn(),
 ) -> Result<(), &'static str> {
 	if stop.load(Ordering::Acquire) || send.is_closed() {
@@ -303,7 +312,9 @@ fn encode_loop(
 		audio_epoch,
 	)?;
 	let mut encoding = None;
-	let mut first_frame_deadline = Some(Instant::now() + Duration::from_secs(15));
+	// Windows sends no picture for a minimized window, or one that has not drawn since the
+	// share began. The share stays up and says so instead of ending.
+	let mut waiting_since = Some(Instant::now());
 	let mut next_frame = Instant::now();
 	let mut next_preview = Instant::now();
 	let mut latest_frame = None;
@@ -325,15 +336,19 @@ fn encode_loop(
 				Some(frame)
 			}
 			Err(_) if stop.load(Ordering::Acquire) || send.is_closed() => break,
-			Err(mpsc::RecvTimeoutError::Timeout)
-				if first_frame_deadline.is_none_or(|deadline| Instant::now() < deadline) =>
-			{
+			Err(mpsc::RecvTimeoutError::Timeout) => {
+				if waiting_since.is_some_and(|since| since.elapsed() >= Duration::from_secs(3))
+					&& let Ok(mut slot) = status.try_lock()
+					&& slot.is_empty()
+				{
+					*slot =
+						"Waiting for a picture · a minimized window shows nothing until restored";
+					wake();
+				}
 				None
 			}
-			Err(_) => {
-				return Err(
-					"No screen frames received; check screen recording permission and the selected source",
-				);
+			Err(mpsc::RecvTimeoutError::Disconnected) => {
+				return Err("Screen capture stopped unexpectedly; share again");
 			}
 		};
 		if stop.load(Ordering::Acquire) || send.is_closed() {
@@ -341,7 +356,11 @@ fn encode_loop(
 		}
 		let now = Instant::now();
 		if let Some(frame) = &frame {
-			first_frame_deadline = None;
+			if waiting_since.take().is_some()
+				&& let Ok(mut slot) = status.try_lock()
+			{
+				*slot = "";
+			}
 			if now >= next_preview {
 				let image = preview_frame(frame)?;
 				if let Ok(mut slot) = preview.try_lock() {
@@ -800,7 +819,6 @@ mod tests {
 			ready: Arc::new(AtomicBool::new(false)),
 			preview: Arc::new(Mutex::new(Some(preview))),
 			done: None,
-			#[cfg(target_os = "linux")]
 			status: Arc::new(Mutex::new("")),
 			#[cfg(target_os = "linux")]
 			preview_visible: Arc::new(AtomicBool::new(true)),

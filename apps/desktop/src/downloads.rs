@@ -401,33 +401,75 @@ fn copy_media(
 }
 
 pub(crate) fn original_url(attachment: &Attachment) -> Option<url::Url> {
-	if !model::valid_attachments(std::slice::from_ref(attachment))
-		|| attachment.size == 0
-		|| attachment.size > MAX_BYTES
-	{
-		return None;
+	attachment_url(
+		attachment,
+		attachment.media.url.as_deref(),
+		"cdn.discordapp.com",
+	)
+	.ok()
+}
+
+/// The link the inline players stream from: the original file, or the same file through
+/// Discord's media proxy when the original link is missing or not in the expected shape.
+/// The error names why the original link was refused.
+pub(crate) fn playback_url(attachment: &Attachment) -> Result<url::Url, &'static str> {
+	attachment_url(
+		attachment,
+		attachment.media.url.as_deref(),
+		"cdn.discordapp.com",
+	)
+	.or_else(|reason| {
+		attachment_url(
+			attachment,
+			attachment.media.proxy_url.as_deref(),
+			"media.discordapp.net",
+		)
+		.map_err(|_| reason)
+	})
+}
+
+/// One signed attachment link on `host`: `/attachments/<channel>/<attachment>/<file>`.
+fn attachment_url(
+	attachment: &Attachment,
+	link: Option<&str>,
+	host: &str,
+) -> Result<url::Url, &'static str> {
+	if !model::valid_attachments(std::slice::from_ref(attachment)) {
+		return Err("attachment details out of bounds");
 	}
-	let url = url::Url::parse(attachment.media.url.as_deref()?).ok()?;
-	let path: Vec<_> = url.path_segments()?.collect();
-	(url.scheme() == "https"
-		&& url.host_str() == Some("cdn.discordapp.com")
-		&& url.port_or_known_default() == Some(443)
-		&& url.username().is_empty()
-		&& url.password().is_none()
-		&& url.fragment().is_none()
-		&& path.len() == 4
-		&& path[0] == "attachments"
-		&& path[1].parse::<model::Id>().is_ok()
-		&& path[2] == attachment.id.to_string()
-		&& !path[3].is_empty()
-		&& !path[3].contains('\\')
-		&& !["%2f", "%5c"]
+	if attachment.size == 0 || attachment.size > MAX_BYTES {
+		return Err("attachment size unknown or above 100 MiB");
+	}
+	let url = url::Url::parse(link.ok_or("no link")?).map_err(|_| "unreadable link")?;
+	if url.scheme() != "https"
+		|| url.host_str() != Some(host)
+		|| url.port_or_known_default() != Some(443)
+	{
+		return Err("link is not on Discord's file servers");
+	}
+	if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+		return Err("link carries credentials or a fragment");
+	}
+	let path: Vec<_> = url.path_segments().ok_or("link has no path")?.collect();
+	if path.len() != 4
+		|| path[0] != "attachments"
+		|| path[1].parse::<model::Id>().is_err()
+		|| path[2] != attachment.id.to_string()
+		|| path[3].is_empty()
+		|| path[3].contains('\\')
+		|| ["%2f", "%5c"]
 			.iter()
 			.any(|escape| path[3].to_ascii_lowercase().contains(escape))
-		&& url
-			.query_pairs()
-			.all(|(name, _)| matches!(name.as_ref(), "ex" | "is" | "hm")))
-	.then_some(url)
+	{
+		return Err("link path is not this attachment");
+	}
+	if !url
+		.query_pairs()
+		.all(|(name, _)| matches!(name.as_ref(), "ex" | "is" | "hm"))
+	{
+		return Err("link asks for a resized or converted file");
+	}
+	Ok(url)
 }
 
 struct Partial<'a> {
@@ -951,6 +993,18 @@ mod tests {
 		image.size = MAX_BYTES;
 		assert!(original_url(&image).is_some());
 		image.size = 1024;
+		// Playback falls back to the same attachment through the media proxy.
+		image.media.url = None;
+		image.media.proxy_url =
+			Some("https://media.discordapp.net/attachments/1/2/a.png?ex=1&is=2&hm=3".into());
+		assert!(original_url(&image).is_none());
+		assert_eq!(
+			playback_url(&image).unwrap().host_str(),
+			Some("media.discordapp.net")
+		);
+		image.media.proxy_url = Some("https://media.discordapp.net/attachments/1/9/a.png".into());
+		assert_eq!(playback_url(&image).err(), Some("no link"));
+		image.media.proxy_url = None;
 		for url in [
 			"http://cdn.discordapp.com/attachments/1/2/a.png",
 			"https://cdn.discordapp.com.evil.test/attachments/1/2/a.png",

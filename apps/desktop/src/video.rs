@@ -126,8 +126,25 @@ impl Video {
 			None
 		} else {
 			Some(
-				crate::downloads::original_url(&attachment)
-					.ok_or("Video attachment unavailable")?,
+				crate::downloads::playback_url(&attachment).map_err(|reason| {
+					if std::env::var_os("ASCENDCORD_VOICE_DIAGNOSTICS").is_some_and(|v| v == "1") {
+						eprintln!(
+							"[AscendCord video] unavailable={reason} link={:?} proxy={:?} size={}",
+							attachment
+								.media
+								.url
+								.as_deref()
+								.map(|link| link.split('?').next()),
+							attachment
+								.media
+								.proxy_url
+								.as_deref()
+								.map(|link| link.split('?').next()),
+							attachment.size
+						);
+					}
+					"Video attachment unavailable"
+				})?,
 			)
 		};
 		if self.requests.is_none() {
