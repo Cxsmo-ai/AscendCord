@@ -41,8 +41,12 @@ struct VoiceTarget {
 enum BridgeCommand {
 	Start(Option<u64>),
 	Stop,
-	Camera { on: bool, device: Option<String> },
-	Screen(bool),
+	Camera {
+		on: bool,
+		device: Option<String>,
+	},
+	/// On or off; when on, the first source whose name contains the text, else the first.
+	Screen(bool, Option<String>),
 }
 
 /// Private same-user files let the owner inspect/control the live client through local tools.
@@ -116,9 +120,14 @@ impl VoiceBridge {
 					.filter(|device| device.len() <= 4096 && !device.contains('\0'))
 					.map(str::to_owned),
 			},
-			"screen" => {
-				BridgeCommand::Screen(value.get("on").and_then(|on| on.as_bool()).unwrap_or(true))
-			}
+			"screen" => BridgeCommand::Screen(
+				value.get("on").and_then(|on| on.as_bool()).unwrap_or(true),
+				value
+					.get("source")
+					.and_then(|source| source.as_str())
+					.filter(|source| source.len() <= 256)
+					.map(str::to_lowercase),
+			),
 			_ => return None,
 		};
 		let _ = std::fs::remove_file(path);
@@ -805,13 +814,20 @@ impl Voice {
 						return Some(command);
 					}
 				}
-				BridgeCommand::Screen(on) => {
+				BridgeCommand::Screen(on, wanted) => {
 					if let Some(call) = state.voice.active.as_ref() {
 						ui.screen.context = Some((state.generation, call.channel, call.request));
 						ui.screen.request = if on {
 							discord_voice::screen::sources()
 								.ok()
-								.and_then(|sources| sources.into_iter().next())
+								.and_then(|sources| {
+									let named = wanted.as_ref().and_then(|wanted| {
+										sources.iter().position(|source| {
+											source.name.to_lowercase().contains(wanted)
+										})
+									});
+									sources.into_iter().nth(named.unwrap_or(0))
+								})
 								.map(|source| {
 									ui::screen::Request::Start(discord_voice::screen::Settings {
 										source: source.id,
@@ -1672,20 +1688,24 @@ impl Voice {
 			let start = live.camera_clock;
 			let wake = ctx.clone();
 			let on_frame = std::sync::Arc::new(move |frame: discord_voice::camera::Frame| {
-				let (width, height, frames_per_second, bitrate_kbps) = (
+				let (width, height, frames_per_second, bitrate_kbps, index, keyframe) = (
 					frame.width,
 					frame.height,
 					frame.frames_per_second,
 					frame.bitrate_kbps,
+					frame.index,
+					frame.keyframe,
 				);
 				let data = frame.data;
 				let codec = frame.codec;
 				if data.len() > discord_voice::camera_video::MAX_FRAME_BYTES {
 					return;
 				}
-				let _ = send.try_send(discord_voice::camera_video::Frame {
+				let queued = send.try_send(discord_voice::camera_video::Frame {
 					generation,
+					index,
 					timestamp: (start.elapsed().as_micros() * 90 / 1000) as u32,
+					keyframe,
 					width,
 					height,
 					frames_per_second,
@@ -1693,7 +1713,11 @@ impl Voice {
 					codec,
 					data,
 				});
-				frame_received.store(true, std::sync::atomic::Ordering::Release);
+				if queued.is_ok() {
+					frame_received.store(true, std::sync::atomic::Ordering::Release);
+				} else {
+					discord_voice::camera::request_keyframe();
+				}
 				if let Some(rgb) = frame.rgb.as_deref()
 					&& let Ok(mut slot) = preview.try_lock()
 					&& store_camera_frame(&mut slot, rgb, width, height)

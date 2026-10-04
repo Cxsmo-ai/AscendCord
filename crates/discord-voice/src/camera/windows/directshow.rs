@@ -548,22 +548,14 @@ fn configure(
 				continue;
 			}
 			if let Ok((width, height, _)) = dimensions(&media.0) {
-				let (target_width, target_height) = (target_width as usize, target_height as usize);
-				let exact = width == target_width && height == target_height;
-				let covers = width >= target_width && height >= target_height;
-				let same_shape = width * target_height == height * target_width;
-				// Without the exact mode, prefer the smallest one that covers the selected size
-				// (scaled down), else the largest smaller one (scaled up); same shape first.
-				let area = if covers {
-					width * height
-				} else {
-					usize::MAX - width * height
-				};
-				// Among equal sizes, the frame rate closest to the selected one.
-				let rate = source_area(&media.0).1.map_or(u64::MAX, |interval| {
-					(10_000_000 / interval as u64).abs_diff(u64::from(quality.frames_per_second))
-				});
-				choices.push(((!exact, !covers, !same_shape, area, rate), media));
+				let rank = mode_rank(
+					width,
+					height,
+					(target_width as usize, target_height as usize),
+					quality.frames_per_second,
+					source_area(&media.0).1,
+				);
+				choices.push((rank, media));
 			}
 		}
 		choices.sort_by_key(|(rank, _)| *rank);
@@ -578,6 +570,31 @@ fn configure(
 		}
 		Err("Camera does not offer a supported capture mode up to 3840×2160")
 	}
+}
+
+fn mode_rank(
+	width: usize,
+	height: usize,
+	(target_width, target_height): (usize, usize),
+	frames_per_second: u8,
+	interval: Option<i64>,
+) -> (bool, bool, usize, bool, u64) {
+	let exact = width == target_width && height == target_height;
+	let covers = width >= target_width && height >= target_height;
+	let same_shape = width * target_height == height * target_width;
+	// Without an exact mode, prefer the smallest mode that covers the target. If none
+	// covers it, use the most source pixels available before considering aspect ratio;
+	// otherwise a tiny same-shape mode can beat a much larger, slightly different mode.
+	let area = if covers {
+		width * height
+	} else {
+		usize::MAX - width * height
+	};
+	// Prefer the requested aspect ratio only among modes with equally good resolution.
+	let rate = interval.map_or(u64::MAX, |interval| {
+		(10_000_000 / interval as u64).abs_diff(u64::from(frames_per_second))
+	});
+	(!exact, !covers, area, !same_shape, rate)
 }
 
 struct Capture {
@@ -850,6 +867,19 @@ fn rgb_frame(
 mod tests {
 	use super::*;
 	use crate::camera::{HEIGHT, WIDTH};
+
+	#[test]
+	fn directshow_prefers_more_source_pixels_over_only_matching_aspect_ratio() {
+		let target = (1920, 1080);
+		let low_same_shape = mode_rank(640, 360, target, 30, Some(333_333));
+		let larger_different_shape = mode_rank(1280, 800, target, 30, Some(333_333));
+		assert!(larger_different_shape < low_same_shape);
+
+		let exact = mode_rank(1920, 1080, target, 30, Some(333_333));
+		let larger_covering = mode_rank(2560, 1440, target, 30, Some(333_333));
+		assert!(exact < larger_covering);
+	}
+
 	#[test]
 	fn native_yuv_and_rgb32_pictures_convert_in_bounds() {
 		for hd in [false, true] {

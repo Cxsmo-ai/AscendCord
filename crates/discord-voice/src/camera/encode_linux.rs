@@ -6,10 +6,10 @@
 //! are built individually, so a machine without the plugin fails at construction and the
 //! caller keeps openh264.
 //!
-//! Every picture is coded as an IDR, matching the software encoder: the camera sender drops to
-//! the latest frame, so inter prediction would freeze a receiver until the next refresh. The
-//! keyframe interval is only a request, so each returned access unit is checked and a backend
-//! that ignores it is rejected.
+//! Pictures predict from the previous one with a keyframe every two seconds; a downstream
+//! force-key-unit request asks the encoder to refresh sooner after a dropped picture. The camera
+//! sender holds back dependent pictures until that keyframe. Every keyframe must carry its
+//! parameter sets, or the backend is rejected.
 //!
 //! Property names and types differ between these elements and across their versions, so every
 //! property is matched against its own `ParamSpec` before being set. Setting one blindly, or
@@ -20,6 +20,7 @@ use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
 
 const UNAVAILABLE: &str = "Linux hardware video encoding is unavailable";
 const FAILED: &str = "Linux hardware video encoding failed";
@@ -62,8 +63,9 @@ impl Encoder {
 	fn assemble(config: Config, encoder: gst::Element) -> Result<Self, &'static str> {
 		// Both spellings of each knob are offered; only the ones this element declares apply.
 		set_number(&encoder, "bitrate", i64::from(config.bit_rate / 1000));
-		set_number(&encoder, "key-int-max", 1);
-		set_number(&encoder, "gop-size", 1);
+		let interval = i64::from(config.fps.max(1)) * 2;
+		set_number(&encoder, "key-int-max", interval);
+		set_number(&encoder, "gop-size", interval);
 		set_number(&encoder, "b-frames", 0);
 		set_number(&encoder, "bframes", 0);
 		set_number(&encoder, "rc-lookahead", 0);
@@ -144,7 +146,11 @@ impl Encoder {
 
 	/// Pushes one packed RGB picture and returns the next finished access unit, or `None` while
 	/// the encoder has not produced one yet.
-	pub(super) fn encode(&mut self, rgb: &[u8]) -> Result<Option<Vec<u8>>, &'static str> {
+	pub(super) fn encode(
+		&mut self,
+		rgb: &[u8],
+		force_keyframe: bool,
+	) -> Result<Option<Vec<u8>>, &'static str> {
 		let expected = (self.config.width as usize)
 			.checked_mul(self.config.height as usize)
 			.and_then(|pixels| pixels.checked_mul(3))
@@ -158,6 +164,15 @@ impl Encoder {
 			return Err(FAILED);
 		}
 		self.pictures += 1;
+		if force_keyframe && let Some(pad) = self.source.static_pad("src") {
+			// This is a request; keep the regular GOP as a recovery bound if a
+			// particular hardware element does not implement force-key-unit.
+			let _ = pad.push_event(
+				gst_video::DownstreamForceKeyUnitEvent::builder()
+					.all_headers(true)
+					.build(),
+			);
+		}
 		let mut buffer = gst::Buffer::from_slice(rgb.to_vec());
 		buffer.get_mut().ok_or(FAILED)?.set_offset(self.pictures);
 		self.source.push_buffer(buffer).map_err(|_| FAILED)?;
@@ -186,11 +201,9 @@ impl Encoder {
 		let map = buffer.map_readable().map_err(|_| FAILED)?;
 		let data = map.to_vec();
 		crate::video::validate_source(&data).map_err(|_| FAILED)?;
-		// The stream must stay independently decodable. A delta picture means the element
-		// ignored the requested keyframe interval, so this backend is unusable.
-		if buffer.flags().contains(gst::BufferFlags::DELTA_UNIT)
-			|| !crate::video_receive::is_keyframe(&data)
-			|| !crate::video_receive::has_parameter_sets(&data)
+		// A keyframe without its parameter sets would leave a new viewer unable to decode.
+		if crate::video_receive::is_keyframe(&data)
+			&& !crate::video_receive::has_parameter_sets(&data)
 		{
 			return Err(FAILED);
 		}
@@ -274,12 +287,12 @@ mod tests {
 	}
 
 	#[test]
-	fn rejects_unbounded_pictures_and_stays_independently_decodable() {
+	fn rejects_unbounded_pictures_and_starts_with_a_keyframe() {
 		let Some(mut encoder) = any_encoder() else {
 			return;
 		};
 		for length in [0, 640 * 480 * 3 - 1, 640 * 480 * 3 + 1] {
-			assert!(encoder.encode(&vec![0; length]).is_err());
+			assert!(encoder.encode(&vec![0; length], true).is_err());
 		}
 		let mut coded = 0;
 		for value in [0u8, 32, 96, 160, 255, 8, 200, 64] {
@@ -287,13 +300,15 @@ mod tests {
 			for (index, pixel) in rgb.as_chunks_mut::<3>().0.iter_mut().take(640).enumerate() {
 				*pixel = [(index % 251) as u8, value, (index % 97) as u8];
 			}
-			let Some(data) = encoder.encode(&rgb).expect("hardware encode") else {
+			let Some(data) = encoder.encode(&rgb, coded == 0).expect("hardware encode") else {
 				continue;
 			};
+			if coded == 0 {
+				assert!(crate::video_receive::is_keyframe(&data));
+				assert!(crate::video_receive::has_parameter_sets(&data));
+			}
 			coded += 1;
 			assert!(data.len() <= CAMERA.max_bytes);
-			assert!(crate::video_receive::is_keyframe(&data));
-			assert!(crate::video_receive::has_parameter_sets(&data));
 		}
 		assert!(coded > 0, "the pipeline returned no encoded picture");
 	}

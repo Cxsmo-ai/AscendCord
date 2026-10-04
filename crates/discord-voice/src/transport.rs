@@ -546,7 +546,7 @@ async fn run_inner(
 				}
 				let control=*controls.borrow();
 				let camera_enabled=enabled && video.available() && control.camera!=0;
-				if !camera_enabled || video.generation!=control.camera {video.clear();}
+				if !camera_enabled || video.generation!=control.camera {video.reset();}
 				video.generation=control.camera;
 				if video.announced && !camera_enabled {
 					json_send(&mut ws,video.announcement(ssrc,camera_enabled)).await?;
@@ -558,14 +558,24 @@ async fn run_inner(
 					'camera: {
 					// A mismatched codec drops this picture only; the audio tick below still runs.
 					if video.negotiated_codec != Some(frame.codec) {
+						video.require_keyframe();
+						crate::camera::request_keyframe();
 						metrics.camera(Camera::Dropped,1);
 						break 'camera;
 					}
 					let quality_changed = video.set_quality(&frame);
+					// A resolution change starts a new prediction chain even if the
+					// encoder backend did not mark this picture as an IDR.
+					if quality_changed {video.require_keyframe();}
 					if !video.announced || quality_changed {
 						json_send(&mut ws,video.announcement(ssrc,true)).await?;
 						video.announced=true;
 						metrics.camera(Camera::Announced,1);
+					}
+					if !video.accept_frame(frame.index, frame.keyframe) {
+						crate::camera::request_keyframe();
+						metrics.camera(Camera::Dropped,1);
+						break 'camera;
 					}
 					let normalized = match frame.codec {
 						model::CameraCodec::H264 => crate::video_sps::normalize(&frame.data)?,

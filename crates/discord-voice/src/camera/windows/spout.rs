@@ -305,6 +305,7 @@ pub(in crate::camera) fn run(
 	let mut connected_once = false;
 	let mut last_sender_probe = Instant::now();
 	let mut encoded_frames = 0_u64;
+	let mut emitted = 0_u64;
 	let mut keyframe_interval = u64::from(config.fps.max(1)) * 2;
 	while !shared.stopped.load(Ordering::Acquire) {
 		// Sender processes can restart while the camera is selected. Rebind on
@@ -431,10 +432,10 @@ pub(in crate::camera) fn run(
 		let nv12 = converter
 			.convert()
 			.map_err(|_| "Spout GPU frame conversion failed")?;
-		let force_keyframe =
-			encoded_frames == 0 || encoded_frames.is_multiple_of(keyframe_interval);
+		let force_keyframe = crate::camera::take_keyframe_request()
+			| (encoded_frames == 0 || encoded_frames.is_multiple_of(keyframe_interval));
 		encoded_frames = encoded_frames.wrapping_add(1);
-		let (h264, _) = encoder
+		let (h264, keyframe) = encoder
 			.encode_surface(nv12, force_keyframe)
 			.map_err(|_| "Spout GPU hardware encoding failed")?;
 		if h264.len() > MAX_ENCODED_BYTES {
@@ -452,7 +453,10 @@ pub(in crate::camera) fn run(
 			height,
 			frames_per_second,
 			bitrate_kbps: quality.bitrate_kbps,
+			keyframe,
+			index: emitted,
 		});
+		emitted = emitted.wrapping_add(1);
 		shared.active.store(true, Ordering::Release);
 		wake();
 	}

@@ -11,7 +11,11 @@ const MAX_PACKETS_PER_FRAME: usize = 2048;
 
 pub struct Frame {
 	pub generation: u64,
+	/// Index assigned by the camera encoder before bounded queues can drop a picture.
+	pub index: u64,
 	pub timestamp: u32,
+	/// Inter pictures are only safe after every preceding picture has been delivered.
+	pub keyframe: bool,
 	pub width: u32,
 	pub height: u32,
 	pub frames_per_second: u8,
@@ -34,8 +38,28 @@ pub(crate) struct Sender {
 	frames_per_second: u8,
 	bitrate_kbps: u16,
 	packets: VecDeque<Vec<u8>>,
+	next_frame: Option<u64>,
+	awaiting_keyframe: bool,
 }
 impl Sender {
+	/// Accept only a continuous prediction chain. A gap requires an IDR before
+	/// this sender can resume; camera capture is asked to produce one immediately.
+	pub fn accept_frame(&mut self, index: u64, keyframe: bool) -> bool {
+		if self.next_frame.is_none_or(|next| next != index) {
+			self.awaiting_keyframe = true;
+		}
+		self.next_frame = Some(index.wrapping_add(1));
+		if self.awaiting_keyframe && !keyframe {
+			return false;
+		}
+		if keyframe {
+			self.awaiting_keyframe = false;
+		}
+		true
+	}
+	pub fn require_keyframe(&mut self) {
+		self.awaiting_keyframe = true;
+	}
 	pub fn configure(&mut self, data: &Value, audio: u32) -> bool {
 		// Request one stream and accept only that exact assignment, never guessed SSRCs.
 		let Some(stream) = data["streams"]
@@ -86,6 +110,11 @@ impl Sender {
 	}
 	pub fn clear(&mut self) {
 		self.packets.clear();
+		self.next_frame = None;
+		self.awaiting_keyframe = true;
+	}
+	pub fn reset(&mut self) {
+		self.clear();
 	}
 	pub fn is_empty(&self) -> bool {
 		self.packets.is_empty()
@@ -249,6 +278,26 @@ fn nal_units(frame: &[u8], codec: model::CameraCodec) -> Result<Vec<&[u8]>, &'st
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn camera_sender_waits_for_keyframe_after_start_or_a_frame_gap() {
+		let mut sender = Sender::default();
+		assert!(!sender.accept_frame(0, false));
+		assert!(sender.accept_frame(1, true));
+		assert!(sender.accept_frame(2, false));
+		assert!(!sender.accept_frame(4, false));
+		assert!(!sender.accept_frame(5, false));
+		assert!(sender.accept_frame(6, true));
+		assert!(sender.accept_frame(7, false));
+		sender.require_keyframe();
+		assert!(!sender.accept_frame(8, false));
+		assert!(sender.accept_frame(9, true));
+	}
+	#[test]
+	fn camera_sender_tracks_frame_indices_across_wrap() {
+		let mut sender = Sender::default();
+		assert!(sender.accept_frame(u64::MAX, true));
+		assert!(sender.accept_frame(0, false));
+	}
 	#[test]
 	fn camera_packetization_is_bounded_and_marks_only_the_last_fragment() {
 		let mut sender = Sender::default();

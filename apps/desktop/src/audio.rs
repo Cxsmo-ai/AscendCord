@@ -124,8 +124,8 @@ impl Audio {
 			None
 		} else {
 			Some(
-				crate::downloads::original_url(&attachment)
-					.ok_or("Audio attachment unavailable")?,
+				crate::downloads::playback_url(&attachment)
+					.map_err(|_| "Audio attachment unavailable")?,
 			)
 		};
 		if self.worker.is_none() {
