@@ -2119,7 +2119,7 @@ mod tests {
 			ltr.iter()
 				.map(|(text, _)| text.as_str())
 				.collect::<String>(),
-			"English مرحبا!"
+			"English \u{0627}\u{0628}\u{062d}\u{0631}\u{0645}!"
 		);
 		assert!(bidi_spans(&[("English only".into(), style)]).is_none());
 		assert!(bidi_spans(&[]).is_none());
