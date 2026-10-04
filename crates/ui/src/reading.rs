@@ -273,6 +273,11 @@ impl MessagingUi {
 			self.member_sidebar_applied = Some(self.member_list_width);
 		}
 	}
+
+	pub(super) fn member_sidebar_resizing(ui: &egui::Ui) -> bool {
+		let resize_id = ui.scope_id().with("people-pane").with("__resize");
+		ui.ctx().is_being_dragged(resize_id) || ui.ctx().drag_stopped_id() == Some(resize_id)
+	}
 }
 
 #[cfg(test)]
@@ -578,7 +583,7 @@ mod tests {
 							ui.label("Synthetic members");
 						});
 					rendered = people.response.rect.width();
-					view.record_member_sidebar(rendered, people.response.dragged());
+					view.record_member_sidebar(rendered, MessagingUi::member_sidebar_resizing(ui));
 				},
 			)
 			.drop_without_applying_deltas();

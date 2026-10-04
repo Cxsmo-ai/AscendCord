@@ -3826,7 +3826,10 @@ impl MessagingUi {
 					.show(ui, |ui| {
 						self.member_rows(ui, state, &mut commands);
 					});
-				self.record_member_sidebar(people.response.rect.width(), people.response.dragged());
+				self.record_member_sidebar(
+					people.response.rect.width(),
+					Self::member_sidebar_resizing(ui),
+				);
 			} else {
 				let response = dialog::Dialog::new("members-narrow", "Members")
 					.subtitle("Everyone with access to this conversation.")

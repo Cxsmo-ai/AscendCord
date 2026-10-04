@@ -2414,6 +2414,8 @@ mod tests {
 		assert!(
 			painted.contains("Synthetic person")
 				&& painted.contains("ABOUT ME")
+				&& painted.contains("Building a quieter place for conversations.")
+				&& painted.contains("Native profile preview · all details here are synthetic.")
 				&& painted.contains("they / them")
 				&& painted.contains("SRN")
 		);

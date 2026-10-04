@@ -1468,7 +1468,15 @@ impl MessagingUi {
 		let mut open = trigger
 			.ctx
 			.data_mut(|data| *data.get_temp_mut_or_default::<bool>(id));
-		let secondary_clicked = trigger.container_secondary_clicked();
+		let secondary_clicked = trigger.ctx.input(|input| {
+			let pointer = &input.pointer;
+			let secondary_pressed = pointer.button_pressed(egui::PointerButton::Secondary)
+				|| pointer.button_clicked(egui::PointerButton::Secondary);
+			secondary_pressed
+				&& pointer
+					.latest_pos()
+					.is_some_and(|position| trigger.interact_rect.contains(position))
+		});
 
 		if secondary_clicked {
 			open = true;
