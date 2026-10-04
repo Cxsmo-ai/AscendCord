@@ -88,13 +88,17 @@ fn main() -> eframe::Result {
 		}
 		return Ok(());
 	}
-	if std::env::args().nth(1).as_deref() == Some("--media-probe") {
+	if let Some(mode @ ("--media-probe" | "--video-probe")) = std::env::args().nth(1).as_deref() {
 		use std::io::Write;
 		platform::startup::attach_parent_console();
-		let device = std::env::args().nth(2);
-		probe::run(device.as_deref(), |line| {
+		let print = |line: String| {
 			let _ = writeln!(std::io::stdout(), "{line}");
-		});
+		};
+		if mode == "--media-probe" {
+			probe::run(std::env::args().nth(2).as_deref(), print);
+		} else {
+			probe::videos(std::env::args().skip(2), print);
+		}
 		return Ok(());
 	}
 	#[cfg(all(debug_assertions, feature = "demo"))]

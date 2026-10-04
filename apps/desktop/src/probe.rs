@@ -39,6 +39,74 @@ pub fn run(selected: Option<&str>, mut print: impl FnMut(String)) {
 	}
 }
 
+/// `--video-probe FILE…`: decodes the start of each file as the inline player would.
+pub fn videos(files: impl Iterator<Item = String>, mut print: impl FnMut(String)) {
+	print(format!("AscendCord {} video probe", env!("CARGO_PKG_VERSION")));
+	for file in files {
+		print(format!("video \"{file}\" {}", probe_video(&file)));
+	}
+}
+
+fn probe_video(file: &str) -> String {
+	use platform::video::{Decoder, Sample};
+	use std::task::Poll;
+	let source = match std::fs::File::open(file) {
+		Ok(source) => source,
+		Err(error) => return format!("cannot open: {error}"),
+	};
+	let started = Instant::now();
+	let mut decoder = match Decoder::open(Box::new(std::io::BufReader::new(source))) {
+		Ok(decoder) => decoder,
+		Err(error) => return format!("error: {error}"),
+	};
+	let info = decoder.info();
+	let opened = started.elapsed();
+	let (mut pictures, mut audio, mut size, mut last_pts) = (0usize, 0usize, (0, 0), 0.0);
+	let mut failure = None;
+	while pictures < 60 && started.elapsed() < Duration::from_secs(20) {
+		match decoder.poll_video() {
+			Ok(Poll::Ready(Some(Sample::Video {
+				pts, width, height, ..
+			}))) => {
+				pictures += 1;
+				size = (width, height);
+				last_pts = pts;
+			}
+			Ok(Poll::Ready(Some(Sample::Audio { .. }))) => {}
+			Ok(Poll::Ready(None)) => break,
+			Ok(Poll::Pending) => std::thread::sleep(Duration::from_millis(1)),
+			Err(error) => {
+				failure = Some(error);
+				break;
+			}
+		}
+		if info.sample_rate > 0
+			&& let Ok(Poll::Ready(Some(Sample::Audio { frames, .. }))) = decoder.poll_audio()
+		{
+			audio += frames.len();
+		}
+	}
+	let mut report = format!(
+		"{}x{} {:.1} s, audio {} Hz x{}: opened in {} ms, {pictures} pictures ({}x{}, to {:.2} s) and {audio} audio frames in {} ms",
+		info.width,
+		info.height,
+		info.duration,
+		info.sample_rate,
+		info.channels,
+		opened.as_millis(),
+		size.0,
+		size.1,
+		last_pts,
+		started.elapsed().as_millis()
+	);
+	if let Some(error) = failure {
+		report.push_str(&format!(", error: {error}"));
+	} else if pictures == 0 {
+		report.push_str(", error: no pictures");
+	}
+	report
+}
+
 fn probe_camera(id: &str, quality: model::CameraQuality) -> String {
 	let (width, height) = quality.dimensions();
 	let frames = Arc::new(AtomicUsize::new(0));

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use windows_capture::{
 	capture::{CaptureControl, Context, GraphicsCaptureApiHandler},
 	frame::Frame,
-	graphics_capture_api::InternalCaptureControl,
+	graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl},
 	monitor::Monitor,
 	settings::{
 		ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
@@ -292,7 +292,12 @@ where
 		} else {
 			CursorCaptureSettings::WithoutCursor
 		},
-		DrawBorderSettings::WithoutBorder,
+		// Windows 10 cannot hide the capture border and refuses to start a session that asks.
+		if GraphicsCaptureApi::is_border_settings_supported().unwrap_or(false) {
+			DrawBorderSettings::WithoutBorder
+		} else {
+			DrawBorderSettings::Default
+		},
 		SecondaryWindowSettings::Default,
 		MinimumUpdateIntervalSettings::Default,
 		DirtyRegionSettings::Default,
