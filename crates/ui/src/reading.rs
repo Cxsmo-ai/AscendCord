@@ -260,12 +260,15 @@ impl MessagingUi {
 	}
 
 	pub(super) fn record_member_sidebar(&mut self, width: f32, resizing: bool) {
-		if !self.member_sidebar_constrained
-			&& !resizing
-			&& self.member_sidebar_applied == Some(self.member_list_width)
-			&& width.is_finite()
-			&& (180.0..=360.0).contains(&width.round())
-		{
+		if resizing {
+			self.member_sidebar_dragging = true;
+			return;
+		}
+		if !self.member_sidebar_dragging {
+			return;
+		}
+		self.member_sidebar_dragging = false;
+		if width.is_finite() && (180.0..=360.0).contains(&width.round()) {
 			self.member_list_width = width.round() as u16;
 			self.member_sidebar_applied = Some(self.member_list_width);
 		}
@@ -580,7 +583,10 @@ mod tests {
 		};
 		for width in [900.0, 480.0, 900.0] {
 			let actual = frame(&mut view, width, vec![]);
-			assert_eq!(view.member_list_width, 340);
+			assert_eq!(
+				view.member_list_width, 340,
+				"A {width}px viewport must not replace the preferred width with {actual}px"
+			);
 			assert!((actual - if width < 600.0 { 200.0 } else { 340.0 }).abs() < 1.0);
 		}
 		let edge = egui::pos2(560.0, 200.0);

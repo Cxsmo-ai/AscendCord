@@ -290,6 +290,7 @@ pub struct MessagingUi {
 	reading_sidebar_constrained: bool,
 	member_sidebar_applied: Option<u16>,
 	member_sidebar_constrained: bool,
+	member_sidebar_dragging: bool,
 	reading_zoom_pending: bool,
 	/// Slider value while the pointer is still down; zoom is applied on release so the
 	/// slider does not rescale under the cursor mid-drag.

@@ -1473,11 +1473,12 @@ impl MessagingUi {
 			open = !open;
 		}
 		// Device dropdowns use egui's popup memory; keep the parent independently open.
-		let close_behavior = if egui::Popup::is_any_open(&trigger.ctx) {
-			egui::PopupCloseBehavior::IgnoreClicks
-		} else {
-			egui::PopupCloseBehavior::CloseOnClickOutside
-		};
+		let close_behavior =
+			if egui::Popup::is_any_open(&trigger.ctx) || trigger.secondary_clicked() {
+				egui::PopupCloseBehavior::IgnoreClicks
+			} else {
+				egui::PopupCloseBehavior::CloseOnClickOutside
+			};
 		egui::Popup::menu(trigger)
 			.open_bool(&mut open)
 			.style(|_: &mut egui::Style| {})
@@ -4734,9 +4735,9 @@ mod tests {
 	fn right_clicking_a_voice_toggle_opens_its_settings_popup() {
 		let ctx = egui::Context::default();
 		let mut messaging = MessagingUi::default();
-		let pos = egui::pos2(40.0, 20.0);
 		let frame = |messaging: &mut MessagingUi, events| {
 			let mut is_open = false;
+			let mut pos = egui::Pos2::ZERO;
 			ctx.run_ui(
 				egui::RawInput {
 					screen_rect: Some(egui::Rect::from_min_size(
@@ -4748,16 +4749,18 @@ mod tests {
 				},
 				|ui| {
 					let mic = ui.button("Microphone toggle");
+					pos = mic.rect.center();
 					messaging.voice_settings_popup(&mic, false, false, true, false);
 					is_open = egui::Popup::is_any_open(ui.ctx());
 				},
 			)
 			.drop_without_applying_deltas();
-			is_open
+			(pos, is_open)
 		};
-		frame(&mut messaging, vec![]);
+		let (pos, _) = frame(&mut messaging, vec![]);
+		let mut is_open = false;
 		for pressed in [true, false] {
-			frame(
+			let (_, open) = frame(
 				&mut messaging,
 				vec![
 					egui::Event::PointerMoved(pos),
@@ -4769,7 +4772,8 @@ mod tests {
 					},
 				],
 			);
+			is_open = open;
 		}
-		assert!(egui::Popup::is_any_open(&ctx));
+		assert!(is_open && egui::Popup::is_any_open(&ctx));
 	}
 }
