@@ -1361,6 +1361,8 @@ mod tests {
 	fn extension_app_notification_grant_and_settings_events_use_local_preferences() {
 		let state = test_support::demo_state();
 		let mut messaging = ui::MessagingUi::default();
+		let mut preferences = crate::app_settings::Settings::default();
+		preferences.apply(&mut messaging);
 		let reading = snapshot(
 			&state,
 			&messaging,
@@ -1383,7 +1385,6 @@ mod tests {
 			ChangeKey::capture(&state, &messaging).changed(&before),
 			Some(AppEventKind::Settings)
 		);
-		let mut preferences = crate::app_settings::Settings::default();
 		preferences.observe(&messaging);
 		assert!(preferences.state.dirty);
 		let mut restored = ui::MessagingUi::default();
