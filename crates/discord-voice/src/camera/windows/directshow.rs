@@ -442,7 +442,7 @@ fn source_area(media: &AM_MEDIA_TYPE) -> (Option<(usize, usize)>, Option<i64>) {
 		}
 	};
 	let visible = (area.left == 0 && area.top == 0 && area.right > 0 && area.bottom > 0)
-		.then(|| (area.right as usize, area.bottom as usize));
+		.then_some((area.right as usize, area.bottom as usize));
 	(visible, (interval > 0).then_some(interval))
 }
 
