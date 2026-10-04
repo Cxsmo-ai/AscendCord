@@ -14,8 +14,10 @@ pub use media_foundation::Decoder;
 
 #[cfg(target_os = "macos")]
 mod apple;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod mp4;
+#[cfg(target_os = "windows")]
+mod opus_track;
 #[cfg(target_os = "macos")]
 pub use apple::Decoder;
 

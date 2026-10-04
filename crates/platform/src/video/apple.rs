@@ -576,7 +576,9 @@ pub(super) unsafe fn copy_rgba(
 }
 
 fn audio_decoder(track: &mp4::AudioTrack) -> Result<Box<dyn AudioDecoder>, &'static str> {
-	let AudioCodec::Aac { config } = &track.track.codec;
+	let AudioCodec::Aac { config } = &track.track.codec else {
+		return Err(UNSUPPORTED);
+	};
 	let positions = Position::from_count(u32::from(track.channels)).ok_or(UNSUPPORTED)?;
 	let mut parameters = AudioCodecParameters::new();
 	parameters
