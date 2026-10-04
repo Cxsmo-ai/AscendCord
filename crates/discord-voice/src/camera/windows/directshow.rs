@@ -312,30 +312,85 @@ impl Pixels {
 	}
 }
 
-/// BT.601 studio-range YUV to blue, green, red.
-fn bgr(y: u8, u: u8, v: u8) -> [u8; 3] {
+/// Studio-range YUV to blue, green, red: BT.709 for HD pictures, BT.601 for SD, as
+/// Windows recommends when a camera does not say.
+fn bgr(y: u8, u: u8, v: u8, hd: bool) -> [u8; 3] {
 	let (c, d, e) = (
 		298 * (i32::from(y) - 16),
 		i32::from(u) - 128,
 		i32::from(v) - 128,
 	);
+	let (red_v, green_u, green_v, blue_u) = if hd {
+		(459, 55, 136, 541)
+	} else {
+		(409, 100, 208, 516)
+	};
 	let channel = |value: i32| ((value + 128) >> 8).clamp(0, 255) as u8;
 	[
-		channel(c + 516 * d),
-		channel(c - 100 * d - 208 * e),
-		channel(c + 409 * e),
+		channel(c + blue_u * d),
+		channel(c - green_u * d - green_v * e),
+		channel(c + red_v * e),
 	]
 }
 
-/// One picture as 24-bit rows padded to four bytes, the layout `rgb_frame` reads.
-fn bgr24(bytes: &[u8], pixels: Pixels, width: usize, height: usize) -> Vec<u8> {
-	let pitch = (width * 3).next_multiple_of(4);
-	if pixels == Pixels::Rgb24 {
-		return bytes.to_vec();
+/// Where one connected picture lives in a sample: rows of `stride` pixels, `rows` of them,
+/// of which the top-left `width` by `height` are the picture (`rcSource`).
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+	pixels: Pixels,
+	stride: usize,
+	rows: usize,
+	width: usize,
+	height: usize,
+}
+
+impl Layout {
+	fn new(
+		pixels: Pixels,
+		(stride, rows, bottom_up): (usize, usize, bool),
+		visible: Option<(usize, usize)>,
+	) -> Self {
+		let (width, height) = visible
+			.filter(|&(width, height)| width <= stride && height <= rows)
+			.unwrap_or((stride, rows));
+		// A bottom-up picture keeps its top rows last in memory, so only its width is cropped.
+		let height = if pixels.bottom_up(bottom_up) {
+			rows
+		} else {
+			height
+		};
+		Self {
+			pixels,
+			stride,
+			rows,
+			width,
+			height,
+		}
 	}
+
+	fn bytes(self) -> usize {
+		self.pixels.bytes(self.stride, self.rows)
+	}
+}
+
+/// The visible picture as 24-bit rows padded to four bytes, the layout `rgb_frame` reads.
+fn bgr24(bytes: &[u8], layout: Layout) -> Vec<u8> {
+	let Layout {
+		pixels,
+		stride,
+		rows,
+		width,
+		height,
+	} = layout;
+	let pitch = (width * 3).next_multiple_of(4);
+	let source_pitch = (stride * 3).next_multiple_of(4);
+	if pixels == Pixels::Rgb24 && pitch == source_pitch {
+		return bytes[..pitch * height].to_vec();
+	}
+	let hd = height > 576;
 	let mut out = vec![0; pitch * height];
-	let chroma_width = width.div_ceil(2);
-	let luma = width * height;
+	let chroma_stride = stride.div_ceil(2);
+	let luma = stride * rows;
 	for (y, row) in out.chunks_exact_mut(pitch).enumerate() {
 		for (x, pixel) in row[..width * 3]
 			.as_chunks_mut::<3>()
@@ -344,28 +399,51 @@ fn bgr24(bytes: &[u8], pixels: Pixels, width: usize, height: usize) -> Vec<u8> {
 			.enumerate()
 		{
 			*pixel = match pixels {
-				Pixels::Rgb24 => unreachable!("returned above"),
+				Pixels::Rgb24 => {
+					let at = y * source_pitch + x * 3;
+					[bytes[at], bytes[at + 1], bytes[at + 2]]
+				}
 				Pixels::Rgb32 => {
-					let at = (y * width + x) * 4;
+					let at = (y * stride + x) * 4;
 					[bytes[at], bytes[at + 1], bytes[at + 2]]
 				}
 				Pixels::Yuy2 => {
-					let at = y * (width * 2).next_multiple_of(4) + (x & !1) * 2;
-					bgr(bytes[at + (x & 1) * 2], bytes[at + 1], bytes[at + 3])
+					let at = y * (stride * 2).next_multiple_of(4) + (x & !1) * 2;
+					bgr(bytes[at + (x & 1) * 2], bytes[at + 1], bytes[at + 3], hd)
 				}
 				Pixels::Nv12 => {
-					let at = luma + (y / 2) * chroma_width * 2 + (x / 2) * 2;
-					bgr(bytes[y * width + x], bytes[at], bytes[at + 1])
+					let at = luma + (y / 2) * chroma_stride * 2 + (x / 2) * 2;
+					bgr(bytes[y * stride + x], bytes[at], bytes[at + 1], hd)
 				}
 				Pixels::I420 => {
-					let plane = chroma_width * height.div_ceil(2);
-					let at = luma + (y / 2) * chroma_width + x / 2;
-					bgr(bytes[y * width + x], bytes[at], bytes[at + plane])
+					let plane = chroma_stride * rows.div_ceil(2);
+					let at = luma + (y / 2) * chroma_stride + x / 2;
+					bgr(bytes[y * stride + x], bytes[at], bytes[at + plane], hd)
 				}
 			};
 		}
 	}
 	out
+}
+
+/// The picture area (`rcSource`) and frame interval of a video format, when it states them.
+fn source_area(media: &AM_MEDIA_TYPE) -> (Option<(usize, usize)>, Option<i64>) {
+	if dimensions(media).is_err() {
+		return (None, None);
+	}
+	// SAFETY: dimensions validated the complete header allocation for either layout.
+	let (area, interval) = unsafe {
+		if media.formattype == FORMAT_VideoInfo {
+			let header = media.pbFormat.cast::<VIDEOINFOHEADER>().read_unaligned();
+			(header.rcSource, header.AvgTimePerFrame)
+		} else {
+			let header = media.pbFormat.cast::<VIDEOINFOHEADER2>().read_unaligned();
+			(header.rcSource, header.AvgTimePerFrame)
+		}
+	};
+	let visible = (area.left == 0 && area.top == 0 && area.right > 0 && area.bottom > 0)
+		.then(|| (area.right as usize, area.bottom as usize));
+	(visible, (interval > 0).then_some(interval))
 }
 
 fn rgb_dimensions(media: &AM_MEDIA_TYPE) -> Result<(usize, usize, bool), &'static str> {
@@ -481,7 +559,11 @@ fn configure(
 				} else {
 					usize::MAX - width * height
 				};
-				choices.push(((!exact, !covers, !same_shape, area), media));
+				// Among equal sizes, the frame rate closest to the selected one.
+				let rate = source_area(&media.0).1.map_or(u64::MAX, |interval| {
+					(10_000_000 / interval as u64).abs_diff(u64::from(quality.frames_per_second))
+				});
+				choices.push(((!exact, !covers, !same_shape, area, rate), media));
 			}
 		}
 		choices.sort_by_key(|(rank, _)| *rank);
@@ -529,7 +611,7 @@ pub(super) fn run(
 		.ok_or("Selected Windows camera is no longer available")?;
 	// SAFETY: This is the only activation path, called after an explicit camera-on
 	// gesture. Graph, format negotiation and teardown all remain on this worker.
-	let (capture, receive, width, height, bottom_up, pixels, mode, filters) = unsafe {
+	let (capture, receive, width, height, bottom_up, layout, mode, filters) = unsafe {
 		let source: IBaseFilter = moniker.BindToObject(None, None).map_err(|_| UNAVAILABLE)?;
 		let graph: IGraphBuilder = CoCreateInstance(&CLSID_FilterGraph, None, CLSCTX_INPROC_SERVER)
 			.map_err(|_| UNAVAILABLE)?;
@@ -619,10 +701,11 @@ pub(super) fn run(
 			)
 		})?;
 		let pixels = pixels.expect("checked above");
-		let (width, height, bitmap_bottom_up) = connected;
-		let bottom_up = pixels.bottom_up(bitmap_bottom_up);
+		let layout = Layout::new(pixels, connected, source_area(&media.0).0);
+		let bottom_up = pixels.bottom_up(connected.2);
+		let (width, height) = (layout.width, layout.height);
 		// rgb_frame scales a camera without the exact mode to the selected size.
-		let bytes = pixels.bytes(width, height);
+		let bytes = layout.bytes();
 		// Check the actual negotiated allocator before any filter starts delivering.
 		let pins = filter.EnumPins().map_err(|_| INVALID)?;
 		let mut bounded_allocator = false;
@@ -677,7 +760,7 @@ pub(super) fn run(
 			capture.control.Run().map_err(|_| UNAVAILABLE)?;
 		}
 		(
-			capture, receive, width, height, bottom_up, pixels, mode, filters,
+			capture, receive, width, height, bottom_up, layout, mode, filters,
 		)
 	};
 	let mut last = Instant::now();
@@ -686,11 +769,11 @@ pub(super) fn run(
 			Ok(bytes) => {
 				let bytes = bytes.map_err(|reason| match reason {
 					FORMAT_CHANGED => reason,
-					reason => invalid(shared, format!("{reason}, {width}x{height} {pixels:?}")),
+					reason => invalid(shared, format!("{reason}, {layout:?}")),
 				})?;
 				let target = quality.dimensions();
 				let rgb = rgb_frame(
-					&bgr24(&bytes, pixels, width, height),
+					&bgr24(&bytes, layout),
 					width,
 					height,
 					bottom_up,
@@ -769,26 +852,46 @@ mod tests {
 	use crate::camera::{HEIGHT, WIDTH};
 	#[test]
 	fn native_yuv_and_rgb32_pictures_convert_in_bounds() {
-		assert_eq!(bgr(235, 128, 128), [255, 255, 255]);
-		assert_eq!(bgr(16, 128, 128), [0, 0, 0]);
-		let red = bgr(81, 90, 240);
-		assert!(red[2] > 250 && red[0] < 5 && red[1] < 5);
-		let (width, height) = (4, 2);
-		let yuy2 = [235u8, 128, 16, 128, 235, 128, 16, 128].repeat(height);
-		assert_eq!(Pixels::Yuy2.bytes(width, height), yuy2.len());
-		assert_eq!(
-			&bgr24(&yuy2, Pixels::Yuy2, width, height)[..6],
-			&[255, 255, 255, 0, 0, 0]
-		);
+		for hd in [false, true] {
+			assert_eq!(bgr(235, 128, 128, hd), [255, 255, 255]);
+			assert_eq!(bgr(16, 128, 128, hd), [0, 0, 0]);
+		}
+		// Pure red encoded with each matrix decodes back to red.
+		for red in [bgr(81, 90, 240, false), bgr(63, 102, 240, true)] {
+			assert!(red[2] > 250 && red[0] < 6 && red[1] < 6, "{red:?}");
+		}
+		let yuy2 = [235u8, 128, 16, 128, 235, 128, 16, 128].repeat(2);
+		let layout = Layout::new(Pixels::Yuy2, (4, 2, true), None);
+		assert_eq!(layout.bytes(), yuy2.len());
+		assert_eq!(&bgr24(&yuy2, layout)[..6], &[255, 255, 255, 0, 0, 0]);
 		for (width, height) in [(5, 3), (1, 1), (2560, 1440)] {
-			for pixels in [Pixels::Nv12, Pixels::I420, Pixels::Yuy2, Pixels::Rgb32] {
-				let bytes = vec![128; pixels.bytes(width, height)];
+			for pixels in [
+				Pixels::Nv12,
+				Pixels::I420,
+				Pixels::Yuy2,
+				Pixels::Rgb32,
+				Pixels::Rgb24,
+			] {
+				let layout = Layout::new(pixels, (width, height, false), None);
+				let bytes = vec![128; layout.bytes()];
 				assert_eq!(
-					bgr24(&bytes, pixels, width, height).len(),
+					bgr24(&bytes, layout).len(),
 					(width * 3).next_multiple_of(4) * height
 				);
 			}
 		}
+		// A 1920-wide NV12 picture in 2048-pixel rows: the chroma plane follows the padded
+		// luma plane and the padding is cropped away.
+		let (stride, rows) = (2048, 1080);
+		let layout = Layout::new(Pixels::Nv12, (stride, rows, true), Some((1920, 1080)));
+		let mut nv12 = vec![16u8; layout.bytes()];
+		for row in 0..rows {
+			nv12[row * stride..row * stride + 1920].fill(235);
+		}
+		nv12[stride * rows..].fill(128);
+		let out = bgr24(&nv12, layout);
+		assert_eq!(out.len(), 1920 * 3 * 1080);
+		assert!(out.iter().all(|&value| value == 255));
 		assert_eq!(Pixels::of(&MEDIASUBTYPE_RGB32), Some(Pixels::Rgb32));
 		assert_eq!(Pixels::of(&MEDIASUBTYPE_NV12), Some(Pixels::Nv12));
 		assert_eq!(Pixels::of(&MEDIASUBTYPE_YUY2), Some(Pixels::Yuy2));
