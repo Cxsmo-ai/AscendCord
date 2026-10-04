@@ -1,6 +1,6 @@
 //! Compatibility path for virtual cameras registered only with DirectShow.
 #![allow(non_snake_case)] // Custom COM interfaces preserve the Qedit.h method names.
-use super::{INVALID, Shared, TIMEOUT, UNAVAILABLE};
+use super::{INVALID, Shared, TIMEOUT, UNAVAILABLE, invalid};
 use model::CameraQuality;
 use std::{
 	ffi::c_void,
@@ -24,6 +24,23 @@ use windows::{
 const SAMPLE_GRABBER: GUID = GUID::from_u128(0xc1f400a0_3f08_11d3_9f0b_006008039e37);
 const NULL_RENDERER: GUID = GUID::from_u128(0xc1f400a4_3f08_11d3_9f0b_006008039e37);
 const MAX_BYTES: usize = 3840 * 2160 * 4;
+// The graph's allocator is bounded by its total memory, not an assumed buffer count: virtual
+// cameras and colour converters commonly negotiate four or more samples.
+const MAX_ALLOCATOR_BYTES: usize = MAX_BYTES * 8;
+const FORMAT_CHANGED: &str = "Camera changed its video format; restart the camera";
+
+fn allocator_fits(buffers: i32, buffer_bytes: i32, prefix: i32, frame_bytes: usize) -> bool {
+	let (Ok(buffers), Ok(buffer_bytes)) = (usize::try_from(buffers), usize::try_from(buffer_bytes))
+	else {
+		return false;
+	};
+	buffers >= 1
+		&& (0..=4096).contains(&prefix)
+		&& (frame_bytes..=MAX_BYTES).contains(&buffer_bytes)
+		&& buffers
+			.checked_mul(buffer_bytes)
+			.is_some_and(|total| total <= MAX_ALLOCATOR_BYTES)
+}
 
 // Qedit.h interfaces are absent from windows-rs metadata. Keep the SDK ABI order.
 #[interface("6b652fff-11fe-4fce-92ad-0266b5d7c78f")]
@@ -61,35 +78,36 @@ impl ISampleGrabberCB_Impl for Callback_Impl {
 		let result = unsafe {
 			(|| {
 				if last.1 {
-					return Err(INVALID);
+					return Err("after an earlier error");
 				}
-				let sample = IMediaSample::from_raw_borrowed(&sample).ok_or(INVALID)?;
+				let sample = IMediaSample::from_raw_borrowed(&sample).ok_or("sample pointer")?;
 				let length = sample.GetActualDataLength();
 				let capacity = sample.GetSize();
+				// A sample may carry tail bytes after the picture; only the picture is copied.
 				if length < 0
 					|| capacity < length
 					|| capacity as usize > MAX_BYTES
-					|| length as usize != self.bytes
+					|| (length as usize) < self.bytes
 				{
-					return Err(INVALID);
+					return Err("sample size");
 				}
-				let changed = sample.GetMediaType().map_err(|_| INVALID)?;
+				let changed = sample.GetMediaType().map_err(|_| "sample media type")?;
 				if !changed.is_null() {
 					let media = Media::take(changed);
-					if rgb_dimensions(&media.0)? != self.dimensions {
-						return Err("Camera changed its video format; restart the camera");
+					if rgb_dimensions(&media.0).ok() != Some(self.dimensions) {
+						return Err(FORMAT_CHANGED);
 					}
 				}
 				if last.0.elapsed() < self.interval {
 					return Ok(None);
 				}
 				last.0 = Instant::now();
-				let pointer = sample.GetPointer().map_err(|_| INVALID)?;
+				let pointer = sample.GetPointer().map_err(|_| "sample pointer")?;
 				if pointer.is_null() {
-					return Err(INVALID);
+					return Err("sample pointer");
 				}
 				Ok(Some(
-					std::slice::from_raw_parts(pointer, length as usize).to_vec(),
+					std::slice::from_raw_parts(pointer, self.bytes).to_vec(),
 				))
 			})()
 		};
@@ -305,13 +323,17 @@ fn configure(
 				continue;
 			}
 			if let Ok((width, height, _)) = dimensions(&media.0) {
-				choices.push((
-					(
-						width != target_width as usize || height != target_height as usize,
-						width * height,
-					),
-					media,
-				));
+				let (target_width, target_height) = (target_width as usize, target_height as usize);
+				let exact = width == target_width && height == target_height;
+				let covers = width >= target_width && height >= target_height;
+				// Without the exact mode, prefer the smallest one that covers the selected size
+				// (scaled down), else the largest smaller one (scaled up).
+				let area = if covers {
+					width * height
+				} else {
+					usize::MAX - width * height
+				};
+				choices.push(((!exact, !covers, area), media));
 			}
 		}
 		choices.sort_by_key(|(rank, _)| *rank);
@@ -414,14 +436,16 @@ pub(super) fn run(
 			.GetConnectedMediaType(&mut media.0)
 			.ok()
 			.map_err(|_| INVALID)?;
-		let (width, height, bottom_up) = rgb_dimensions(&media.0)?;
-		if (width, height)
-			!= (
-				quality.dimensions().0 as usize,
-				quality.dimensions().1 as usize,
-			) {
-			return Err("Selected Windows camera mode did not match the requested resolution");
-		}
+		let (width, height, bottom_up) = rgb_dimensions(&media.0).map_err(|_| {
+			invalid(
+				shared,
+				format!(
+					"converted format {:?} / {:?}",
+					media.0.subtype, media.0.formattype
+				),
+			)
+		})?;
+		// rgb_frame scales a camera without the exact mode to the selected size.
 		let bytes = (width * 3).next_multiple_of(4) * height;
 		// Check the actual negotiated allocator before any filter starts delivering.
 		let pins = filter.EnumPins().map_err(|_| INVALID)?;
@@ -436,19 +460,26 @@ pub(super) fn run(
 				let properties = input
 					.GetAllocator()
 					.and_then(|allocator| allocator.GetProperties())
-					.map_err(|_| INVALID)?;
-				if !(1..=3).contains(&properties.cBuffers)
-					|| properties.cbBuffer < bytes as i32
-					|| properties.cbBuffer as usize > MAX_BYTES
-					|| !(0..=4096).contains(&properties.cbPrefix)
-				{
-					return Err(INVALID);
+					.map_err(|error| invalid(shared, format!("allocator properties: {error}")))?;
+				if !allocator_fits(
+					properties.cBuffers,
+					properties.cbBuffer,
+					properties.cbPrefix,
+					bytes,
+				) {
+					return Err(invalid(
+						shared,
+						format!(
+							"allocator: {} buffers of {} bytes, prefix {}; {width}x{height} needs {bytes}",
+							properties.cBuffers, properties.cbBuffer, properties.cbPrefix
+						),
+					));
 				}
 				bounded_allocator = true;
 			}
 		}
 		if !bounded_allocator {
-			return Err(INVALID);
+			return Err(invalid(shared, "no frame grabber allocator".into()));
 		}
 		let (send, receive) = mpsc::sync_channel(1);
 		let interval = Duration::from_secs_f64(1.0 / f64::from(quality.frames_per_second));
@@ -475,9 +506,13 @@ pub(super) fn run(
 	while !shared.stopped.load(Ordering::Acquire) {
 		match receive.recv_timeout(Duration::from_millis(50)) {
 			Ok(bytes) => {
+				let bytes = bytes.map_err(|reason| match reason {
+					FORMAT_CHANGED => reason,
+					reason => invalid(shared, format!("{reason}, {width}x{height} RGB24")),
+				})?;
 				let target = quality.dimensions();
 				let rgb = rgb_frame(
-					&bytes?,
+					&bytes,
 					width,
 					height,
 					bottom_up,
@@ -580,6 +615,15 @@ mod tests {
 		let end = (HEIGHT - 1) * WIDTH * 3 + center;
 		assert_eq!(&top[end..end + 3], &[6, 5, 4]);
 		assert_eq!(&top[..3], &[0, 0, 0]);
+		let frame = 1920 * 1080 * 3;
+		for buffers in [1, 3, 4, 8, 12] {
+			assert!(allocator_fits(buffers, frame as i32, 0, frame));
+		}
+		assert!(!allocator_fits(0, frame as i32, 0, frame));
+		assert!(!allocator_fits(-1, frame as i32, 0, frame));
+		assert!(!allocator_fits(4, frame as i32 - 1, 0, frame));
+		assert!(!allocator_fits(1, frame as i32, 4097, frame));
+		assert!(!allocator_fits(9, MAX_BYTES as i32, 0, frame));
 		let wide = rgb_frame(&vec![255; 16 * 3 * 9], 16, 9, false, target).unwrap();
 		assert_eq!(&wide[..WIDTH * 60 * 3], &vec![0; WIDTH * 60 * 3]);
 		assert_eq!(

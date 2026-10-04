@@ -106,6 +106,7 @@ pub fn info_flag(mut args: impl Iterator<Item = String>) -> Option<String> {
 		"--help" | "-h" => Some(format!(
 			"{version}\n\nUsage: ascendcord [--start-minimized]\n\n  \
 			 --start-minimized  Start in the tray (with --autostart)\n  \
+			 --media-probe [ID] Test each camera (or one) and a screen, then exit\n  \
 			 -V, --version      Print the version and exit\n  \
 			 -h, --help         Print this help and exit"
 		)),

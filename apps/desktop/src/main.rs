@@ -37,6 +37,7 @@ mod post_menu_demo;
 mod reading_settings;
 #[cfg(feature = "demo")]
 mod rendering_demo;
+mod probe;
 mod screen;
 #[cfg(feature = "demo")]
 mod screenshot;
@@ -85,6 +86,15 @@ fn main() -> eframe::Result {
 		{
 			std::process::exit(1);
 		}
+		return Ok(());
+	}
+	if std::env::args().nth(1).as_deref() == Some("--media-probe") {
+		use std::io::Write;
+		platform::startup::attach_parent_console();
+		let device = std::env::args().nth(2);
+		probe::run(device.as_deref(), |line| {
+			let _ = writeln!(std::io::stdout(), "{line}");
+		});
 		return Ok(());
 	}
 	#[cfg(all(debug_assertions, feature = "demo"))]
