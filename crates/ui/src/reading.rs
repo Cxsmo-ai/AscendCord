@@ -556,6 +556,7 @@ mod tests {
 		};
 		let frame = |view: &mut MessagingUi, width, events| {
 			let mut rendered = 0.0;
+			let mut maximum_width = 0.0;
 			ctx.run_ui(
 				egui::RawInput {
 					screen_rect: Some(egui::Rect::from_min_size(
@@ -567,6 +568,7 @@ mod tests {
 				},
 				|ui| {
 					let maximum = view.prepare_member_sidebar(ui);
+					maximum_width = maximum;
 					let people = egui::Panel::right("people-pane")
 						.resizable(true)
 						.default_size(f32::from(view.member_list_width).min(maximum))
@@ -579,15 +581,18 @@ mod tests {
 				},
 			)
 			.drop_without_applying_deltas();
-			rendered
+			(rendered, maximum_width)
 		};
 		for width in [900.0, 480.0, 900.0] {
-			let actual = frame(&mut view, width, vec![]);
+			let (actual, maximum) = frame(&mut view, width, vec![]);
 			assert_eq!(
 				view.member_list_width, 340,
 				"A {width}px viewport must not replace the preferred width with {actual}px"
 			);
-			assert!((actual - if width < 600.0 { 200.0 } else { 340.0 }).abs() < 1.0);
+			assert!(
+				(actual - f32::from(view.member_list_width).min(maximum)).abs() < 1.0,
+				"A {width}px viewport must render the preferred width clamped to egui's available width; got {actual}px with a {maximum}px limit"
+			);
 		}
 		let edge = egui::pos2(560.0, 200.0);
 		let resized = egui::pos2(620.0, 200.0);
