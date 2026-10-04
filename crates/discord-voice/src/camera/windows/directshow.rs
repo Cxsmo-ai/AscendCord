@@ -337,8 +337,13 @@ fn bgr24(bytes: &[u8], pixels: Pixels, width: usize, height: usize) -> Vec<u8> {
 	let chroma_width = width.div_ceil(2);
 	let luma = width * height;
 	for (y, row) in out.chunks_exact_mut(pitch).enumerate() {
-		for (x, pixel) in row[..width * 3].chunks_exact_mut(3).enumerate() {
-			pixel.copy_from_slice(&match pixels {
+		for (x, pixel) in row[..width * 3]
+			.as_chunks_mut::<3>()
+			.0
+			.iter_mut()
+			.enumerate()
+		{
+			*pixel = match pixels {
 				Pixels::Rgb24 => unreachable!("returned above"),
 				Pixels::Rgb32 => {
 					let at = (y * width + x) * 4;
@@ -357,7 +362,7 @@ fn bgr24(bytes: &[u8], pixels: Pixels, width: usize, height: usize) -> Vec<u8> {
 					let at = luma + (y / 2) * chroma_width + x / 2;
 					bgr(bytes[y * width + x], bytes[at], bytes[at + plane])
 				}
-			});
+			};
 		}
 	}
 	out

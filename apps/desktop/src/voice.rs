@@ -1649,6 +1649,12 @@ impl Voice {
 				});
 				return state.set_call_camera(false);
 			}
+			// A camera turned off on purpose leaves no stale "on" status behind.
+			if ui.voice_camera_status.starts_with("Camera on")
+				|| ui.voice_camera_status == "Opening camera…"
+			{
+				ui.voice_camera_status.clear();
+			}
 			return None;
 		}
 		if self.camera_preview.is_none() {
