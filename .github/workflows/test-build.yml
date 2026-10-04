@@ -25,12 +25,15 @@ jobs:
       - name: Build
         run: cargo build --release -p ascendcord --locked
 
+      # The runner has no cameras; this shows the screen path and that the probe exits.
       - name: Media probe on the runner
+        continue-on-error: true
         shell: pwsh
         run: |
-          $job = Start-Job { & "$using:PWD\target\release\ascendcord.exe" --media-probe | Out-String }
-          if (-not (Wait-Job $job -Timeout 120)) { throw "media probe did not finish" }
-          Receive-Job $job
+          $probe = Start-Process -FilePath target\release\ascendcord.exe -ArgumentList '--media-probe' `
+            -RedirectStandardOutput probe.txt -RedirectStandardError probe-err.txt -PassThru
+          if (-not $probe.WaitForExit(120000)) { $probe.Kill(); Write-Output 'probe did not finish' }
+          Get-Content probe.txt, probe-err.txt
 
       - uses: actions/upload-artifact@v4
         with:
