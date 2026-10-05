@@ -1556,6 +1556,9 @@ impl Desktop {
 			.last()
 			.map_or(10_000, |m| m.id.0.max(10_000));
 		let mut messaging = ui::MessagingUi::default();
+		// The saved tray value loads asynchronously. Seed the UI before the first observe pass,
+		// or its default `false` is mistaken for a user edit and overwrites the enabled default.
+		messaging.minimize_to_tray = tray_setting.enabled;
 		// Start from the stored defaults: any difference on the first frame counts as a user
 		// edit, and an edit made before the saved preferences load would replace them.
 		app_settings.apply(&mut messaging);
@@ -3931,6 +3934,11 @@ impl Desktop {
 
 	/// Keep the settings page, the import picker, the saved file and the send queue in step.
 	fn tesktop_tick(&mut self, ctx: &egui::Context) {
+		let audio = self.tesktop.audio_config();
+		self.messaging.voice_audio_plugins = ui::VoiceAudioPlugins {
+			output_cap_percent: audio.output_cap_percent,
+			peak_ceiling_db_tenths: audio.peak_ceiling_db_tenths,
+		};
 		// A body rewrite belongs to one plugin, and the formatter caches by owner.
 		let (owner, transform) = self
 			.tesktop

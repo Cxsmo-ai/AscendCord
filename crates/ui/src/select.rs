@@ -324,12 +324,14 @@ impl egui::Plugin for Pointer {
 		if let Some(text) = output
 			.platform_output
 			.commands
-			.iter()
+			.iter_mut()
 			.find_map(|command| match command {
-				egui::OutputCommand::CopyText(text) => Some(text.clone()),
+				egui::OutputCommand::CopyText(text) => Some(text),
 				_ => None,
 			}) {
-			self.cached = text;
+			let copied = complete_partial_emoji_markup(text);
+			*text = copied.clone();
+			self.cached = copied;
 			if self.silent {
 				output
 					.platform_output
@@ -341,6 +343,36 @@ impl egui::Plugin for Pointer {
 		if output.platform_output.cursor_icon == CursorIcon::Text && !hovering_edit(ctx) {
 			output.platform_output.cursor_icon = CursorIcon::Default;
 		}
+	}
+}
+
+/// Egui selection endpoints can land between the placeholder glyphs used for inline artwork.
+/// If a copy starts just after a custom emoji's opening `<`, restore that delimiter instead of
+/// putting broken markup on the clipboard.
+fn complete_partial_emoji_markup(text: &str) -> String {
+	let Some(rest) = text.strip_prefix(':') else {
+		return text.to_owned();
+	};
+	let Some(name_end) = rest.find(':') else {
+		return text.to_owned();
+	};
+	let name = &rest[..name_end];
+	let after_name = &rest[name_end + 1..];
+	let Some(id_end) = after_name.find('>') else {
+		return text.to_owned();
+	};
+	let id = &after_name[..id_end];
+	if !name.is_empty()
+		&& name.len() <= 32
+		&& name
+			.bytes()
+			.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+		&& !id.is_empty()
+		&& id.bytes().all(|byte| byte.is_ascii_digit())
+	{
+		format!("<{text}")
+	} else {
+		text.to_owned()
 	}
 }
 

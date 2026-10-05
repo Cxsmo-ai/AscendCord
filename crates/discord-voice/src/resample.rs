@@ -156,6 +156,19 @@ mod tests {
 			.collect()
 	}
 
+	fn stereo_sine(rate: u32, frequency: f64, seconds: f64, amplitude: f64) -> Vec<f32> {
+		let count = (f64::from(rate) * seconds) as usize;
+		(0..count)
+			.flat_map(|n| {
+				let phase = std::f64::consts::TAU * frequency * n as f64 / f64::from(rate);
+				[
+					(phase.sin() * amplitude) as f32,
+					(phase.cos() * amplitude) as f32,
+				]
+			})
+			.collect()
+	}
+
 	/// Least-squares fit of a sinusoid at `frequency`; returns (amplitude, residual RMS).
 	fn fit(samples: &[f32], channel: usize, rate: f64, frequency: f64) -> (f64, f64) {
 		let values: Vec<f64> = samples
@@ -234,11 +247,32 @@ mod tests {
 	#[test]
 	fn passband_is_flat_to_20_khz_at_96k() {
 		for frequency in [20.0, 5_000.0, 15_000.0, 19_000.0] {
-			let input = sine(96_000, frequency, 0.5, 0.5);
+			let input = stereo_sine(96_000, frequency, 0.5, 0.5);
 			let output = convert(96_000, &input);
-			let (amplitude, _) = fit(&output[output.len() / 4..], 0, 48_000.0, frequency);
-			let gain_db = 20.0 * (amplitude / 0.5).log10();
-			assert!(gain_db.abs() < 0.05, "{frequency} Hz gain {gain_db:.4} dB");
+			for channel in 0..2 {
+				let (amplitude, _) = fit(&output[output.len() / 4..], channel, 48_000.0, frequency);
+				let gain_db = 20.0 * (amplitude / 0.5).log10();
+				assert!(
+					gain_db.abs() < 0.05,
+					"{frequency} Hz ch{channel} gain {gain_db:.4} dB"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn common_44100_hz_microphone_rate_stays_flat_through_19_khz() {
+		for frequency in [20.0, 500.0, 5_000.0, 15_000.0, 18_000.0, 19_000.0] {
+			let input = stereo_sine(44_100, frequency, 0.25, 0.5);
+			let output = convert(44_100, &input);
+			for channel in 0..2 {
+				let (amplitude, _) = fit(&output[output.len() / 4..], channel, 48_000.0, frequency);
+				let gain_db = 20.0 * (amplitude / 0.5).log10();
+				assert!(
+					gain_db.abs() < 0.05,
+					"{frequency} Hz at 44.1 kHz ch{channel} gain {gain_db:.4} dB"
+				);
+			}
 		}
 	}
 

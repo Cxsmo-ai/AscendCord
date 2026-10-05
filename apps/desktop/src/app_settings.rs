@@ -94,16 +94,20 @@ impl Settings {
 		ui.transparency = value.transparency;
 		ui.blur = value.blur;
 		ui.transparent_all = value.transparent_all;
-		ui.voice_processing = value.voice_processing.unwrap_or_else(|| {
-			model::voice_settings::VoiceProcessing::from_legacy(value.voice_noise_suppression)
-		});
+		ui.voice_processing = value
+			.voice_processing
+			.unwrap_or_else(|| {
+				model::voice_settings::VoiceProcessing::from_legacy(value.voice_noise_suppression)
+			})
+			.normalized();
 		ui.voice_push_to_talk = value.voice_push_to_talk;
 		ui.voice_muted = value.voice_muted;
 		ui.voice_deafened = value.voice_deafened;
 		ui.voice_input.clone_from(&value.voice_input);
 		ui.voice_output.clone_from(&value.voice_output);
 		ui.camera_quality = value.camera_quality;
-		ui.voice_gain.input_percent = value.input_percent;
+		// Input gain is intentionally fixed at unity; scrub values persisted by older builds.
+		ui.voice_gain.input_percent = 100;
 		ui.voice_gain.output_percent = value.output_percent;
 		ui.keybinds = value.keybinds.clone();
 		ui.expanded_folders.clone_from(&value.expanded_folders);
@@ -201,7 +205,8 @@ mod tests {
 
 	#[test]
 	fn legacy_preferences_without_voice_settings_keep_suppression_disabled() {
-		let current: AppPreferences = serde_json::from_str("{}").unwrap();
+		let mut current: AppPreferences = serde_json::from_str("{}").unwrap();
+		current.input_percent = 140;
 		assert!(!current.voice_noise_suppression);
 		assert!(current.voice_processing.is_none());
 		let settings = Settings {
@@ -211,5 +216,6 @@ mod tests {
 		let mut ui = ui::MessagingUi::default();
 		settings.apply(&mut ui);
 		assert!(!ui.voice_processing.noise_suppression);
+		assert_eq!(ui.voice_gain.input_percent, 100);
 	}
 }

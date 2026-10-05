@@ -1,10 +1,7 @@
 use crate::MessagingUi;
 use client_core::{Command, State};
 use extensions::AppAction;
-use model::{
-	Id,
-	voice_settings::{InputProfile, NoiseSuppression},
-};
+use model::Id;
 
 fn id(value: &str) -> Result<Id, String> {
 	value
@@ -22,27 +19,16 @@ fn queue(command: Option<Command>, commands: &mut Vec<Command>) -> Result<(), St
 
 impl MessagingUi {
 	pub fn extension_audio_settings(&self) -> extensions::AudioSettingsSnapshot {
-		let effective = self.voice_processing.effective();
 		extensions::AudioSettingsSnapshot {
-			input_percent: self.voice_gain.input_percent,
+			input_percent: 100,
 			output_percent: self.voice_gain.output_percent,
 			push_to_talk: self.voice_push_to_talk,
-			input_profile: match self.voice_processing.profile {
-				InputProfile::VoiceIsolation => "voice_isolation",
-				InputProfile::Studio => "studio",
-				InputProfile::Custom => "custom",
-			}
-			.into(),
-			suppression: match effective.suppression {
-				NoiseSuppression::Off => "off",
-				NoiseSuppression::RnNoise => "rnnoise",
-				NoiseSuppression::WebRtc => "webrtc",
-			}
-			.into(),
-			suppression_level: effective.suppression_level,
-			echo_cancellation: effective.echo_cancellation,
-			automatic_gain: effective.automatic_gain,
-			sensitivity_db: effective.sensitivity_db,
+			input_profile: "studio".into(),
+			suppression: "off".into(),
+			suppression_level: 0,
+			echo_cancellation: false,
+			automatic_gain: false,
+			sensitivity_db: None,
 		}
 	}
 
@@ -174,52 +160,20 @@ impl MessagingUi {
 			}
 			AppAction::SetActivitySharing { enabled } => self.share_game_activity = enabled,
 			AppAction::SetAudioSettings { settings } => {
-				let mut processing = self.voice_processing;
-				if let Some(profile) = settings.input_profile.as_deref() {
-					processing.profile = match profile {
-						"voice_isolation" => InputProfile::VoiceIsolation,
-						"studio" => InputProfile::Studio,
-						"custom" => InputProfile::Custom,
-						_ => return Err("Invalid microphone profile".into()),
-					};
-				}
-				if settings.suppression.is_some()
+				if settings.input_percent.is_some()
+					|| settings.input_profile.is_some()
+					|| settings.suppression.is_some()
 					|| settings.suppression_level.is_some()
 					|| settings.echo_cancellation.is_some()
 					|| settings.automatic_gain.is_some()
 					|| settings.sensitivity_db.is_some()
 					|| settings.open_microphone
 				{
-					let custom = processing.edit();
-					if let Some(suppression) = settings.suppression.as_deref() {
-						custom.suppression = match suppression {
-							"off" => NoiseSuppression::Off,
-							"rnnoise" => NoiseSuppression::RnNoise,
-							"webrtc" => NoiseSuppression::WebRtc,
-							_ => return Err("Invalid suppression mode".into()),
-						};
-					}
-					custom.suppression_level = settings
-						.suppression_level
-						.unwrap_or(custom.suppression_level);
-					custom.echo_cancellation = settings
-						.echo_cancellation
-						.unwrap_or(custom.echo_cancellation);
-					custom.automatic_gain =
-						settings.automatic_gain.unwrap_or(custom.automatic_gain);
-					if settings.open_microphone {
-						custom.sensitivity_db = None;
-					} else if let Some(db) = settings.sensitivity_db {
-						custom.sensitivity_db = Some(db);
-					}
+					return Err(
+						"Microphone processing and input gain are fixed to the unfiltered unity-gain path"
+							.into(),
+					);
 				}
-				if !processing.custom.is_valid() {
-					return Err("Invalid microphone processing settings".into());
-				}
-				self.voice_processing = processing;
-				self.voice_gain.input_percent = settings
-					.input_percent
-					.unwrap_or(self.voice_gain.input_percent);
 				self.voice_gain.output_percent = settings
 					.output_percent
 					.unwrap_or(self.voice_gain.output_percent);
@@ -363,40 +317,35 @@ mod tests {
 	use extensions::{AudioSettingsPatch, OwnPresencePatch, OwnProfilePatch};
 
 	#[test]
-	fn audio_patch_uses_visible_preset_and_rejects_invalid_patch_atomically() {
+	fn audio_patch_keeps_capture_raw_and_rejects_input_changes_atomically() {
 		let mut state = test_support::demo_state();
 		let mut view = MessagingUi::default();
-		view.voice_processing.profile = InputProfile::Studio;
-		view.voice_processing.custom.sensitivity_db = Some(-20);
 		let mut commands = Vec::new();
 		view.apply_extension_account_action(
 			&mut state,
 			AppAction::SetAudioSettings {
 				settings: AudioSettingsPatch {
-					input_percent: Some(140),
-					sensitivity_db: Some(-60),
+					output_percent: Some(140),
+					push_to_talk: Some(true),
 					..Default::default()
 				},
 			},
 			&mut commands,
 		)
 		.unwrap();
-		assert_eq!(view.voice_gain.input_percent, 140);
-		assert_eq!(view.voice_gain.output_percent, 100);
-		assert_eq!(view.voice_processing.profile, InputProfile::Custom);
-		assert_eq!(
-			view.voice_processing.custom.suppression,
-			NoiseSuppression::Off
-		);
-		assert_eq!(view.voice_processing.custom.sensitivity_db, Some(-60));
+		assert_eq!(view.voice_gain.input_percent, 100);
+		assert_eq!(view.voice_gain.output_percent, 140);
+		assert!(view.voice_push_to_talk);
+		assert_eq!(view.extension_audio_settings().input_percent, 100);
+		assert_eq!(view.extension_audio_settings().suppression, "off");
 		let previous = (view.voice_gain, view.voice_processing);
 		assert!(
 			view.apply_extension_account_action(
 				&mut state,
 				AppAction::SetAudioSettings {
 					settings: AudioSettingsPatch {
-						input_percent: Some(201),
-						open_microphone: true,
+						input_percent: Some(140),
+						suppression: Some("rnnoise".into()),
 						..Default::default()
 					}
 				},
@@ -407,6 +356,19 @@ mod tests {
 		assert_eq!((view.voice_gain, view.voice_processing), previous);
 		assert!(commands.is_empty());
 		assert!(!view.voice_preview_requested);
+		assert!(
+			view.apply_extension_account_action(
+				&mut state,
+				AppAction::SetAudioSettings {
+					settings: AudioSettingsPatch {
+						input_percent: Some(201),
+						..Default::default()
+					}
+				},
+				&mut commands
+			)
+			.is_err()
+		);
 	}
 
 	#[test]

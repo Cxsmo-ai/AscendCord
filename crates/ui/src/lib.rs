@@ -126,6 +126,21 @@ impl Default for VoiceGain {
 	}
 }
 
+/// Device-local settings supplied by the bundled native audio plugins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoiceAudioPlugins {
+	pub output_cap_percent: u16,
+	pub peak_ceiling_db_tenths: i16,
+}
+impl Default for VoiceAudioPlugins {
+	fn default() -> Self {
+		Self {
+			output_cap_percent: 200,
+			peak_ceiling_db_tenths: 0,
+		}
+	}
+}
+
 pub struct AttachmentPaste {
 	pub target: egui::Id,
 	pub text: Option<String>,
@@ -370,6 +385,7 @@ pub struct MessagingUi {
 	pub voice_input: Option<String>,
 	pub voice_output: Option<String>,
 	pub voice_gain: VoiceGain,
+	pub voice_audio_plugins: VoiceAudioPlugins,
 	voice_user_volumes: Option<Box<[(u64, u16); 64]>>,
 	/// Speakers silenced on this device only; never sent to Discord.
 	voice_user_muted: Vec<u64>,

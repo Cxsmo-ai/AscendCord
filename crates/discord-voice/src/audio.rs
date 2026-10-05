@@ -1,9 +1,8 @@
 //! Acheron-shaped native audio engine: miniaudio devices request 48 kHz, stereo S16,
-//! 20 ms periods; capture DSP and playback mixing stay on a worker, outside device callbacks.
+//! 20 ms periods; microphone capture and playback mixing stay on a worker, outside device callbacks.
 use crate::{CaptureFrame, Frame, StereoFrame};
 use miniaudio::{Context, Device, DeviceConfig, DeviceType, Format};
 use model::voice_settings::VoiceProcessing;
-use nnnoiseless::DenoiseState;
 use std::{
 	sync::{
 		Arc,
@@ -18,6 +17,15 @@ const RATE: u32 = 48_000;
 const CHANNELS: u32 = 2;
 const PERIOD: u32 = 960;
 const PCM_SAMPLES: usize = PERIOD as usize * CHANNELS as usize;
+
+fn preserve_raw_capture(mut stereo: StereoFrame) -> StereoFrame {
+	for sample in &mut stereo {
+		if !sample.is_finite() {
+			*sample = 0.0;
+		}
+	}
+	stereo
+}
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Devices {
@@ -106,8 +114,9 @@ pub struct Gate {
 	stopped: AtomicBool,
 	input_enabled: AtomicBool,
 	failed: AtomicBool,
-	input_gain: AtomicU16,
 	output_gain: AtomicU16,
+	output_cap: AtomicU16,
+	peak_ceiling_db_tenths: AtomicU16,
 	preview_level: AtomicU16,
 	/// Level measurement in the capture callback; off unless something displays or uses it.
 	meter: AtomicBool,
@@ -131,8 +140,9 @@ impl Default for Gate {
 			stopped: AtomicBool::new(false),
 			input_enabled: AtomicBool::new(true),
 			failed: AtomicBool::new(false),
-			input_gain: AtomicU16::new(100),
 			output_gain: AtomicU16::new(100),
+			output_cap: AtomicU16::new(200),
+			peak_ceiling_db_tenths: AtomicU16::new(2000),
 			preview_level: AtomicU16::new(0),
 			meter: AtomicBool::new(false),
 			capture_callbacks: AtomicU64::new(0),
@@ -168,7 +178,6 @@ impl Gate {
 pub struct Audio {
 	pub gate: Arc<Gate>,
 	settings: watch::Sender<Devices>,
-	processing: watch::Sender<VoiceProcessing>,
 	thread: std::thread::Thread,
 	done: Option<mpsc::Receiver<()>>,
 }
@@ -200,7 +209,6 @@ impl Audio {
 		// The microphone test exists to show the level.
 		gate.meter.store(preview, Ordering::Relaxed);
 		let (settings, mut selected) = watch::channel(settings_value);
-		let (processing, mut selected_processing) = watch::channel(VoiceProcessing::default());
 		let (done_send, done) = mpsc::sync_channel(1);
 		let worker_gate = gate.clone();
 		let thread = std::thread::Builder::new()
@@ -210,11 +218,6 @@ impl Audio {
 				let mut capture_ring: Option<CaptureInput> = None;
 				let mut playback_ring: Option<rtrb::Producer<StereoFrame>> = None;
 				let mut last_selection = Devices::default();
-				let mut last_processing = VoiceProcessing::default();
-				let mut denoise_left = DenoiseState::new();
-				let mut denoise_right = DenoiseState::new();
-				let mut voice_hold = 0u8;
-				let preview = preview;
 				// Owner-run stereo verification: replace captured samples with 440 Hz left /
 				// 660 Hz right at -12 dBFS while keeping the device's real callback timing.
 				let test_tone =
@@ -253,13 +256,6 @@ impl Audio {
 							}
 						}
 					}
-					let settings = *selected_processing.borrow_and_update();
-					if settings != last_processing {
-						last_processing = settings;
-						voice_hold = 0;
-						denoise_left = DenoiseState::new();
-						denoise_right = DenoiseState::new();
-					}
 					let mut work = false;
 					if let Some(input) = &mut capture_ring {
 						for _ in 0..8 {
@@ -281,73 +277,9 @@ impl Audio {
 								}
 								tone_phase = (tone_phase + u64::from(PERIOD)) % u64::from(RATE);
 							}
-							let mut probability = 0.0f32;
-							// Music/line-in mode deliberately skips both RNNoise and speech
-							// classification so a non-speech source is not silently gated.
-							if !settings.always_transmit
-								&& (settings.noise_suppression || settings.use_rnnoise_vad)
-							{
-								for offset in [0usize, 480] {
-									let mut left =
-										std::array::from_fn(|i| stereo[(offset + i) * 2] * 32768.0);
-									let mut right = std::array::from_fn(|i| {
-										stereo[(offset + i) * 2 + 1] * 32768.0
-									});
-									if settings.noise_suppression {
-										let mut out_left = [0.0; 480];
-										let mut out_right = [0.0; 480];
-										probability = probability
-											.max(denoise_left.process_frame(&mut out_left, &left))
-											.max(
-												denoise_right.process_frame(&mut out_right, &right),
-											);
-										left = out_left;
-										right = out_right;
-									} else {
-										probability = probability
-											.max(denoise_left.process_frame(&mut [0.0; 480], &left))
-											.max(
-												denoise_right
-													.process_frame(&mut [0.0; 480], &right),
-											);
-									}
-									for i in 0..480 {
-										stereo[(offset + i) * 2] =
-											(left[i] / 32768.0).clamp(-1.0, 1.0);
-										stereo[(offset + i) * 2 + 1] =
-											(right[i] / 32768.0).clamp(-1.0, 1.0);
-									}
-								}
-							}
-							let gain =
-								f32::from(worker_gate.input_gain.load(Ordering::Relaxed).min(200))
-									/ 100.0;
-							let mut sum = 0.0f64;
-							for sample in &mut stereo {
-								*sample = if sample.is_finite() {
-									(*sample * gain).clamp(-1.0, 1.0)
-								} else {
-									0.0
-								};
-								sum += f64::from(*sample * 32768.0).powi(2);
-							}
-							let rms = (sum / PCM_SAMPLES as f64).sqrt();
-							let active_voice = if settings.always_transmit {
-								true
-							} else if settings.use_rnnoise_vad {
-								probability >= 0.5
-							} else {
-								settings.vad_threshold_rms == 0
-									|| rms >= f64::from(settings.vad_threshold_rms)
-							};
-							if active_voice {
-								voice_hold = 25;
-							} else {
-								voice_hold = voice_hold.saturating_sub(1);
-							}
-							if (preview || active_voice || voice_hold > 0)
-								&& capture_send.try_send(CaptureFrame::Stereo(stereo)).is_err()
-							{
+							// No app DSP is applied: this only replaces invalid IEEE values before encoding.
+							stereo = preserve_raw_capture(stereo);
+							if capture_send.try_send(CaptureFrame::Stereo(stereo)).is_err() {
 								worker_gate
 									.capture_worker_drops
 									.fetch_add(1, Ordering::Relaxed);
@@ -379,7 +311,6 @@ impl Audio {
 		Ok(Self {
 			gate,
 			settings,
-			processing,
 			thread: thread.thread().clone(),
 			done: Some(done),
 		})
@@ -486,18 +417,6 @@ impl Audio {
 		self.gate.muted.store(muted, Ordering::Release);
 		self.gate.deafened.store(deafened, Ordering::Release);
 	}
-	pub fn set_processing(&self, settings: VoiceProcessing) {
-		let settings = settings.normalized();
-		self.processing.send_if_modified(|current| {
-			if *current == settings {
-				false
-			} else {
-				*current = settings;
-				true
-			}
-		});
-		self.thread.unpark();
-	}
 	/// Enables the input level meter (`preview_level_db`); while off the capture callback
 	/// skips the per-sample level math and the reported level is silence.
 	pub fn set_meter(&self, enabled: bool) {
@@ -506,13 +425,23 @@ impl Audio {
 		}
 		self.gate.meter.store(enabled, Ordering::Relaxed);
 	}
-	pub fn set_gain(&self, input: u16, output: u16) {
-		self.gate
-			.input_gain
-			.store(input.min(200), Ordering::Relaxed);
+	pub fn set_gain(&self, output: u16) {
 		self.gate
 			.output_gain
 			.store(output.min(200), Ordering::Relaxed);
+	}
+	pub fn set_playback_controls(&self, output_cap_percent: u16, peak_ceiling_db_tenths: i16) {
+		self.gate
+			.output_cap
+			.store(output_cap_percent.clamp(10, 200), Ordering::Relaxed);
+		let ceiling = if peak_ceiling_db_tenths < 0 {
+			(2000_i16 + peak_ceiling_db_tenths.clamp(-200, 0)) as u16
+		} else {
+			2000
+		};
+		self.gate
+			.peak_ceiling_db_tenths
+			.store(ceiling, Ordering::Relaxed);
 	}
 }
 impl Drop for Audio {
@@ -551,6 +480,36 @@ pub fn debug_processing_check() {
 	let mut converted = Vec::new();
 	resampler.process(&[0.25; PCM_SAMPLES * 2], &mut converted);
 	assert_eq!(converted.len(), PCM_SAMPLES);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn capture_sanitization_preserves_every_finite_sample_bit_for_bit() {
+		let mut input = [0.0; PCM_SAMPLES];
+		for (index, sample) in input.iter_mut().enumerate() {
+			*sample = (index as f32 - 900.0) / 1_000.0;
+		}
+		let output = preserve_raw_capture(input);
+		assert_eq!(
+			output.map(f32::to_bits),
+			input.map(f32::to_bits),
+			"unity mic path must not add gain, clipping, or filtering"
+		);
+	}
+
+	#[test]
+	fn capture_sanitization_only_replaces_non_finite_samples() {
+		let mut input = [0.25; PCM_SAMPLES];
+		input[0] = f32::NAN;
+		input[1] = f32::INFINITY;
+		input[2] = f32::NEG_INFINITY;
+		let output = preserve_raw_capture(input);
+		assert_eq!(&output[..3], &[0.0, 0.0, 0.0]);
+		assert!(output[3..].iter().all(|sample| *sample == 0.25));
+	}
 }
 
 /// Native-rate capture: the device callback copies its first two channels into a sample
@@ -738,6 +697,7 @@ fn open_devices(selection: &Devices, gate: &Arc<Gate>) -> Result<OpenedDevices, 
 	let playback_gate = gate.clone();
 	let mut pending = [0.0f32; PCM_SAMPLES];
 	let mut pending_offset = PCM_SAMPLES;
+	let mut limiter_gain = 1.0f32;
 	playback_device.set_data_callback(move |_, output, _| {
 		let samples = output.as_samples_mut::<f32>();
 		if !playback_gate.playback() {
@@ -745,7 +705,18 @@ fn open_devices(selection: &Devices, gate: &Arc<Gate>) -> Result<OpenedDevices, 
 			pending_offset = PCM_SAMPLES;
 			return;
 		}
-		let gain = f32::from(playback_gate.output_gain.load(Ordering::Relaxed).min(200)) / 100.0;
+		let output_cap = playback_gate.output_cap.load(Ordering::Relaxed).min(200);
+		let gain = f32::from(
+			playback_gate
+				.output_gain
+				.load(Ordering::Relaxed)
+				.min(output_cap),
+		) / 100.0;
+		let ceiling_db = playback_gate
+			.peak_ceiling_db_tenths
+			.load(Ordering::Relaxed)
+			.min(2000);
+		let ceiling = 10.0_f32.powf((f32::from(ceiling_db) - 2000.0) / 200.0);
 		for sample in samples.as_chunks_mut::<2>().0 {
 			if pending_offset >= PCM_SAMPLES {
 				match playback_read.pop() {
@@ -759,9 +730,18 @@ fn open_devices(selection: &Devices, gate: &Arc<Gate>) -> Result<OpenedDevices, 
 					}
 				}
 			}
-			for channel in 0..2 {
-				sample[channel] = (pending[pending_offset + channel] * gain).clamp(-1.0, 1.0);
-			}
+			let left = pending[pending_offset] * gain;
+			let right = pending[pending_offset + 1] * gain;
+			let peak = left.abs().max(right.abs());
+			let target = if peak > ceiling { ceiling / peak } else { 1.0 };
+			// Instant attack prevents overshoots; gradual release avoids abrupt gain changes.
+			limiter_gain = if target < limiter_gain {
+				target
+			} else {
+				(limiter_gain + 0.002).min(target)
+			};
+			sample[0] = (left * limiter_gain).clamp(-ceiling, ceiling);
+			sample[1] = (right * limiter_gain).clamp(-ceiling, ceiling);
 			pending_offset += 2;
 		}
 	});
