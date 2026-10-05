@@ -7,7 +7,9 @@ use model::Id;
 /// while leaving a comfortable pointer target.
 pub(super) const RAIL_WIDTH: f32 = 60.0;
 pub(super) const RAIL_ICON_SIZE: f32 = 40.0;
-const RAIL_ROW_HEIGHT: f32 = 49.0;
+// show_rows expects the row's height without item spacing. The current style uses 11px
+// between rows, so passing the icon size keeps its virtual positions aligned with layout.
+const RAIL_ROW_HEIGHT: f32 = RAIL_ICON_SIZE;
 
 #[derive(Default)]
 pub(super) struct RailCache {
@@ -251,8 +253,8 @@ impl MessagingUi {
 					self.search.open = false;
 				}
 				let direct_count = self.rail_cache.direct.len();
-				let separator = direct_count;
-				let server_start = separator + 1;
+				let separator = (direct_count > 0).then_some(direct_count);
+				let server_start = direct_count + usize::from(separator.is_some());
 				let server_end = server_start + self.folder_ui.row_count();
 				let add_server = server_end;
 				let sync_row = state.folders_pending.then_some(add_server + 1);
@@ -264,6 +266,9 @@ impl MessagingUi {
 					+ 1 + usize::from(sync_row.is_some())
 					+ usize::from(retry_row.is_some());
 				let call = direct_call(state);
+				// show_rows reads spacing before invoking its row closure. Keep that value in
+				// sync with the spacing used while laying out each rail item.
+				ui.spacing_mut().item_spacing.y = 11.0;
 				self.scroll
 					.attach(
 						ui,
@@ -339,7 +344,7 @@ impl MessagingUi {
 								selected = Some(channel.id);
 							}
 						}
-						if range.contains(&separator) {
+						if separator.is_some_and(|index| range.contains(&index)) {
 							let (rect, _) = ui.allocate_exact_size(
 								egui::Vec2::splat(RAIL_ICON_SIZE),
 								egui::Sense::hover(),

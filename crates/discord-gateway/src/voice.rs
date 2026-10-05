@@ -89,6 +89,9 @@ impl Calls {
 	pub(super) fn has_call(&self) -> bool {
 		self.active.is_some() || self.departing.is_some()
 	}
+	pub(super) fn is_departing(&self) -> bool {
+		self.departing.is_some()
+	}
 
 	pub(super) fn departure_expired(&mut self) -> Option<Event> {
 		self.departure_deadline = None;
@@ -96,7 +99,7 @@ impl Calls {
 			Event::Voice(voice::Event::Failed {
 				channel,
 				request,
-				message: "Discord did not acknowledge hangup; reconnect before calling again",
+				message: "Discord did not acknowledge hangup; reconnecting voice before another call",
 			})
 		})
 	}
@@ -260,7 +263,7 @@ impl Calls {
 				deaf,
 				..
 			} => {
-				let guild = *self.allowed.get(&channel).ok_or(Failure::Protocol)?;
+				let guild = *self.allowed.get(&channel).ok_or(Failure::Forbidden)?;
 				if self.active.is_some() || self.departing.is_some() {
 					return Err(Failure::Protocol);
 				}
