@@ -697,6 +697,72 @@ fn quality_pill(ui: &egui::Ui, stage: Rect, quality: Quality) {
 
 /// Full-window media viewer. Returns the attachment to keep showing, or `None` once closed by
 /// the close control, Escape, or a click anywhere outside the image and its controls.
+pub(crate) fn embedded_viewer(
+	ui: &mut egui::Ui,
+	media: &model::EmbedMedia,
+	images: &mut Avatars,
+	download: &mut DownloadUi,
+	demo: bool,
+) -> bool {
+	let size = ui.ctx().content_rect().size().max(egui::vec2(1.0, 1.0));
+	let escaped = ui
+		.ctx()
+		.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+	let mut close = escaped;
+	let modal = egui::Modal::new(egui::Id::unique("embedded-media-viewer"))
+		.backdrop_color(Color32::from_black_alpha(236))
+		.frame(egui::Frame::NONE)
+		.show(ui.ctx(), |ui| {
+			ui.set_min_size(size);
+			ui.set_max_size(size);
+			*ui.visuals_mut() = egui::Visuals::dark();
+			ui.visuals_mut().override_text_color = Some(Color32::WHITE);
+			let (full, backdrop) = ui.allocate_exact_size(size, Sense::click());
+			let stage = Rect::from_min_max(
+				full.min + egui::vec2(48.0, 64.0),
+				full.max - egui::vec2(48.0, 72.0),
+			)
+			.intersect(full);
+			let bounds = stage.size().max(egui::vec2(1.0, 1.0));
+			let original = if media.width > 0 && media.height > 0 {
+				egui::vec2(
+					media.width.min(16384) as f32,
+					media.height.min(16384) as f32,
+				)
+			} else {
+				egui::vec2(320.0, 180.0)
+			};
+			let fitted = (original * (bounds.x / original.x).min(bounds.y / original.y).min(1.0))
+				.max(egui::vec2(1.0, 1.0));
+			let mut image_ui = ui.new_child(
+				egui::UiBuilder::new()
+					.max_rect(Rect::from_center_size(stage.center(), fitted))
+					.layout(egui::Layout::centered_and_justified(
+						egui::Direction::TopDown,
+					)),
+			);
+			let shown = images.show_media(&mut image_ui, media, fitted, demo, Surface::Viewer);
+			let response = ui.interact(
+				shown.response.rect,
+				shown.response.id.with("media"),
+				Sense::click(),
+			);
+			embed_context_menu(&response, media, download, demo);
+			let close_rect = Rect::from_min_size(
+				full.right_top() + egui::vec2(-56.0, 8.0),
+				egui::Vec2::splat(40.0),
+			);
+			ui.scope_builder(egui::UiBuilder::new().max_rect(close_rect), |ui| {
+				close |= glass_button(ui, Icon::Close, 40.0, "Close (Esc)").clicked();
+			});
+			if backdrop.clicked() && !response.contains_pointer() {
+				close = true;
+			}
+		});
+	let _ = modal;
+	!close
+}
+
 pub fn viewer(
 	ui: &mut egui::Ui,
 	attachments: &[Attachment],

@@ -795,6 +795,7 @@ pub fn voice_demo_state() -> State {
 			.map(|entry| entry.participant)
 			.collect(),
 		error: None,
+		ring_error: None,
 	});
 	state.select(Id(25));
 	load_page(&mut state, None);
@@ -831,6 +832,7 @@ pub fn call_demo_state() -> State {
 		server_deafened: false,
 		participants: vec![participant(1, false), participant(2, true)],
 		error: None,
+		ring_error: None,
 	});
 	state.status = "Offline call fixture · no microphone or network access";
 	state

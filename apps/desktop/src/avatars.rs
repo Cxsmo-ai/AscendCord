@@ -30,6 +30,9 @@ fn is_animated_key(key: &str) -> bool {
 	if key.starts_with("anim:") {
 		return true;
 	}
+	if key.starts_with("emoji-") && key.ends_with("-animated") {
+		return true;
+	}
 	if let Some(value) = key.strip_prefix("banner-") {
 		return value
 			.split_once('-')
@@ -389,10 +392,13 @@ fn cdn_url(key: &str) -> Option<String> {
 			"https://cdn.discordapp.com/app-assets/{application}/{asset}.png?size=128"
 		));
 	}
-	if let Some(id) = key.strip_prefix("emoji-") {
+	if let Some(value) = key.strip_prefix("emoji-") {
+		let animated = value.ends_with("-animated");
+		let id = value.strip_suffix("-animated").unwrap_or(value);
 		let id: Id = id.parse().ok()?;
+		let extension = if animated { "gif" } else { "png" };
 		return Some(format!(
-			"https://cdn.discordapp.com/emojis/{id}.png?size=64"
+			"https://cdn.discordapp.com/emojis/{id}.{extension}?size=64"
 		));
 	}
 	if let Some(value) = key.strip_prefix("banner-") {
@@ -658,7 +664,10 @@ fn proxy_base(source: &str) -> Option<url::Url> {
 			|| matches!(parts.as_slice(), ["guilds", guild, "users", user, "avatars" | "banners", hash]
                 if guild.parse::<Id>().is_ok() && user.parse::<Id>().is_ok()
                     && hash.rsplit_once('.').is_some_and(|(hash, _)| model::valid_avatar_hash(hash)))
-			|| matches!(parts.as_slice(), ["embed", "avatars", index]
+			|| matches!(parts.as_slice(), ["emojis", file]
+			if file.rsplit_once('.').is_some_and(|(id, extension)| {
+				id.parse::<Id>().is_ok() && matches!(extension, "png" | "gif" | "webp")
+			})) || matches!(parts.as_slice(), ["embed", "avatars", index]
                 if matches!(*index, "0.png" | "1.png" | "2.png" | "3.png" | "4.png" | "5.png"))
 	};
 	if !valid_path
@@ -1798,10 +1807,14 @@ mod tests {
 	}
 
 	#[test]
-	fn custom_emoji_urls_are_static_and_confined_to_discord_cdn() {
+	fn custom_emoji_urls_resolve_static_and_animated_assets_on_discord_cdn() {
 		assert_eq!(
 			super::cdn_url("emoji-9001").as_deref(),
 			Some("https://cdn.discordapp.com/emojis/9001.png?size=64")
+		);
+		assert_eq!(
+			super::cdn_url("emoji-9001-animated").as_deref(),
+			Some("https://cdn.discordapp.com/emojis/9001.gif?size=64")
 		);
 		for key in [
 			"emoji-0",
@@ -1866,6 +1879,13 @@ mod tests {
 		assert_eq!(
 			cdn_url("guild-1-a_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
 			"https://cdn.discordapp.com/icons/1/a_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png?size=128"
+		);
+		assert!(
+			embed_url(
+				"https://cdn.discordapp.com/emojis/1540011035849785344.png?quality=lossless&name=durr&size=64",
+				64,
+			)
+			.is_some()
 		);
 		for source in [
 			"http://media.discordapp.net/attachments/1/2/image.png",

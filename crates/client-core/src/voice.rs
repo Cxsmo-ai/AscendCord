@@ -112,6 +112,8 @@ pub struct Call {
 	/// Participant whose screen share this device explicitly chose to watch.
 	pub watching: Option<Id>,
 	pub error: Option<&'static str>,
+	/// The media call may continue even if Discord rejects the optional DM ring request.
+	pub ring_error: Option<&'static str>,
 }
 #[derive(Default)]
 pub struct State {
@@ -234,6 +236,11 @@ pub enum Event {
 		phase: Phase,
 	},
 	Failed {
+		channel: Id,
+		request: u64,
+		message: &'static str,
+	},
+	RingFailed {
 		channel: Id,
 		request: u64,
 		message: &'static str,
@@ -390,6 +397,7 @@ impl ClientState {
 			watching: None,
 			participants,
 			error: None,
+			ring_error: None,
 		});
 		if self.voice.incoming == Some(channel) {
 			self.voice.incoming = None;
@@ -742,6 +750,19 @@ impl ClientState {
 					call.watching = None;
 					call.error.get_or_insert(message);
 					call.participants.clear();
+				}
+			}
+			Event::RingFailed {
+				channel,
+				request,
+				message,
+			} => {
+				if let Some(call) = &mut self.voice.active
+					&& call.channel == channel
+					&& call.request == request
+					&& call.phase != Phase::Failed
+				{
+					call.ring_error = Some(message);
 				}
 			}
 			Event::Server { .. } | Event::Stream { .. } | Event::Watch { .. } => {} // The desktop consumes negotiation material; core never retains it.

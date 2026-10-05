@@ -346,11 +346,14 @@ impl Connection {
                                 voice_send.try_send(control).map_err(|_|Failure::Capacity)?;
                                 if let Some((recipient,stop))=ring {
                                     drop(ringing.take());
-                                    let api=api.clone();let emit=emit.clone();let voice_send=voice_send.clone();let finished=finished.clone();let ring_wake=wake.clone();
+									let api=api.clone();let emit=emit.clone();let finished=finished.clone();let ring_wake=wake.clone();
                                     ringing=Some(AbortTask(tokio::spawn(async move {
                                         if let Err(failure)=api.ring_call(channel,recipient,stop).await {
-                                            if !stop {let _=voice_send.try_send(V::Leave{channel,request});}
-                                            let _=emit(Event::Voice(E::Failed{channel,request,message:failure.label()}));
+                                            let message=match failure {
+                                                Failure::Forbidden => "Could not ring the other participants: Discord denied the ringing request",
+                                                _ => "Could not ring the other participants: the ringing request failed",
+                                            };
+                                            let _=emit(Event::Voice(E::RingFailed{channel,request,message}));
                                             if failure.ends_session(){api.stop();let _=finished.send(Some(failure));ring_wake.request_repaint();}
                                         }
                                     })));

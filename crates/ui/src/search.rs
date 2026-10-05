@@ -1142,6 +1142,7 @@ impl SearchUi {
 										&mut self.formats,
 										avatars,
 										&mut self.opening,
+										&mut None,
 										media.download,
 										profile,
 										state,

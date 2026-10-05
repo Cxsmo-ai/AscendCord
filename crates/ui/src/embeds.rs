@@ -177,7 +177,7 @@ fn gallery(
 	ui: &mut egui::Ui,
 	embeds: &[Embed],
 	images: &mut Avatars,
-	opening: &mut Option<String>,
+	viewing: &mut Option<model::EmbedMedia>,
 	download: &mut DownloadUi,
 	demo: bool,
 ) {
@@ -194,11 +194,6 @@ fn gallery(
 				.max_rect(rect),
 			|ui| {
 				let media = embed.image.as_ref().expect("gallery has images");
-				let target = media
-					.url
-					.as_deref()
-					.or(media.proxy_url.as_deref())
-					.and_then(external_url);
 				let image = images
 					.show_media(ui, media, rect.size(), demo, Surface::Banner)
 					.response;
@@ -207,11 +202,7 @@ fn gallery(
 				embed_context_menu(&response, media, download, demo);
 				response.widget_info(|| {
 					egui::WidgetInfo::labeled(
-						if target.is_some() {
-							egui::Role::Button
-						} else {
-							egui::Role::Image
-						},
+						egui::Role::Button,
 						ui.is_enabled(),
 						format!("Open embed image {} of {}", index + 1, embeds.len()),
 					)
@@ -224,10 +215,8 @@ fn gallery(
 						egui::StrokeKind::Inside,
 					);
 				}
-				if let Some(target) = target
-					&& response.on_hover_text("Open image…").clicked()
-				{
-					*opening = Some(target);
+				if response.on_hover_text("Open image…").clicked() {
+					*viewing = Some(media.clone());
 				}
 			},
 		);
@@ -310,6 +299,7 @@ pub fn show(
 	cache: &mut FormatCache,
 	images: &mut Avatars,
 	opening: &mut Option<String>,
+	viewing: &mut Option<model::EmbedMedia>,
 	download: &mut DownloadUi,
 	profile: &mut crate::profiles::ProfileSession,
 	state: &client_core::State,
@@ -330,7 +320,7 @@ pub fn show(
 		let embed = &group[0];
 		ui.push_id(("embed", index), |ui| {
 			if count > 1 && inline_image(embed).is_some() {
-				gallery(ui, group, images, opening, download, demo);
+				gallery(ui, group, images, viewing, download, demo);
 				if group.iter().any(|e| e.limited) {
 					ui.small("Embed display limited");
 				}
@@ -413,11 +403,7 @@ pub fn show(
 					.is_some_and(|star| star.hovered() || star.clicked())
 					&& response.on_hover_text("Open image…").clicked()
 				{
-					*opening = embed
-						.url
-						.as_deref()
-						.or(image.url.as_deref())
-						.and_then(external_url);
+					*viewing = Some(image.clone());
 				}
 				ui.add_space(6.0);
 				return;
@@ -554,7 +540,7 @@ pub fn show(
 								field += count;
 							}
 							if count > 1 {
-								gallery(ui, group, images, opening, download, demo);
+								gallery(ui, group, images, viewing, download, demo);
 							} else if let Some(image) = &embed.image {
 								image_preview(
 									ui,
@@ -755,6 +741,7 @@ mod tests {
 									&mut cache,
 									&mut images,
 									&mut opening,
+									&mut None,
 									&mut download,
 									&mut profile,
 									&client_core::State::default()
@@ -909,6 +896,7 @@ mod tests {
 							&mut cache,
 							&mut images,
 							&mut None,
+							&mut None,
 							&mut DownloadUi::default(),
 							&mut profile,
 							&client_core::State::default(),
@@ -938,7 +926,7 @@ mod tests {
 	}
 
 	#[test]
-	fn gallery_tiles_fit_without_overlap_and_open_each_original() {
+	fn gallery_tiles_fit_without_overlap_and_open_in_the_image_viewer() {
 		for theme in [egui::Theme::Dark, egui::Theme::Light] {
 			for width in [96.0, 240.0, 456.0] {
 				for count in [2, 3, 4, 10] {
@@ -965,7 +953,7 @@ mod tests {
 					ctx.set_theme(theme);
 					let embeds = gallery_embeds(count);
 					let mut images = Avatars::default();
-					let mut opening = None;
+					let mut viewing = None;
 					let mut origin = egui::Pos2::ZERO;
 					let mut frame = |events| {
 						ctx.run_ui(
@@ -984,14 +972,14 @@ mod tests {
 									ui,
 									&embeds,
 									&mut images,
-									&mut opening,
+									&mut viewing,
 									&mut DownloadUi::default(),
 									false,
 								);
 							},
 						)
 						.drop_without_applying_deltas();
-						(origin, opening.take())
+						(origin, viewing.take())
 					};
 					frame(vec![]);
 					let (origin, _) = frame(vec![]);
@@ -1012,7 +1000,7 @@ mod tests {
 							pressed: false,
 							modifiers: Default::default(),
 						}]);
-						assert_eq!(opened, embeds[i].image.as_ref().unwrap().url);
+						assert_eq!(opened, embeds[i].image.clone());
 					}
 					assert_eq!(images.take_requests().len(), count);
 				}
@@ -1198,6 +1186,7 @@ mod tests {
 					&mut cache,
 					&mut images,
 					&mut opening,
+					&mut None,
 					&mut download,
 					&mut profile,
 					&client_core::State::default(),
