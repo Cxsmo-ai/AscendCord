@@ -118,6 +118,7 @@ pub struct Gate {
 	capture_format: AtomicU16,
 	capture_ring_drops: AtomicU64,
 	capture_worker_drops: AtomicU64,
+	playback_ring_drops: AtomicU64,
 	revision: AtomicU64,
 	acknowledged: AtomicU64,
 }
@@ -141,6 +142,7 @@ impl Default for Gate {
 			capture_format: AtomicU16::new(0),
 			capture_ring_drops: AtomicU64::new(0),
 			capture_worker_drops: AtomicU64::new(0),
+			playback_ring_drops: AtomicU64::new(0),
 			revision: AtomicU64::new(1),
 			acknowledged: AtomicU64::new(0),
 		}
@@ -358,7 +360,11 @@ impl Audio {
 								break;
 							};
 							work = true;
-							let _ = output.push(frame);
+							if output.push(frame).is_err() {
+								worker_gate
+									.playback_ring_drops
+									.fetch_add(1, Ordering::Relaxed);
+							}
 						}
 					}
 					if !work {
@@ -433,6 +439,10 @@ impl Audio {
 	}
 	pub fn is_stopped(&self) -> bool {
 		self.gate.stopped.load(Ordering::Acquire)
+	}
+	/// Playback frames dropped because the native output callback fell behind its bounded queue.
+	pub fn playback_ring_drops(&self) -> u64 {
+		self.gate.playback_ring_drops.load(Ordering::Relaxed)
 	}
 	pub fn shutdown(mut self) -> mpsc::Receiver<()> {
 		self.done.take().expect("audio owns completion")
@@ -720,7 +730,9 @@ fn open_devices(selection: &Devices, gate: &Arc<Gate>) -> Result<OpenedDevices, 
 		selection.output.as_deref(),
 		false,
 	));
-	let (playback_write, mut playback_read) = rtrb::RingBuffer::new(8);
+	// Keep 240 ms of bounded device-side headroom so a short worker scheduling
+	// hiccup does not immediately turn into missing output samples.
+	let (playback_write, mut playback_read) = rtrb::RingBuffer::new(12);
 	let mut playback_device = Device::new(Some(context), &output_config)
 		.map_err(|_| "Could not open speaker device; check system sound settings")?;
 	let playback_gate = gate.clone();

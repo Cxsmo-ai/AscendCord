@@ -229,11 +229,12 @@ impl Interconnect {
 		let sender = &shared.sender;
 		let send = if sender.is_object() {
 			format!(
-				"Tesktop send · {} kb/s wire · {} pps · callback drops {}/{} · loop stalls {}",
+				"Tesktop send · {} kb/s wire · {} pps · callback drops in {}/{} out {} · loop stalls {}",
 				sender["wire_bitrate_bps"].as_u64().unwrap_or(0) / 1000,
 				sender["wire_packets_per_second"].as_u64().unwrap_or(0),
 				sender["capture_ring_drops"].as_u64().unwrap_or(0),
 				sender["capture_worker_drops"].as_u64().unwrap_or(0),
+				sender["playback_ring_drops"].as_u64().unwrap_or(0),
 				sender["transport_loop_stalls_per_second"]
 					.as_u64()
 					.unwrap_or(0),

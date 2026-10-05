@@ -136,6 +136,7 @@ pub struct TimelineView {
 	// revealing edits, without cloning payloads. Pruned with the active window: at most 500 records.
 	revealed: BTreeMap<Id, Revealed>,
 	pub(super) viewing: Option<(Id, Id)>,
+	pub(super) embedded_viewing: Option<model::EmbedMedia>,
 	/// Fixture-only: viewer to open once its message has arrived in the timeline.
 	pending_viewer: Option<(Id, Id)>,
 	pub(super) download: crate::attachments::DownloadUi,
@@ -2480,6 +2481,7 @@ impl TimelineView {
 													&mut self.formatted,
 													avatars,
 													&mut self.opening,
+													&mut self.embedded_viewing,
 													&mut self.download,
 													profile,
 													state,
@@ -3534,6 +3536,16 @@ impl TimelineView {
 				)
 				.map(|id| (message_id, id))
 			});
+		}
+		if let Some(media) = self.embedded_viewing.take()
+			&& crate::attachments::embedded_viewer(
+				ui,
+				&media,
+				avatars,
+				&mut self.download,
+				state.demo,
+			) {
+			self.embedded_viewing = Some(media);
 		}
 	}
 }
@@ -7776,6 +7788,7 @@ mod tests {
 					&message,
 					&mut FormatCache::default(),
 					&mut crate::avatars::Avatars::default(),
+					&mut None,
 					&mut None,
 					&mut crate::attachments::DownloadUi::default(),
 					&mut profile,

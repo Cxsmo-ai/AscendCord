@@ -192,7 +192,7 @@ a terminal failure; copy the failed-call reason as well when troubleshooting.
 `cargo run --locked -p serein -- --demo --demo-voice-failed` previews a synthetic
 failure and checks that subsequent cleanup/progress events retain its original reason.
 
-Set `SEREIN_VOICE_DIAGNOSTICS=1` before launching AscendCord to get aggregate voice
+Set `ASCENDCORD_VOICE_DIAGNOSTICS=1` before launching AscendCord to get aggregate voice
 timings on stderr every five seconds and a best-effort final summary on teardown.
 `StreamSend` reports the active screen encoder; `Transport` reports camera encoding
 and call video decoding; `StreamReceive` reports its own video decoding. Values are
@@ -203,11 +203,11 @@ the software fallback after keyframe recovery.
 For example, launch an already-built macOS app from a terminal:
 
 ```sh
-SEREIN_VOICE_DIAGNOSTICS=1 SEREIN_FRAME_DIAGNOSTICS=1 /Applications/Serein.app/Contents/MacOS/serein 2> serein-voice.log
+ASCENDCORD_VOICE_DIAGNOSTICS=1 ASCENDCORD_FRAME_DIAGNOSTICS=1 /Applications/AscendCord.app/Contents/MacOS/AscendCord 2> ascendcord-voice.log
 ```
 
-On Windows PowerShell, set `$env:SEREIN_VOICE_DIAGNOSTICS="1"` and
-`$env:SEREIN_FRAME_DIAGNOSTICS="1"`, then launch `serein.exe 2> serein-voice.log`.
+On Windows PowerShell, set `$env:ASCENDCORD_VOICE_DIAGNOSTICS="1"` and
+`$env:ASCENDCORD_FRAME_DIAGNOSTICS="1"`, then launch `AscendCord.exe 2> ascendcord-voice.log`.
 On Linux, use the same environment assignments as macOS with the installed executable.
 Quit an already-running instance first. Join/leave the call yourself; diagnostics never
 enable capture, join a call or send media. Quit normally to obtain the existing UI frame
@@ -228,11 +228,11 @@ restart to apply this change. Compare speaking, muted and noise-suppression-on/o
 the cause; UI frame diagnostics help identify excessive rendering separately.
 
 Logging is off by default. Fixed numeric reports go through an eight-slot queue to a
-separate writer; media workers never wait for stderr. Output stops after 128 reports
-or 64 KiB per process, shared by all calls, so restart for another capture. A full queue
+separate writer; media workers never wait for stderr. Output stops after 8192 reports
+or 8 MiB per process, shared by all calls, so restart for another capture. A full queue
 drops summaries. No IDs, device names, endpoints, keys, audio or signaling payloads
 are logged; upstream cryptographic tracing remains disabled. No files are created by
-Serein. Shell redirection is owner-managed and may include unrelated framework logs.
+AscendCord. Shell redirection is owner-managed and may include unrelated framework logs.
 The device-free check is `cargo run --locked -p discord-voice --example voice_diagnostics`.
 Instrumentation alone does not establish the cause of a reported CPU spike or a speedup.
 
@@ -563,7 +563,7 @@ Both feed the existing camera transport; no Discord wire behavior changed in thi
 
 ### Screen-share audio diagnostics
 
-The existing opt-in `SEREIN_VOICE_DIAGNOSTICS=1` reporter now also emits `StreamSend`
+The existing opt-in `ASCENDCORD_VOICE_DIAGNOSTICS=1` reporter now also emits `StreamSend`
 and `StreamReceive` summaries. `StreamSend` encode calls count captured 20 ms audio
 frames encoded, encrypted and sent. `StreamReceive` receive calls count accepted
 DAVE audio packets; mix calls count decoded frames offered to the parent call's output.
@@ -719,8 +719,8 @@ redirection can leave an empty file. After closing the previous test instance, r
 the intended build on each endpoint with separate output files:
 
 ```powershell
-$env:SEREIN_VOICE_DIAGNOSTICS="1"
-Start-Process .\dist\serein.exe -RedirectStandardError "$PWD\stream-debug-retest.log" -Wait
+$env:ASCENDCORD_VOICE_DIAGNOSTICS="1"
+Start-Process .\dist\AscendCord.exe -RedirectStandardError "$PWD\stream-debug-retest.log" -Wait
 ```
 
 Start sharing promptly after launch so the bounded diagnostic budget covers the test.

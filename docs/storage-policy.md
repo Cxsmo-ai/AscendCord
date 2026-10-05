@@ -747,7 +747,7 @@ Schema 7 adds one checked integer `message_kind` (0..255) per cached message, wi
 
 ### Opt-in synchronization and compatibility diagnostics
 
-Voice performance diagnostics (`SEREIN_VOICE_DIAGNOSTICS=1`) are also off by default.
+Voice performance diagnostics (`ASCENDCORD_VOICE_DIAGNOSTICS=1`) are also off by default.
 They retain at most eight fixed-size numeric reports in a worker queue (under 2 KiB),
 plus one report per producer and one being written. One background writer formats
 reports and caps attempted stderr output at 8,192 reports AND 8 MiB per process,

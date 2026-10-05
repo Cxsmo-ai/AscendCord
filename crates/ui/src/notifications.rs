@@ -3,10 +3,10 @@ use client_core::{Command, State};
 use egui::{Align2, Color32, FontId};
 use model::Id;
 
-/// Fixed width of the server rail column. The 38px icons and 9px inset keep it compact
+/// Fixed width of the server rail column. The 40px icons and 9px inset keep it compact
 /// while leaving a comfortable pointer target.
 pub(super) const RAIL_WIDTH: f32 = 60.0;
-pub(super) const RAIL_ICON_SIZE: f32 = 38.0;
+pub(super) const RAIL_ICON_SIZE: f32 = 40.0;
 const RAIL_ROW_HEIGHT: f32 = 49.0;
 
 #[derive(Default)]
@@ -129,12 +129,12 @@ pub(super) fn rail_indicator(
 	} else {
 		return;
 	};
-	let pill = egui::Rect::from_center_size(
-		egui::pos2(rect.left() - 5.0, rect.center().y),
-		egui::vec2(8.0, height),
+	let pill = egui::Rect::from_min_size(
+		egui::pos2(rect.left() - 9.0, rect.center().y - height * 0.5),
+		egui::vec2(4.0, height),
 	);
 	ui.painter()
-		.rect_filled(pill, 4, design::palette(ui).text_strong);
+		.rect_filled(pill, 2, design::palette(ui).text_strong);
 }
 /// Green speaker badge on the rail avatar of the conversation you are calling in.
 fn call_badge(ui: &egui::Ui, rect: egui::Rect) {

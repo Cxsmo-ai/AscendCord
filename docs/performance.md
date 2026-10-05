@@ -1935,7 +1935,7 @@ growing buffer saved 0.3 ms per 8 MiB. No live Discord session was used.
 ## Idle call repaints and Windows graphics backend (October 2, 2026)
 
 Owner-run, release build, Windows 10, AMD Radeon RX 5700 XT, signed in and idle in a guild
-voice call with the voice-bridge soak armed. `SEREIN_FRAME_DIAGNOSTICS=1` now also reports the
+voice call with the voice-bridge soak armed. `ASCENDCORD_FRAME_DIAGNOSTICS=1` now also reports the
 egui repaint call sites (`repaint_causes`, bounded to 32 sites).
 
 An active call requested a repaint every 100 ms to poll values that are either event-driven

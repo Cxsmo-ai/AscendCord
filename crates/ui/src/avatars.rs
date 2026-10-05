@@ -362,7 +362,21 @@ impl Avatars {
 		size: f32,
 		demo: bool,
 	) -> Option<egui::Image<'static>> {
-		let key = format!("emoji-{id}");
+		self.custom_image_animated(_ctx, id, false, size, demo)
+	}
+	pub(crate) fn custom_image_animated(
+		&mut self,
+		_ctx: &egui::Context,
+		id: model::Id,
+		animated: bool,
+		size: f32,
+		demo: bool,
+	) -> Option<egui::Image<'static>> {
+		let key = if animated {
+			format!("emoji-{id}-animated")
+		} else {
+			format!("emoji-{id}")
+		};
 		#[cfg(any(test, feature = "demo"))]
 		if demo && matches!(id.0, 9001 | 9002) && !self.emoji_textures.contains_key(&key) {
 			let mut image = ColorImage::filled([32, 32], egui::Color32::TRANSPARENT);

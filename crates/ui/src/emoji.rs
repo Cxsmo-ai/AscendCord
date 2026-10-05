@@ -150,6 +150,11 @@ pub(crate) fn blank(ctx: &Context, size: f32) -> Image<'static> {
 }
 
 pub(crate) fn custom_prefix(text: &str) -> Option<(model::Id, usize)> {
+	custom_prefix_with_animation(text).map(|(id, len, _)| (id, len))
+}
+
+pub(crate) fn custom_prefix_with_animation(text: &str) -> Option<(model::Id, usize, bool)> {
+	let animated = text.starts_with("<a:");
 	let body = text
 		.strip_prefix("<:")
 		.or_else(|| text.strip_prefix("<a:"))?;
@@ -160,7 +165,11 @@ pub(crate) fn custom_prefix(text: &str) -> Option<(model::Id, usize)> {
 	{
 		return None;
 	}
-	Some((id.parse().ok()?, text.len() - body.len() + end + 1))
+	Some((
+		id.parse().ok()?,
+		text.len() - body.len() + end + 1,
+		animated,
+	))
 }
 
 #[cfg(test)]

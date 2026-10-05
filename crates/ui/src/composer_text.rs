@@ -134,8 +134,8 @@ impl Layout {
 				label = Some((tail[..len].to_owned(), colors.mention_text));
 				background = colors.mention_bg;
 				len
-			} else if let Some((id, len)) = emoji::custom_prefix(tail) {
-				image = avatars.custom_image(ui.ctx(), id, size, demo);
+			} else if let Some((id, len, animated)) = emoji::custom_prefix_with_animation(tail) {
+				image = avatars.custom_image_animated(ui.ctx(), id, animated, size, demo);
 				// A useful name remains visible while artwork is unavailable/loading.
 				if image.is_none() {
 					let name = tail[..len]

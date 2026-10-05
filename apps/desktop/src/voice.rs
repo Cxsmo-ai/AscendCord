@@ -161,6 +161,7 @@ impl VoiceBridge {
 				"input_dbfs": live.audio.preview_level_db().round() as i32,
 				"capture_ring_drops": capture_ring_drops,
 			"capture_worker_drops": capture_worker_drops,
+			"playback_ring_drops": live.audio.playback_ring_drops(),
 			"wire_bitrate_bps": live.wire_bitrate_bps,
 			"wire_packets_per_second": live.wire_packets_per_second,
 			"transport_loop_stalls_per_second": live.pacing_stalls,

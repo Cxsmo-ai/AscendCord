@@ -541,6 +541,16 @@ impl MessagingUi {
 				.and_then(|c| c.error),
 			STAGE_TEXT,
 		);
+		call_ring_warning(
+			&mut body_ui,
+			state
+				.voice
+				.active
+				.as_ref()
+				.filter(|c| c.channel == channel)
+				.and_then(|c| c.ring_error),
+			egui::Color32::YELLOW,
+		);
 		if !state.can_view(channel) {
 			body_ui.label(
 				RichText::new("Participant list unavailable with the current access.")
@@ -2754,6 +2764,11 @@ impl MessagingUi {
 						state.voice.active.as_ref().and_then(|c| c.error),
 						STAGE_TEXT,
 					);
+					call_ring_warning(
+						&mut notice_ui,
+						state.voice.active.as_ref().and_then(|c| c.ring_error),
+						egui::Color32::YELLOW,
+					);
 					let body = egui::Rect::from_min_max(
 						egui::pos2(rect.left() + STAGE_MARGIN, notice_ui.cursor().top() + 8.0),
 						egui::pos2(
@@ -2915,6 +2930,7 @@ impl MessagingUi {
 		let camera = call.camera;
 		let connected = matches!(phase, Phase::Connected | Phase::Waiting);
 		let error = call.error;
+		let ring_error = call.ring_error;
 		let channel = state
 			.channel(call.channel)
 			.map_or("Direct message", |c| c.name.as_str())
@@ -3042,6 +3058,7 @@ impl MessagingUi {
 					});
 				});
 				call_failure(ui, error, colors.text_strong);
+				call_ring_warning(ui, ring_error, colors.warning);
 				let controls = self.controls_enabled(state);
 				let can_camera = self.voice_camera_available
 					&& state.can_camera(channel_id)
@@ -3435,6 +3452,11 @@ fn call_failure(ui: &mut egui::Ui, error: Option<&str>, color: egui::Color32) {
 			});
 		});
 	});
+}
+
+fn call_ring_warning(ui: &mut egui::Ui, error: Option<&str>, color: egui::Color32) {
+	let Some(error) = error else { return };
+	ui.label(RichText::new(error).size(12.0).color(color).strong());
 }
 
 fn stage_notices(ui: &mut egui::Ui, notices: &[(String, bool)]) {
