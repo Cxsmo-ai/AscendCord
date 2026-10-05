@@ -1265,9 +1265,20 @@ async fn run_inner(
 					let stream=matches!(command,client_core::voice::Command::StartStream{..}|client_core::voice::Command::StopStream{..}|client_core::voice::Command::WatchStream{..}|client_core::voice::Command::StopWatching{..});
 					let packet=match if stream {calls.stream_packet(command,owner_id)} else {calls.packet(command)} {
 						Ok(packet)=>packet,
-						Err(_) => {
+						Err(failure) => {
 							match command {
-								client_core::voice::Command::Join{channel,request,..} => emit(Event::Voice(client_core::voice::Event::Failed{channel,request,message:"Previous call is still leaving, or the channel is unavailable; wait for departure or reconnect"}))?,
+								client_core::voice::Command::Join{channel,request,..} => {
+									let message = if failure == Failure::Forbidden {
+										"This voice channel is unavailable or your permission to join changed"
+									} else if calls.is_departing() {
+										"The previous call is still disconnecting; wait for departure or reconnect"
+									} else if calls.active.is_some() {
+										"A call is already active; leave it before joining another channel"
+									} else {
+										"This voice channel is unavailable; refresh channel access and try again"
+									};
+									emit(Event::Voice(client_core::voice::Event::Failed{channel,request,message}))?;
+								},
 								client_core::voice::Command::StartStream{channel,request,stream_request} => emit(Event::Voice(client_core::voice::Event::Stream{channel,request,stream_request,event:client_core::screen::Event::Failed("A screen share is already active, stopping, or the call is unavailable")}))?,
 								client_core::voice::Command::WatchStream{channel,request,stream_request,streamer} => emit(Event::Voice(client_core::voice::Event::Watch{channel,request,stream_request,streamer,event:client_core::screen::Event::Failed("Another stream is already being watched, or the call is unavailable")}))?,
 								_=>{}
@@ -1286,6 +1297,9 @@ async fn run_inner(
 
 				_=tokio::time::sleep_until(calls.departure_deadline.unwrap_or(ready_deadline)), if calls.departure_deadline.is_some() => {
 					if let Some(event)=calls.departure_expired() {emit(event)?;}
+					// A missing departure acknowledgement leaves Discord's voice state uncertain.
+					// Drop this gateway session so the normal reconnect path clears the stale lock.
+					break;
 				}
 				changed = member_queries.changed(), if queries_open && ready_at.is_some() => {
 					queries_open = changed.is_ok();
