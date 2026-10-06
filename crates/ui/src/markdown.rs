@@ -1695,10 +1695,7 @@ impl Formatted {
 					style
 						.emoji_url
 						.map(|(id, animated)| (id, text.len(), animated))
-						.or_else(|| {
-							crate::emoji::custom_prefix_with_animation(&text[offset..])
-								.map(|(id, len, animated)| (id, len, animated))
-						})
+						.or_else(|| crate::emoji::custom_prefix_with_animation(&text[offset..]))
 				} else {
 					None
 				};
