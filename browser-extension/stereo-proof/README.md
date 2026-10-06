@@ -10,9 +10,7 @@ track's left/right level, side (L-R) level and L/R correlation with Web Audio an
 Identical channels (correlation near 1 with no side energy) mean a mono path; only these numbers
 leave the page. Start AscendCord with `ASCENDCORD_TEST_TONE=1` set in its environment **before
 launching** to send 440 Hz left / 660 Hz right at -12 dBFS. A stereo path reads about -15 dBFS on
-each side, correlation near 0 and side -18 dBFS. For the response curve, use
-`ASCENDCORD_TEST_SWEEP=1` instead. Turn diagnostic mode off after testing; it replaces live
-microphone audio with tones.
+each side, correlation near 0 and side -18 dBFS. For the response curve and automatic test call, launch AscendCord with `--test-sweep-channel=<voice-channel-id>`. This explicit argument enables the synthetic sweep and joins only that channel. Without it, AscendCord follows its normal audio and call flow. Turn diagnostic mode off after testing; it replaces live microphone audio with tones.
 
 The page hook watches WebRTC peer connections and sends a bounded summary of inbound audio RTP
 statistics to AscendCord over `127.0.0.1:43721`. The local app matches the inbound SSRC against its
@@ -40,9 +38,7 @@ Mixed-tone transition windows are rejected. The graph plots pipeline gain relati
 −12.04 dBFS peak input. One valid sample per band per sweep pass is averaged in linear power, and
 error bars show standard deviation across independent passes. The second panel shows gain relative
 to the measured median across 20 Hz–20 kHz. To capture a response
-curve, set
-`ASCENDCORD_TEST_SWEEP=1` in the AscendCord process environment before launching it, and join the
-controlled test call. The extension captures the matched response curve automatically; keep
+curve, launch AscendCord with `--test-sweep-channel=<voice-channel-id>`. The extension captures the matched response curve automatically; keep
 Discord joined until the two-pass capture completes. The diagnostic replaces live microphone
 content with a 20 Hz–20 kHz equal-level stepped sine sweep at −12.04 dBFS peak. The popup can save the
 actual graph canvas as a 2400×1200 PNG; it is rendered from the numeric capture, not generated
@@ -58,14 +54,17 @@ separately measures native-rate sample conversion at the source code's resampler
 1. Open `chrome://extensions` or `edge://extensions`.
 2. Turn on **Developer mode** and choose **Load unpacked**.
 3. Select this `stereo-proof` folder. Keep the extension enabled.
-4. Keep AscendCord open and join the same voice call from the browser alt account.
+4. For an unattended sender join, launch AscendCord with `--test-sweep-channel=<voice-channel-id>`. AscendCord joins that exact channel after
+   login and resumes the same target after app restarts. The target must be a voice channel the
+   signed-in account can access. The app will not guess a channel or interrupt a different active
+   call. Without this argument, AscendCord follows its normal audio and call flow.
 5. Keep the Discord browser call joined. The extension automatically starts receiver capture
    when the browser sees the active AscendCord synthetic sweep, stops after two sweep passes,
    and prepares and persists a numeric JSON report. Open the popup to review it, save the measured
    graph as PNG, or export the JSON report.
 
 After editing an unpacked install, use the extension card's **Reload** button and reload the
-Discord tab. The manifest version for this diagnostic dashboard is 0.3.2.
+Discord tab. The manifest version for this diagnostic dashboard is 0.3.3.
 
 The desktop listener is bound only to IPv4 loopback, requires this extension's fixed origin, rejects
 large or unknown report fields, and keeps the latest report in memory for five seconds. The health

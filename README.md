@@ -36,6 +36,10 @@
 Every release lists SHA-256 checksums in `SHA256SUMS.txt`. Installed Windows builds can
 update themselves from **Settings → Updates**.
 
+The release also includes the **Stereo Proof** browser extension for measured voice testing. See
+[how to install it and run an opt-in test sweep](docs/stereo-proof-testing.md). Normal AscendCord
+launches use the regular microphone and call flow.
+
 ## Why AscendCord
 
 - **Native.** Rust with egui and wgpu instead of Electron. In a voice call it uses

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AscendCord Stereo Proof",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Read-only Discord WebRTC receive statistics for AscendCord's local voice verifier.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3eGUbLwcHWH5avadMXzZ9MJwkG3XaOOz7MRhaoNpaXoHFwDb5wxcbtJOneMJIBw3V5fVXAeIxNMdLCLblpH/VG3AZBq7JTLb7IiyooFGOA8G/YacyqxFCPSFBJZJ78WjjfUCd/1eVJprJ3JL/xRIXMh2nhkg343BfPTuZJST0hDPM3rxfNXpzeuucdu3X27eJGITkXDrOP1EFX49nLbjPVlCRoJfM8aI8xZVR4p9EkKDJRAKKySx8zQMimtTa5yGySSlavedDbmVvkKoA/fDnbLtdCvXVz3TnwGj9INkrRSIF4LTPj575lOjHrj3BeQUIVXG4wSQdDrNM/YoedJTOwIDAQAB",
   "permissions": ["storage"],

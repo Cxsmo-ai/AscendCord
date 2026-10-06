@@ -15,6 +15,10 @@ if (-not (Test-Path 'dist\ascendcord.exe')) { throw 'dist\ascendcord.exe is miss
 $zip = Join-Path $out "ascendcord-$Tag-Windows-$arch.zip"
 Compress-Archive -Path 'dist\*' -DestinationPath $zip -CompressionLevel Optimal
 
+# The unpacked browser extension is a separate, browser-loadable release asset.
+$extension = Join-Path $out "ascendcord-$Tag-Stereo-Proof-Extension.zip"
+Compress-Archive -Path 'browser-extension\stereo-proof\*' -DestinationPath $extension -CompressionLevel Optimal
+
 $installer = "dist-installer\ascendcord-$version-setup.exe"
 if (Test-Path $installer) {
     Copy-Item $installer (Join-Path $out "ascendcord-$Tag-Windows-$arch-Setup.exe")
