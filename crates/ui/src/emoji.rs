@@ -172,6 +172,30 @@ pub(crate) fn custom_prefix_with_animation(text: &str) -> Option<(model::Id, usi
 	))
 }
 
+/// A Discord CDN custom emoji URL is artwork, not a browser link. Only accept the first-party
+/// CDN path and image formats used for custom emoji; never turn an arbitrary URL into an image.
+pub(crate) fn cdn_url_prefix(text: &str) -> Option<(model::Id, bool, usize)> {
+	const PREFIX: &str = "https://cdn.discordapp.com/emojis/";
+	let rest = text.strip_prefix(PREFIX)?;
+	let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+	let url = &rest[..end];
+	let (path, query) = url.split_once('?').unwrap_or((url, ""));
+	if url.len() > 512 || path.contains(['#', '/', '\\']) {
+		return None;
+	}
+	let (id, extension) = path.rsplit_once('.')?;
+	let animated = match extension {
+		"png" => false,
+		"gif" => true,
+		_ => return None,
+	};
+	let id: model::Id = id.parse().ok()?;
+	if id.0 == 0 || (!query.is_empty() && !query.bytes().all(|byte| byte.is_ascii_graphic())) {
+		return None;
+	}
+	Some((id, animated, PREFIX.len() + end))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -194,6 +218,28 @@ mod tests {
 			"<:hello:https://example.com>",
 		] {
 			assert!(custom_prefix(token).is_none(), "{token}");
+		}
+	}
+	#[test]
+	fn discord_emoji_cdn_links_are_strictly_recognized() {
+		let url = "https://cdn.discordapp.com/emojis/1452181583720222731.png?quality=lossless&name=dtm&size=64";
+		assert_eq!(
+			cdn_url_prefix(&format!("{url} next")),
+			Some((model::Id(1452181583720222731), false, url.len()))
+		);
+		let animated = "https://cdn.discordapp.com/emojis/9001.gif?size=64";
+		assert_eq!(
+			cdn_url_prefix(animated),
+			Some((model::Id(9001), true, animated.len()))
+		);
+		for url in [
+			"https://example.com/emojis/9001.png",
+			"http://cdn.discordapp.com/emojis/9001.png",
+			"https://cdn.discordapp.com/emojis/0.png",
+			"https://cdn.discordapp.com/emojis/9001.svg",
+			"https://cdn.discordapp.com/emojis/9001.png#fragment",
+		] {
+			assert!(cdn_url_prefix(url).is_none(), "{url}");
 		}
 	}
 	#[test]

@@ -9,6 +9,8 @@
 //! Every hook is bounded by items and bytes, so message traffic cannot grow memory without limit.
 
 pub mod aftermath;
+pub mod audio_center;
+pub mod audio_limiter;
 pub mod autoreply;
 pub mod blockkeywords;
 pub mod body;
@@ -53,6 +55,22 @@ pub const MAX_SETTINGS_BYTES: usize = 256 * 1024;
 pub const MAX_PENDING_REPLIES: usize = 8;
 /// Bytes across those pending messages.
 pub const MAX_PENDING_REPLY_BYTES: usize = 8 * 1024;
+
+/// Native voice controls contributed by the AudioCenter and AudioLimiter ports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioConfig {
+	pub output_cap_percent: u16,
+	/// Peak ceiling in tenths of a decibel below full scale; zero disables the ceiling.
+	pub peak_ceiling_db_tenths: i16,
+}
+impl Default for AudioConfig {
+	fn default() -> Self {
+		Self {
+			output_cap_percent: 200,
+			peak_ceiling_db_tenths: 0,
+		}
+	}
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Meta {
@@ -554,6 +572,8 @@ impl Registry {
 	/// The bundled TestCord ports. Only pipelined plugins need host hooks, so only those ship.
 	pub fn new() -> Self {
 		let plugins: Vec<Box<dyn Plugin>> = vec![
+			Box::new(audio_center::AudioCenter),
+			Box::new(audio_limiter::AudioLimiter),
 			Box::new(clearurls::ClearUrls),
 			Box::new(copy::CopyUserUrls),
 			Box::new(copy::CopyUserMention),
@@ -655,6 +675,33 @@ impl Registry {
 	pub fn settings_of(&self, id: &str) -> &'static [Setting] {
 		self.resolve(id)
 			.map_or(&[][..], |index| self.plugins[index].settings())
+	}
+
+	/// Resolved speaker playback controls. AudioCenter mic mixing is intentionally ignored so
+	/// legacy plugin settings cannot alter the raw single-microphone capture path.
+	pub fn audio_config(&self) -> AudioConfig {
+		let mut config = AudioConfig::default();
+		if self.enabled("audioLimiter") {
+			let values = self.values("audioLimiter");
+			let settings = self.settings_of("audioLimiter");
+			if flag_or(&values, settings, "enableVolumeLimiting") {
+				config.output_cap_percent =
+					number_or(&values, settings, "maxVolume").clamp(10, 100) as u16;
+			}
+			if flag_or(&values, settings, "enableDbLimiting") {
+				config.peak_ceiling_db_tenths =
+					(number_or(&values, settings, "maxDecibels").clamp(-20, 0) * 10) as i16;
+			}
+		}
+		config
+	}
+
+	fn values(&self, id: &str) -> Values {
+		Values(
+			self.entries
+				.get(id)
+				.map_or_else(BTreeMap::new, |entry| entry.values.clone()),
+		)
 	}
 
 	pub fn enabled(&self, id: &str) -> bool {
@@ -1431,5 +1478,26 @@ mod tests {
 			Some("ClearURLs")
 		);
 		assert!(registry.meta("NothingHere").is_none());
+	}
+
+	#[test]
+	fn audio_plugins_cannot_change_raw_microphone_capture() {
+		let mut registry = Registry::new();
+		assert_eq!(registry.audio_config(), AudioConfig::default());
+		registry.set_enabled("audioCenter", true);
+		assert!(registry.settings_of("audioCenter").is_empty());
+		registry.set_enabled("audioLimiter", true);
+		registry.set_value("audioLimiter", "maxVolume", Value::from(75));
+		registry.set_value("audioLimiter", "maxDecibels", Value::from(-6));
+		assert_eq!(
+			registry.audio_config(),
+			AudioConfig {
+				output_cap_percent: 75,
+				peak_ceiling_db_tenths: -60,
+			}
+		);
+		registry.set_enabled("audioCenter", false);
+		registry.set_enabled("audioLimiter", false);
+		assert_eq!(registry.audio_config(), AudioConfig::default());
 	}
 }

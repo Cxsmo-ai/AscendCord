@@ -151,10 +151,13 @@ impl VoiceBridge {
 		let call = state.voice.active.as_ref();
 		let sender = live.map(|live| {
 			let (capture_rate_hz, capture_channels, capture_format, capture_ring_drops, capture_worker_drops) = live.audio.capture_stats();
-			let processing = ui.voice_processing.effective();
+			let opus = model::voice_settings::OpusSettings::default();
+			let test_sweep = live.audio.test_sweep_active();
 			serde_json::json!({
 				"call_connected": call.is_some_and(|call| matches!(call.phase, Phase::Connected | Phase::Waiting)),
-				"send_enabled": ui.voice_transmit_status == "Mic send is enabled.",
+				"test_sweep_active": test_sweep,
+				"audio_source": if test_sweep { "synthetic_sweep" } else { "microphone" },
+				"send_enabled": if test_sweep { ui.voice_transmit_status == "Synthetic sweep send is enabled." } else { ui.voice_transmit_status == "Mic send is enabled." },
 				"capture_rate_hz": capture_rate_hz,
 				"capture_channels": capture_channels,
 				"capture_format": capture_format,
@@ -167,19 +170,20 @@ impl VoiceBridge {
 			"transport_loop_stalls_per_second": live.pacing_stalls,
 			"pacing_catchups_per_second": live.pacing_catchups,
 			"max_send_gap_ms": live.max_send_gap_ms,
-				"opus_bitrate_target_bps": ui.voice_processing.opus.bitrate,
-				"opus_application": format!("{:?}", ui.voice_processing.opus.application),
-				"opus_signal": format!("{:?}", ui.voice_processing.opus.signal),
-				"opus_complexity": ui.voice_processing.opus.complexity,
-				"opus_fec": ui.voice_processing.opus.fec,
-				"opus_vbr": ui.voice_processing.opus.vbr,
-				"opus_packet_loss_target_percent": ui.voice_processing.opus.packet_loss_percent,
+				"opus_bitrate_target_bps": opus.bitrate,
+				"opus_application": format!("{:?}", opus.application),
+				"opus_signal": format!("{:?}", opus.signal),
+				"opus_complexity": opus.complexity,
+				"opus_fec": opus.fec,
+				"opus_vbr": opus.vbr,
+				"opus_packet_loss_target_percent": opus.packet_loss_percent,
 				"force_stereo": true,
-				"always_transmit": ui.voice_processing.always_transmit,
-				"noise_suppression": processing.suppression != model::voice_settings::NoiseSuppression::Off,
-				"rnnoise_vad": ui.voice_processing.use_rnnoise_vad,
-				"echo_cancellation": processing.echo_cancellation,
-				"automatic_gain": processing.automatic_gain,
+				"always_transmit": true,
+				"noise_suppression": false,
+				"rnnoise_vad": false,
+				"echo_cancellation": false,
+				"automatic_gain": false,
+				"input_gain_percent": 100,
 				"audio_ssrc": live.audio_ssrc,
 			})
 		});
@@ -1044,7 +1048,13 @@ impl Voice {
 			} else if call.phase == Phase::Waiting {
 				"Encrypted voice is waiting for another participant · Discord send is paused."
 			} else if !live.audio.is_ready() {
-				"Voice input device is still opening · no microphone frames are being sent yet."
+				if live.audio.test_sweep_active() {
+					"Synthetic sweep source is still opening · physical microphone bypassed."
+				} else {
+					"Voice input device is still opening · no microphone frames are being sent yet."
+				}
+			} else if live.audio.test_sweep_active() {
+				"Synthetic sweep send is enabled."
 			} else {
 				"Mic send is enabled."
 			};
@@ -1057,28 +1067,22 @@ impl Voice {
 				) || call.server_muted
 				|| deafened || (ui.voice_push_to_talk && !ui.voice_ptt_active);
 			live.audio.set_controls(muted, deafened);
-			live.audio.set_processing(ui.voice_processing);
-			let processing = ui.voice_processing;
 			live.audio.set_input_enabled(can_speak);
-			live.audio
-				.set_gain(ui.voice_gain.input_percent, ui.voice_gain.output_percent);
+			live.audio.set_gain(ui.voice_gain.output_percent);
+			live.audio.set_playback_controls(
+				ui.voice_audio_plugins.output_cap_percent,
+				ui.voice_audio_plugins.peak_ceiling_db_tenths,
+			);
 			let user_volumes = ui.voice_user_volumes();
 			let stream_volume = ui.voice_stream_volume();
-			let activity_threshold_db = ui
-				.voice_processing
-				.effective()
-				.sensitivity_db
-				.unwrap_or(-70);
+			let activity_threshold_db = -70;
 			live.controls.send_if_modified(|control| {
 				if control.muted == muted
 					&& control.deafened == deafened
 					&& control.user_volumes == user_volumes
 					&& control.stream_volume == stream_volume
 					&& control.activity_threshold_db == activity_threshold_db
-					&& control.opus == processing.opus
-					&& control.noise_suppression == processing.noise_suppression
-					&& control.rnnoise_vad == processing.use_rnnoise_vad
-					&& control.vad_threshold_rms == processing.vad_threshold_rms
+					&& control.opus == model::voice_settings::OpusSettings::default()
 				{
 					false
 				} else {
@@ -1087,10 +1091,7 @@ impl Voice {
 					control.user_volumes = user_volumes;
 					control.stream_volume = stream_volume;
 					control.activity_threshold_db = activity_threshold_db;
-					control.opus = processing.opus;
-					control.noise_suppression = processing.noise_suppression;
-					control.rnnoise_vad = processing.use_rnnoise_vad;
-					control.vad_threshold_rms = processing.vad_threshold_rms;
+					control.opus = model::voice_settings::OpusSettings::default();
 					true
 				}
 			});
@@ -1184,10 +1185,25 @@ impl Voice {
 			{
 				let now = Instant::now();
 				let db = live.audio.preview_level_db();
-				if ui.voice_transmit_status != "Mic send is enabled." {
+				let send_enabled = if live.audio.test_sweep_active() {
+					ui.voice_transmit_status == "Synthetic sweep send is enabled."
+				} else {
+					ui.voice_transmit_status == "Mic send is enabled."
+				};
+				if !send_enabled {
 					soak.status = ui.voice_transmit_status.to_owned();
 				} else if !live.audio.is_ready() {
-					soak.status = "Capture device is not ready · retrying device open".into();
+					soak.status = if live.audio.test_sweep_active() {
+						"Synthetic sweep source is not ready · retrying".into()
+					} else {
+						"Capture device is not ready · retrying device open".into()
+					};
+				} else if live.audio.test_sweep_active() {
+					soak.silent_since = None;
+					soak.status = format!(
+						"Running · synthetic sweep · physical microphone bypassed · {} reconnects",
+						soak.retries,
+					);
 				} else if db <= -90.0 {
 					let silent_since = *soak.silent_since.get_or_insert(now);
 					if now.duration_since(silent_since) >= VOICE_SOAK_SILENCE_TIMEOUT
@@ -1448,10 +1464,11 @@ impl Voice {
 			preview.devices = devices;
 			preview.started = Instant::now();
 		}
-		preview
-			.audio
-			.set_gain(ui.voice_gain.input_percent, ui.voice_gain.output_percent);
-		preview.audio.set_processing(ui.voice_processing);
+		preview.audio.set_gain(ui.voice_gain.output_percent);
+		preview.audio.set_playback_controls(
+			ui.voice_audio_plugins.output_cap_percent,
+			ui.voice_audio_plugins.peak_ceiling_db_tenths,
+		);
 		preview.audio.set_ready(true);
 		let error = preview.failure.get().copied().or_else(|| {
 			if preview.audio.is_stopped() {
@@ -1831,15 +1848,8 @@ impl Voice {
 		)?;
 		let negotiated_camera_codec = ui.camera_quality.codec;
 		let (controls, control_receive) = watch::channel(Controls {
-			activity_threshold_db: ui
-				.voice_processing
-				.effective()
-				.sensitivity_db
-				.unwrap_or(-70),
-			opus: ui.voice_processing.opus,
-			noise_suppression: ui.voice_processing.noise_suppression,
-			rnnoise_vad: ui.voice_processing.use_rnnoise_vad,
-			vad_threshold_rms: ui.voice_processing.vad_threshold_rms,
+			activity_threshold_db: -70,
+			opus: model::voice_settings::OpusSettings::default(),
 			muted: listen_only || ui.voice_push_to_talk,
 			camera: 0,
 			camera_codec: negotiated_camera_codec,
@@ -1865,8 +1875,11 @@ impl Voice {
 		});
 		audio.set_controls(listen_only || ui.voice_push_to_talk, false);
 		audio.set_input_enabled(input_enabled);
-		audio.set_processing(ui.voice_processing);
-		audio.set_gain(ui.voice_gain.input_percent, ui.voice_gain.output_percent);
+		audio.set_gain(ui.voice_gain.output_percent);
+		audio.set_playback_controls(
+			ui.voice_audio_plugins.output_cap_percent,
+			ui.voice_audio_plugins.peak_ceiling_db_tenths,
+		);
 		let session = pending.session.ok_or("Missing voice session")?;
 		let session_copy = Zeroizing::new(session.expose().to_owned());
 		let (token, endpoint) = pending.server.ok_or("Missing voice server")?;

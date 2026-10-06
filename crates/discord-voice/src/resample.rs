@@ -156,6 +156,19 @@ mod tests {
 			.collect()
 	}
 
+	fn stereo_sine(rate: u32, frequency: f64, seconds: f64, amplitude: f64) -> Vec<f32> {
+		let count = (f64::from(rate) * seconds) as usize;
+		(0..count)
+			.flat_map(|n| {
+				let phase = std::f64::consts::TAU * frequency * n as f64 / f64::from(rate);
+				[
+					(phase.sin() * amplitude) as f32,
+					(phase.cos() * amplitude) as f32,
+				]
+			})
+			.collect()
+	}
+
 	/// Least-squares fit of a sinusoid at `frequency`; returns (amplitude, residual RMS).
 	fn fit(samples: &[f32], channel: usize, rate: f64, frequency: f64) -> (f64, f64) {
 		let values: Vec<f64> = samples
@@ -234,11 +247,79 @@ mod tests {
 	#[test]
 	fn passband_is_flat_to_20_khz_at_96k() {
 		for frequency in [20.0, 5_000.0, 15_000.0, 19_000.0] {
-			let input = sine(96_000, frequency, 0.5, 0.5);
+			let input = stereo_sine(96_000, frequency, 0.5, 0.5);
 			let output = convert(96_000, &input);
-			let (amplitude, _) = fit(&output[output.len() / 4..], 0, 48_000.0, frequency);
-			let gain_db = 20.0 * (amplitude / 0.5).log10();
-			assert!(gain_db.abs() < 0.05, "{frequency} Hz gain {gain_db:.4} dB");
+			for channel in 0..2 {
+				let (amplitude, _) = fit(&output[output.len() / 4..], channel, 48_000.0, frequency);
+				let gain_db = 20.0 * (amplitude / 0.5).log10();
+				assert!(
+					gain_db.abs() < 0.05,
+					"{frequency} Hz ch{channel} gain {gain_db:.4} dB"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn common_44100_hz_microphone_rate_stays_flat_through_19_khz() {
+		for frequency in [20.0, 500.0, 5_000.0, 15_000.0, 18_000.0, 19_000.0] {
+			let input = stereo_sine(44_100, frequency, 0.25, 0.5);
+			let output = convert(44_100, &input);
+			for channel in 0..2 {
+				let (amplitude, _) = fit(&output[output.len() / 4..], channel, 48_000.0, frequency);
+				let gain_db = 20.0 * (amplitude / 0.5).log10();
+				assert!(
+					gain_db.abs() < 0.05,
+					"{frequency} Hz at 44.1 kHz ch{channel} gain {gain_db:.4} dB"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn measured_equal_level_tone_sweep_is_flat_on_both_channels() {
+		const FREQUENCY_POINTS: usize = 480;
+		let frequencies_hz = (0..=FREQUENCY_POINTS)
+			.map(|point| 20.0 * 1_000.0f64.powf(point as f64 / FREQUENCY_POINTS as f64))
+			.collect::<Vec<_>>();
+		let mut csv = String::from(
+			"input_rate_hz,output_rate_hz,frequency_hz,channel,gain_db,residual_dbfs,residual_dbc\n",
+		);
+
+		for rate in [44_100, 48_000, 96_000] {
+			let passband_hz = (f64::from(rate.min(OUTPUT_RATE)) * 0.45).min(20_000.0);
+			for &frequency in frequencies_hz
+				.iter()
+				.filter(|&&frequency| frequency <= passband_hz)
+			{
+				let input = stereo_sine(rate, frequency, 0.25, 0.5);
+				let output = convert(rate, &input);
+				let steady = &output[output.len() / 4..];
+				for channel in 0..2 {
+					let (amplitude, residual) = fit(steady, channel, 48_000.0, frequency);
+					let gain_db = 20.0 * (amplitude / 0.5).log10();
+					let residual_dbfs = 20.0 * residual.max(1e-15).log10();
+					let residual_dbc = 20.0 * (residual / amplitude).max(1e-15).log10();
+					assert!(
+						gain_db.abs() < 0.05,
+						"{frequency} Hz at {rate} Hz, channel {channel}: {gain_db:.5} dB"
+					);
+					assert!(
+						residual_dbc < -75.0,
+						"{frequency} Hz at {rate} Hz, channel {channel}: {residual_dbc:.1} dBc residual"
+					);
+					use std::fmt::Write as _;
+					writeln!(
+						csv,
+						"{rate},{OUTPUT_RATE},{frequency:.6},{channel},{gain_db:.9},{residual_dbfs:.3},{residual_dbc:.3}"
+					)
+					.expect("writing to a string cannot fail");
+				}
+			}
+		}
+
+		if let Some(path) = std::env::var_os("ASCENDCORD_EQ_CSV") {
+			std::fs::write(path, csv).expect("write measured resampler response CSV");
 		}
 	}
 

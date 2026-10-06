@@ -1,9 +1,35 @@
+function fitSinePeak(samples, frequencyHz, sampleRate) {
+  const mean = samples.reduce((sum, value) => sum + value, 0) / samples.length;
+  let cc = 0, ss = 0, cs = 0, yc = 0, ys = 0, total = 0;
+  const phaseStep = Math.PI * 2 * frequencyHz / sampleRate;
+  const stepCos = Math.cos(phaseStep), stepSin = Math.sin(phaseStep);
+  let c = 1, s = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const value = samples[i] - mean;
+    cc += c * c; ss += s * s; cs += c * s;
+    yc += value * c; ys += value * s; total += value * value;
+    const nextC = c * stepCos - s * stepSin;
+    s = s * stepCos + c * stepSin;
+    c = nextC;
+  }
+  const determinant = cc * ss - cs * cs;
+  if (determinant <= 0 || total <= 0) return null;
+  const a = (yc * ss - ys * cs) / determinant;
+  const b = (ys * cc - yc * cs) / determinant;
+  const amplitude = Math.hypot(a, b);
+  const explained = Math.max(0, Math.min(1, (a * yc + b * ys) / total));
+  return { amplitude, explained };
+}
+
 (() => {
   "use strict";
 
   const marker = "tesktop-stereo-proof-v1";
-  const NativePeerConnection = window.RTCPeerConnection;
-  if (typeof NativePeerConnection !== "function") return;
+  const SPECTRUM_POINTS = 48;
+  const SPECTRUM_LOW_HZ = 20;
+  const SPECTRUM_HIGH_HZ = 20_000;
+  let NativePeerConnection = null;
+  let InstalledPeerConnection = null;
 
   const peers = new Set();
   const meters = new Map();
@@ -52,9 +78,13 @@
   function context() {
     if (!audioContext) {
       try {
-        audioContext = new AudioContext({ latencyHint: "playback" });
+        audioContext = new AudioContext({ latencyHint: "playback", sampleRate: 48_000 });
       } catch {
-        return null;
+        try {
+          audioContext = new AudioContext({ latencyHint: "playback" });
+        } catch {
+          return null;
+        }
       }
     }
     if (audioContext.state === "suspended") audioContext.resume().catch(() => {});
@@ -73,13 +103,20 @@
       const splitter = ctx.createChannelSplitter(2);
       const left = ctx.createAnalyser();
       const right = ctx.createAnalyser();
-      left.fftSize = right.fftSize = 4096;
+      left.fftSize = right.fftSize = 16384;
+      // Keep each capture independent so a band transition does not smear into
+      // the next measurement window.
+      left.smoothingTimeConstant = right.smoothingTimeConstant = 0;
+      left.minDecibels = right.minDecibels = -120;
+      left.maxDecibels = right.maxDecibels = 12;
       source.connect(splitter);
       splitter.connect(left, 0);
       splitter.connect(right, 1);
       entry = {
         source, splitter, left, right,
-        l: new Float32Array(4096), r: new Float32Array(4096),
+        l: new Float32Array(16384), r: new Float32Array(16384),
+        leftSpectrum: new Float32Array(left.frequencyBinCount),
+        rightSpectrum: new Float32Array(right.frequencyBinCount),
         channels: source.channelCount,
       };
       meters.set(track.id, entry);
@@ -98,6 +135,8 @@
     if (!entry || audioContext?.state !== "running") return null;
     entry.left.getFloatTimeDomainData(entry.l);
     entry.right.getFloatTimeDomainData(entry.r);
+    entry.left.getFloatFrequencyData(entry.leftSpectrum);
+    entry.right.getFloatFrequencyData(entry.rightSpectrum);
     let ll = 0, rr = 0, lr = 0, diff = 0;
     for (let i = 0; i < entry.l.length; i++) {
       const a = entry.l[i], b = entry.r[i];
@@ -106,38 +145,133 @@
     const n = entry.l.length;
     const db = power => power > 0 ? Math.max(-120, 10 * Math.log10(power / n)) : -120;
     const correlation = ll > 0 && rr > 0 ? lr / Math.sqrt(ll * rr) : null;
+    const spectrumDbfs = [];
+    for (let point = 0; point < SPECTRUM_POINTS; point++) {
+      const fraction = point / (SPECTRUM_POINTS - 1);
+      const frequency = SPECTRUM_LOW_HZ * (SPECTRUM_HIGH_HZ / SPECTRUM_LOW_HZ) ** fraction;
+      const bin = Math.max(1, Math.min(entry.leftSpectrum.length - 1,
+        Math.round(frequency * entry.leftSpectrum.length * 2 / audioContext.sampleRate)));
+      // Average L/R power. AudioBuffer analyser values are in dBFS; averaging in
+      // linear power avoids a channel from dominating the display by a few dB.
+      const leftDb = entry.leftSpectrum[bin];
+      const rightDb = entry.rightSpectrum[bin];
+      const power = (10 ** (leftDb / 10) + 10 ** (rightDb / 10)) / 2;
+      spectrumDbfs.push(Math.max(-120, Math.min(12, 10 * Math.log10(power))));
+    }
+    // Identify the received sine using every FFT bin instead of assigning the
+    // loudest of 48 sparse display probes to a sweep band.
+    let peakBin = 1;
+    let peakPower = 0;
+    for (let bin = 1; bin < entry.leftSpectrum.length; bin++) {
+      const power = (10 ** (entry.leftSpectrum[bin] / 10) +
+        10 ** (entry.rightSpectrum[bin] / 10)) / 2;
+      if (power > peakPower) {
+        peakPower = power;
+        peakBin = bin;
+      }
+    }
+    // Refine the FFT peak between bins before assigning it to a known sweep
+    // tone. The analyser spectrum is windowed (Blackman), so its displayed
+    // magnitude is not an absolute dBFS amplitude measurement. Estimate the
+    // sine's peak amplitude directly from the time-domain PCM instead.
+    const bin = entry.leftSpectrum;
+    const leftDb = bin[Math.max(1, peakBin - 1)];
+    const centerDb = bin[peakBin];
+    const rightDb = bin[Math.min(bin.length - 1, peakBin + 1)];
+    const curvature = leftDb - 2 * centerDb + rightDb;
+    const binOffset = curvature < 0
+      ? Math.max(-0.5, Math.min(0.5, 0.5 * (leftDb - rightDb) / curvature)) : 0;
+    const peakFrequencyHz = (peakBin + binOffset) * audioContext.sampleRate / entry.left.fftSize;
+    const logStep = Math.log(20_000 / 20) / 47;
+    const toneIndex = Math.max(0, Math.min(47,
+      Math.round(Math.log(Math.max(20, peakFrequencyHz) / 20) / logStep)));
+    const expectedFrequencyHz = 20 * Math.exp(toneIndex * logStep);
+    const frequencyError = Math.abs(peakFrequencyHz / expectedFrequencyHz - 1);
+    const leftFit = fitSinePeak(entry.l, expectedFrequencyHz, audioContext.sampleRate);
+    const rightFit = fitSinePeak(entry.r, expectedFrequencyHz, audioContext.sampleRate);
+    const fitValid = frequencyError <= 0.085 && leftFit && rightFit &&
+      leftFit.explained >= 0.8 && rightFit.explained >= 0.8;
+    const tonePower = fitValid
+      ? (leftFit.amplitude ** 2 + rightFit.amplitude ** 2) / 2 : 0;
     return {
       left_dbfs: db(ll),
       right_dbfs: db(rr),
       side_dbfs: db(diff / 4),
       lr_correlation: correlation === null ? null : Math.max(-1, Math.min(1, correlation)),
+      spectrum_dbfs: spectrumDbfs,
+      peak_frequency_hz: peakFrequencyHz,
+      analysis_sample_rate_hz: audioContext.sampleRate,
+      // Peak amplitude referenced to full scale, averaged as channel power.
+      // Mixed-tone transition windows are rejected instead of biasing the curve.
+      peak_dbfs: tonePower > 0 ? Math.max(-120, Math.min(12, 10 * Math.log10(tonePower))) : -120,
     };
   }
   const previous = new Map();
   const peerIds = new WeakMap();
   let nextPeerId = 1;
   let running = false;
+  let curveCapture = false;
+  let sampleTimer;
+  let lastInstallError = "";
+  let lastReportedObserverState = "";
+
+  function reportObserverState(state, error = "") {
+    const identity = `${state}:${error}`;
+    if (identity === lastReportedObserverState) return;
+    lastReportedObserverState = identity;
+    window.postMessage({
+      source: marker,
+      observer: {
+        state,
+        peer_api: typeof window.RTCPeerConnection === "function",
+        error: String(error).slice(0, 180),
+        at_ms: Date.now(),
+      },
+    }, location.origin);
+  }
 
   function installPeerConnection() {
-    const Wrapped = function (...args) {
-      const peer = new NativePeerConnection(...args);
-      peerIds.set(peer, nextPeerId++);
-      peers.add(peer);
-      peer.addEventListener("connectionstatechange", () => {
-        if (peer.connectionState === "closed") peers.delete(peer);
+    const current = window.RTCPeerConnection;
+    if (typeof current !== "function") {
+      reportObserverState("waiting-for-peer-api", lastInstallError);
+      return false;
+    }
+    if (InstalledPeerConnection === current) return true;
+    try {
+      NativePeerConnection = current;
+      wrapDescription("setLocalDescription");
+      wrapDescription("setRemoteDescription");
+      wrapCreate("createOffer");
+      wrapCreate("createAnswer");
+
+      const Wrapped = function (...args) {
+        const peer = new NativePeerConnection(...args);
+        peerIds.set(peer, nextPeerId++);
+        peers.add(peer);
+        peer.addEventListener("connectionstatechange", () => {
+          if (peer.connectionState === "closed") peers.delete(peer);
+        });
+        peer.addEventListener("signalingstatechange", () => {
+          if (peer.signalingState === "closed") peers.delete(peer);
+        });
+        return peer;
+      };
+      Wrapped.prototype = NativePeerConnection.prototype;
+      Object.setPrototypeOf(Wrapped, NativePeerConnection);
+      Object.defineProperty(window, "RTCPeerConnection", {
+        configurable: true,
+        writable: true,
+        value: Wrapped,
       });
-      peer.addEventListener("signalingstatechange", () => {
-        if (peer.signalingState === "closed") peers.delete(peer);
-      });
-      return peer;
-    };
-    Wrapped.prototype = NativePeerConnection.prototype;
-    Object.setPrototypeOf(Wrapped, NativePeerConnection);
-    Object.defineProperty(window, "RTCPeerConnection", {
-      configurable: true,
-      writable: true,
-      value: Wrapped,
-    });
+      InstalledPeerConnection = Wrapped;
+      lastInstallError = "";
+      reportObserverState("hook-installed");
+      return true;
+    } catch (error) {
+      lastInstallError = String(error?.message ?? error);
+      reportObserverState("hook-install-failed", lastInstallError);
+      return false;
+    }
   }
 
   function numeric(value, fallback = 0) {
@@ -228,6 +362,10 @@
         right_dbfs: stereo?.right_dbfs ?? null,
         side_dbfs: stereo?.side_dbfs ?? null,
         lr_correlation: stereo?.lr_correlation ?? null,
+        spectrum_dbfs: stereo?.spectrum_dbfs ?? null,
+      peak_frequency_hz: stereo?.peak_frequency_hz ?? null,
+      peak_dbfs: stereo?.peak_dbfs ?? null,
+      analysis_sample_rate_hz: stereo?.analysis_sample_rate_hz ?? null,
       });
     }
   }
@@ -244,6 +382,12 @@
       }
       window.postMessage({
         source: marker,
+        observer: {
+          state: InstalledPeerConnection ? "sampling" : "hook-not-installed",
+          peer_api: typeof window.RTCPeerConnection === "function",
+          error: lastInstallError,
+          at_ms: Date.now(),
+        },
         report: {
           protocol: 1,
           sampled_at_ms: Date.now(),
@@ -256,14 +400,27 @@
     }
   }
 
-  wrapDescription("setLocalDescription");
-  wrapDescription("setRemoteDescription");
-  wrapCreate("createOffer");
-  wrapCreate("createAnswer");
+  // At document_start some Chromium builds expose WebRTC a little later. Keep
+  // trying instead of permanently disabling the observer on its first tick.
+  let installAttempts = 0;
+  const installTimer = setInterval(() => {
+    installAttempts++;
+    if (installPeerConnection() || installAttempts >= 200) clearInterval(installTimer);
+  }, 50);
   installPeerConnection();
+  window.addEventListener("message", event => {
+    if (event.source !== window || event.origin !== location.origin ||
+        event.data?.source !== "tesktop-stereo-proof-control") return;
+    const next = event.data.captureCurve === true;
+    if (curveCapture === next) return;
+    curveCapture = next;
+    clearInterval(sampleTimer);
+    sampleTimer = setInterval(sample, curveCapture ? 250 : 2000);
+    sample();
+  });
   for (const kind of ["pointerdown", "keydown"]) {
     window.addEventListener(kind, () => context(), { capture: true, passive: true });
   }
-  setInterval(sample, 2000);
+  sampleTimer = setInterval(sample, 2000);
   setTimeout(sample, 750);
 })();

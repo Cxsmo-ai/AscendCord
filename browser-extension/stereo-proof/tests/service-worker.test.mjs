@@ -1,0 +1,350 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+import vm from "node:vm";
+
+test("calibrates peak sine amplitude and rejects mixed-tone windows", async () => {
+  const source = await readFile(new URL("../rtc-observer.js", import.meta.url), "utf8");
+  const start = source.indexOf("function fitSinePeak(");
+  const end = source.indexOf("\n(() => {", start);
+  assert.ok(start >= 0 && end > start, "the observer exposes its pure analysis function to this test");
+  const analysisContext = vm.createContext({});
+  vm.runInContext(`${source.slice(start, end)}\nglobalThis.fitSinePeak = fitSinePeak;`, analysisContext);
+  const { fitSinePeak } = analysisContext;
+  const sampleRate = 48_000;
+  const length = 16_384;
+  const pureTone = Float32Array.from({ length }, (_, index) =>
+    0.25 * Math.sin(2 * Math.PI * 1_000 * index / sampleRate + 0.7));
+  const fit = fitSinePeak(pureTone, 1_000, sampleRate);
+  assert.ok(Math.abs(fit.amplitude - 0.25) < 1e-5);
+  assert.ok(Math.abs(20 * Math.log10(fit.amplitude) - 20 * Math.log10(0.25)) < 0.001);
+  assert.ok(fit.explained > 0.999);
+
+  const transition = Float32Array.from({ length }, (_, index) =>
+    0.125 * (Math.sin(2 * Math.PI * 1_000 * index / sampleRate) +
+      Math.sin(2 * Math.PI * 1_300 * index / sampleRate)));
+  const mixedFit = fitSinePeak(transition, 1_000, sampleRate);
+  assert.ok(mixedFit.explained < 0.8, "a band transition should fail the fit-quality gate");
+});
+
+test("auto-starts a matched sweep capture without a popup button press", async () => {
+  const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
+  let onMessage;
+  let onRemoved;
+  let now = 10_000;
+  let forwarded;
+  let healthForwarded;
+  let captureControl;
+  let senderSweep = true;
+  const chrome = {
+    runtime: { onMessage: { addListener(listener) { onMessage = listener; } } },
+    tabs: {
+      onRemoved: { addListener(listener) { onRemoved = listener; } },
+      sendMessage: async (_tabId, message) => { captureControl = message; return {}; },
+    },
+  };
+  const context = {
+    chrome,
+    URL,
+    Date: class extends Date { static now() { return now; } },
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    fetch: async (url, options) => {
+      if (url.endsWith("/v1/status")) {
+        return { ok: true, status: 200, json: async () => ({ sender: {
+          audio_ssrc: 77, test_sweep_active: senderSweep, send_enabled: true,
+        } }) };
+      }
+      if (url.endsWith("/v1/diagnostics")) healthForwarded = JSON.parse(options.body);
+      else forwarded = JSON.parse(options.body);
+      return { ok: true, status: 204 };
+    },
+  };
+  vm.runInNewContext(source, context);
+
+  const spectrum = Array.from({ length: 48 }, (_, index) => -90 + index);
+  const peakFrequency = 20_000;
+  const report = {
+    protocol: 1, sampled_at_ms: now, peer_connections: 1,
+    streams: [{ ssrc: 77, codec: "audio/opus", channels: 2, track_channels: 2,
+      sdp_fmtp_stereo: true, active: true, spectrum_dbfs: spectrum,
+      peak_frequency_hz: peakFrequency, peak_dbfs: -18, analysis_sample_rate_hz: 48_000 }],
+  };
+  const sender = { tab: { id: 5, url: "https://discord.com/channels/1/2" } };
+  const send = message => new Promise(resolve => {
+    const result = onMessage(message, sender, resolve);
+    if (result !== true) resolve(undefined);
+  });
+
+  const heartbeat = await send({ kind: "tesktop-content-bridge-heartbeat" });
+  assert.equal(heartbeat.ok, true);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(healthForwarded.content_bridge, true);
+  assert.equal(healthForwarded.observer_state, "not-seen");
+  let diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.equal(diagnostics.contentBridgeAt, now);
+  assert.equal(diagnostics.observerReportAt, 0);
+  now += 1_100;
+
+  await send({ kind: "tesktop-receiver-report", report });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.equal(diagnostics.observerReportAt, now);
+  assert.equal(diagnostics.inboundStreams, 1);
+  assert.equal(diagnostics.peerConnections, 1);
+  assert.equal(diagnostics.test.running, true);
+  assert.equal(diagnostics.test.automatic, true);
+  assert.equal(diagnostics.test.sender_ssrc, 77);
+  assert.equal(diagnostics.test_summary.matched_samples, 1);
+  await new Promise(resolve => setTimeout(resolve, 1_050));
+  assert.equal(healthForwarded.inbound_streams, 1);
+  assert.equal(healthForwarded.peer_connections, 1);
+  assert.equal(healthForwarded.sweep_test.running, true,
+    "the post-capture diagnostic must include the automatically started test");
+  assert.equal(healthForwarded.sweep_test.automatic, true);
+  assert.equal("gain_db" in (healthForwarded.sweep_curve ?? {}), false,
+    "the desktop endpoint keeps its strict schema; richer curve fields remain local");
+  const testData = await send({ kind: "tesktop-read-test-data" });
+  assert.equal(testData.test.samples[0].ssrc, 77);
+  assert.equal(testData.test.samples[0].sender_match, true);
+  assert.equal(captureControl.active, true, "an exact sweep match should start curve capture automatically");
+  assert.equal("spectrum_dbfs" in forwarded.streams[0], false);
+  let local = await send({ kind: "tesktop-read-local-spectrum" });
+  assert.deepEqual(Array.from(local.report.streams[0].spectrum_dbfs), spectrum);
+
+  await send({ kind: "tesktop-set-curve-capture", active: true });
+  assert.equal(captureControl.active, true);
+  now += 2_000;
+  const next = { ...report, sampled_at_ms: now, streams: [{
+    ...report.streams[0], ssrc: 77, codec: "audio/opus",
+    spectrum_dbfs: spectrum.map(value => value + 1), peak_dbfs: -17, analysis_sample_rate_hz: 48_000,
+  }] };
+  await send({ kind: "tesktop-receiver-report", report: next });
+  local = await send({ kind: "tesktop-read-local-spectrum" });
+  assert.equal(local.curve_capture_active, true);
+  assert.equal(local.curves[0].ssrc, 77);
+  assert.equal(local.curves[0].tabId, 5);
+  assert.equal(local.curves[0].spectrum_dbfs[47], -17);
+  assert.equal(local.curves[0].samples_per_band[47], 1);
+  senderSweep = false;
+  await send({ kind: "tesktop-read-status" });
+  diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.equal(diagnostics.test.running, false);
+  assert.equal(diagnostics.test.sample_count, 2);
+  assert.equal(diagnostics.auto_export_ready, true);
+  assert.equal(diagnostics.curve_capture_active, false);
+  const exported = await send({ kind: "tesktop-read-test-data" });
+  assert.equal(exported.export.format, "AscendCord Stereo Proof receiver test v1");
+  assert.equal(exported.export.test.samples.length, 2);
+  assert.equal(exported.export.diagnostics.test_summary.matched_samples, 2);
+  onRemoved(5);
+  local = await send({ kind: "tesktop-read-local-spectrum" });
+  assert.equal(local.report, null);
+  assert.equal(local.curves.length, 0);
+});
+
+test("manual capture binds a sender that appears after capture starts and excludes unmatched stats", async () => {
+  const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
+  let onMessage;
+  let now = 20_000;
+  let senderAvailable = false;
+  const chrome = {
+    runtime: { onMessage: { addListener(listener) { onMessage = listener; } } },
+    tabs: {
+      onRemoved: { addListener() {} },
+      sendMessage: async () => ({}),
+    },
+  };
+  const context = {
+    chrome,
+    URL,
+    Date: class extends Date { static now() { return now; } },
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    fetch: async (url, options) => {
+      if (url.endsWith("/v1/status")) {
+        return { ok: true, status: 200, json: async () => ({ sender: senderAvailable ? {
+          audio_ssrc: 88, test_sweep_active: true, send_enabled: true,
+        } : null }) };
+      }
+      return { ok: true, status: 204 };
+    },
+  };
+  vm.runInNewContext(source, context);
+  const sender = { tab: { id: 6, url: "https://discord.com/channels/1/2" } };
+  const send = message => new Promise(resolve => {
+    const result = onMessage(message, sender, resolve);
+    if (result !== true) resolve(undefined);
+  });
+
+  const started = await send({ kind: "tesktop-start-test" });
+  assert.equal(started.test.sender_ssrc, null);
+  const report = loss => ({
+    protocol: 1, sampled_at_ms: now, peer_connections: 1,
+    streams: [{ ssrc: 88, codec: "audio/opus", loss_percent: loss }],
+  });
+  await send({ kind: "tesktop-receiver-report", report: report(99) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  let diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.equal(diagnostics.test_summary.matched_samples, 0);
+  assert.equal(diagnostics.test_summary.average_loss_percent, null);
+  assert.equal(diagnostics.test_summary.unmatched_samples, 1);
+
+  senderAvailable = true;
+  now += 2_000;
+  await send({ kind: "tesktop-receiver-report", report: report(2) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.equal(diagnostics.test.sender_ssrc, 88);
+  assert.equal(diagnostics.test.automatic, false);
+  assert.equal(diagnostics.test_summary.matched_samples, 1);
+  assert.equal(diagnostics.test_summary.unmatched_samples, 1);
+  assert.equal(diagnostics.test_summary.average_loss_percent, 2);
+  const data = await send({ kind: "tesktop-read-test-data" });
+  assert.equal(data.test.samples[0].sender_match, false);
+  assert.equal(data.test.samples[1].sender_match, true);
+});
+
+test("automatically captures two full sweeps and prepares a measured response report", async () => {
+  const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
+  let onMessage;
+  let now = 30_000;
+  const chrome = {
+    runtime: { onMessage: { addListener(listener) { onMessage = listener; } } },
+    tabs: {
+      onRemoved: { addListener() {} },
+      sendMessage: async () => ({}),
+    },
+  };
+  const context = {
+    chrome,
+    URL,
+    Date: class extends Date { static now() { return now; } },
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    fetch: async url => url.endsWith("/v1/status")
+      ? { ok: true, status: 200, json: async () => ({ sender: {
+        audio_ssrc: 99, test_sweep_active: true, send_enabled: true,
+      } }) }
+      : { ok: true, status: 204 },
+  };
+  vm.runInNewContext(source, context);
+  const sender = { tab: { id: 7, url: "https://discord.com/channels/1/2" } };
+  const send = message => new Promise(resolve => {
+    const result = onMessage(message, sender, resolve);
+    if (result !== true) resolve(undefined);
+  });
+  const startAt = now;
+  const expectedFrequency = index => 20 * 1000 ** (index / 47);
+  const reportAt = sampleAt => {
+    const elapsed = sampleAt - startAt;
+    const band = Math.floor(elapsed / 700) % 48;
+    const pass = Math.floor(elapsed / (48 * 700));
+    return { protocol: 1, sampled_at_ms: sampleAt, peer_connections: 1, streams: [{
+      ssrc: 99, codec: "audio/opus", channels: 2, track_channels: 2,
+      sdp_fmtp_stereo: true, active: true, loss_percent: 0,
+      spectrum_dbfs: Array(48).fill(-100),
+      peak_frequency_hz: expectedFrequency(band), peak_dbfs: -18 + pass * 0.5,
+      analysis_sample_rate_hz: 48_000,
+    }] };
+  };
+
+  await send({ kind: "tesktop-receiver-report", report: reportAt(now) });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  let diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.equal(diagnostics.test.running, true);
+  assert.equal(diagnostics.curve_capture_active, true);
+
+  for (let elapsed = 250; elapsed <= 72_000; elapsed += 250) {
+    now = startAt + elapsed;
+    await send({ kind: "tesktop-receiver-report", report: reportAt(now) });
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.equal(diagnostics.test.running, false);
+  assert.equal(diagnostics.auto_export_ready, true);
+  assert.equal(diagnostics.curve_capture_active, false);
+  const exported = await send({ kind: "tesktop-read-test-data" });
+  assert.ok(exported.export.test.samples.length > 100);
+  assert.equal(exported.export.test.samples.every(sample => sample.sender_match), true);
+  assert.equal(exported.export.diagnostics.sweep_curve.ssrc, 99);
+  assert.equal(exported.export.diagnostics.sweep_curve.spectrum_dbfs.length, 48);
+  assert.equal(exported.export.diagnostics.sweep_curve.samples_per_band.length, 48);
+  assert.ok(exported.export.diagnostics.sweep_curve.samples_per_band.every(count => count >= 2));
+  assert.equal(exported.export.diagnostics.sweep_curve.measured_bins, 48);
+  assert.equal(exported.export.diagnostics.sweep_curve.coverage_complete, true);
+  assert.equal(exported.export.diagnostics.pipeline_validation.passed, true);
+  assert.equal(exported.export.diagnostics.sweep_curve.peak_frequency_hz.length, 48);
+});
+
+test("automatically persists a completed proof so an MV3 worker restart keeps the report", async () => {
+  const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
+  let onMessage;
+  let now = 40_000;
+  let savedExport = null;
+  const storage = {
+    async get() { return savedExport ? { tesktopCompletedSweepExport: savedExport } : {}; },
+    async set(value) { savedExport = value.tesktopCompletedSweepExport; },
+    async remove() { savedExport = null; },
+  };
+  const sender = { tab: { id: 8, url: "https://discord.com/channels/1/2" } };
+  const report = () => ({
+    protocol: 1, sampled_at_ms: now, peer_connections: 1,
+    streams: [{
+      ssrc: 101, codec: "audio/opus", channels: 2, track_channels: 2,
+      sdp_fmtp_stereo: true, active: true, loss_percent: 0, jitter_ms: 1,
+      spectrum_dbfs: Array(48).fill(-18),
+      peak_frequency_hz: 20 * 1000 ** (Math.floor((now - 40_000) / 700) % 48 / 47),
+      peak_dbfs: -18, analysis_sample_rate_hz: 48_000,
+    }],
+  });
+
+  const createWorker = () => {
+    const chrome = {
+      storage: { local: storage },
+      runtime: { onMessage: { addListener(listener) { onMessage = listener; } } },
+      tabs: {
+        onRemoved: { addListener() {} },
+        sendMessage: async () => ({}),
+      },
+    };
+    vm.runInNewContext(source, {
+      chrome, URL,
+      Date: class extends Date { static now() { return now; } },
+      AbortController, setTimeout, clearTimeout,
+      fetch: async url => url.endsWith("/v1/status")
+        ? { ok: true, status: 200, json: async () => ({ sender: {
+          audio_ssrc: 101, test_sweep_active: true, send_enabled: true,
+        } }) }
+        : { ok: true, status: 204 },
+    });
+    return message => new Promise(resolve => {
+      onMessage(message, sender, resolve);
+    });
+  };
+  const waitForWork = () => new Promise(resolve => setTimeout(resolve, 5));
+
+  const firstWorker = createWorker();
+  await firstWorker({ kind: "tesktop-receiver-report", report: report() });
+  await waitForWork();
+  for (let elapsed = 250; elapsed <= 72_000; elapsed += 250) {
+    now = 40_000 + elapsed;
+    await firstWorker({ kind: "tesktop-receiver-report", report: report() });
+    if (elapsed % 1_000 === 0) await waitForWork();
+  }
+  const beforeRestart = await firstWorker({ kind: "tesktop-read-test-data" });
+  assert.equal(beforeRestart.export.diagnostics.pipeline_validation.passed, true);
+  assert.ok(savedExport, "the completed JSON is written to extension local storage");
+
+  const restartedWorker = createWorker();
+  const afterRestart = await restartedWorker({ kind: "tesktop-read-test-data" });
+  const diagnostics = await restartedWorker({ kind: "tesktop-read-diagnostics" });
+  assert.equal(afterRestart.export.test.id, beforeRestart.export.test.id);
+  assert.ok(afterRestart.export.test.samples.length > 100);
+  assert.equal(diagnostics.auto_export_ready, true);
+  assert.equal(diagnostics.auto_export_saved, true);
+  assert.equal(diagnostics.pipeline_validation.passed, true);
+});

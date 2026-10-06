@@ -170,10 +170,15 @@ impl VoiceProcessing {
 		}
 	}
 	pub fn normalized(mut self) -> Self {
-		self.custom.suppression_level = self.custom.suppression_level.min(3);
-		self.custom.sensitivity_db = self.custom.sensitivity_db.map(|db| db.clamp(-80, 0));
-		self.vad_threshold_rms = self.vad_threshold_rms.min(2_000);
-		self.opus = self.opus.normalized();
+		// Capture is intentionally fixed to the raw microphone path. Normalize older saved
+		// preferences so stale settings cannot re-enable processing through another caller.
+		self.noise_suppression = false;
+		self.profile = InputProfile::Studio;
+		self.custom = Processing::studio();
+		self.use_rnnoise_vad = false;
+		self.always_transmit = true;
+		self.vad_threshold_rms = 0;
+		self.opus = OpusSettings::default();
 		self
 	}
 	/// Editing a preset starts from its visible values, rather than hidden custom values.
@@ -183,5 +188,20 @@ impl VoiceProcessing {
 		}
 		self.profile = InputProfile::Custom;
 		&mut self.custom
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn saved_processing_options_normalize_to_unfiltered_microphone_defaults() {
+		let mut saved = VoiceProcessing::from_legacy(true);
+		saved.use_rnnoise_vad = true;
+		saved.always_transmit = false;
+		saved.vad_threshold_rms = 900;
+		saved.opus.bitrate = 32_000;
+		assert_eq!(saved.normalized(), VoiceProcessing::default());
 	}
 }

@@ -10,6 +10,7 @@ mod mixer;
 pub mod resample;
 pub mod screen;
 mod stream_playout;
+mod test_sweep;
 mod timer;
 mod transport;
 mod video;
@@ -28,8 +29,7 @@ pub type MonoFrame = [f32; 960];
 pub type Frame = [f32; 1_920];
 pub type StereoFrame = Frame;
 
-/// Mic payload before Opus. Capture, optional RNNoise and the stereo Opus encoder
-/// keep independent left/right channels end to end.
+/// Raw stereo mic payload before Discord's required Opus network encoding.
 #[derive(Clone, Copy)]
 pub enum CaptureFrame {
 	Stereo(StereoFrame),
@@ -64,9 +64,6 @@ pub struct Controls {
 	pub muted: bool,
 	/// Acheron-compatible encoder settings applied on the next 20 ms voice tick.
 	pub opus: model::voice_settings::OpusSettings,
-	pub noise_suppression: bool,
-	pub rnnoise_vad: bool,
-	pub vad_threshold_rms: u16,
 	/// Local indicator threshold; independent of received participants.
 	pub activity_threshold_db: i16,
 	/// Zero means off; a new value invalidates frames from the previous camera instance.
@@ -86,9 +83,6 @@ impl Default for Controls {
 		Self {
 			muted: false,
 			opus: model::voice_settings::OpusSettings::default(),
-			noise_suppression: true,
-			rnnoise_vad: true,
-			vad_threshold_rms: 100,
 			activity_threshold_db: -45,
 			camera: 0,
 			camera_codec: model::CameraCodec::H264,

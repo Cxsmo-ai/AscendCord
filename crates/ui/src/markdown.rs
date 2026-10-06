@@ -40,6 +40,8 @@ struct Style {
 	role_color: Option<u32>,
 	mass_mention: bool,
 	channel: Option<Id>,
+	/// A first-party custom emoji CDN URL; it remains the copied source text, but draws as art.
+	emoji_url: Option<(Id, bool)>,
 	/// Discord `<t:seconds[:style]>` reference: rendered fresh each frame, never at parse time.
 	timestamp: Option<(i64, u8)>,
 	no_autolink: bool,
@@ -111,6 +113,9 @@ fn has_artwork(spans: &[(String, Style)]) -> bool {
 		if style.code {
 			return false;
 		}
+		if style.emoji_url.is_some() {
+			return true;
+		}
 		let mut offset = 0;
 		while offset < text.len() {
 			if crate::emoji::custom_prefix(&text[offset..]).is_some() {
@@ -153,6 +158,10 @@ fn only_emoji(spans: &[(String, Style)], blocks: &[CodeBlock], mentions: usize) 
 			return false;
 		}
 		let mut offset = 0;
+		if style.emoji_url.is_some() {
+			count += 1;
+			continue;
+		}
 		while offset < text.len() {
 			if let Some((_, len)) = crate::emoji::custom_prefix(&text[offset..]) {
 				count += 1;
@@ -935,19 +944,31 @@ impl Formatted {
 			{
 				target = &target[..target.len() - 1];
 			}
-			if (target.starts_with("https://") || target.starts_with("http://"))
-				&& let Some(link) = self.add_link(target)
-			{
+			if target.starts_with("https://") || target.starts_with("http://") {
 				let link_start = start + word.len() - candidate.len();
-				self.push(&text[consumed..link_start], style);
-				self.push(
-					target,
-					Style {
-						link: Some(link),
-						..style
-					},
-				);
-				consumed = link_start + target.len();
+				if let Some((id, animated, len)) = crate::emoji::cdn_url_prefix(target)
+					&& len == target.len()
+				{
+					self.push(&text[consumed..link_start], style);
+					self.push(
+						target,
+						Style {
+							emoji_url: Some((id, animated)),
+							..style
+						},
+					);
+					consumed = link_start + target.len();
+				} else if let Some(link) = self.add_link(target) {
+					self.push(&text[consumed..link_start], style);
+					self.push(
+						target,
+						Style {
+							link: Some(link),
+							..style
+						},
+					);
+					consumed = link_start + target.len();
+				}
 			}
 		}
 		self.push(&text[consumed..], style);
@@ -1645,7 +1666,7 @@ impl Formatted {
 	) -> egui::Response {
 		struct Inline {
 			text: String,
-			custom: Option<model::Id>,
+			custom: Option<(model::Id, bool)>,
 			image: Option<egui::Image<'static>>,
 		}
 		let size = crate::emoji::inline_size(ui);
@@ -1670,9 +1691,17 @@ impl Formatted {
 			let mut start = 0;
 			let mut offset = 0;
 			while offset < text.len() {
-				let custom = (!style.code)
-					.then(|| crate::emoji::custom_prefix(&text[offset..]))
-					.flatten();
+				let custom = if offset == 0 && !style.code {
+					style
+						.emoji_url
+						.map(|(id, animated)| (id, text.len(), animated))
+						.or_else(|| {
+							crate::emoji::custom_prefix_with_animation(&text[offset..])
+								.map(|(id, len, animated)| (id, len, animated))
+						})
+				} else {
+					None
+				};
 				let len = custom.map_or_else(
 					|| {
 						text[offset..]
@@ -1681,7 +1710,7 @@ impl Formatted {
 							.expect("remaining text")
 							.len()
 					},
-					|(_, len)| len,
+					|(_, len, _)| len,
 				);
 				let cluster = &text[offset..offset + len];
 				let cell = if custom.is_none() && !style.code {
@@ -1701,7 +1730,7 @@ impl Formatted {
 				job.append(" ", 0.0, crate::emoji::inline_format(ui, size, size));
 				inlines.push(Inline {
 					text: cluster.to_owned(),
-					custom: custom.map(|(id, _)| id),
+					custom: custom.map(|(id, _, animated)| (id, animated)),
 					image: cell.and_then(|cell| {
 						atlas
 							.get_or_insert_with(|| crate::emoji::atlas(ui.ctx()))
@@ -1810,7 +1839,9 @@ impl Formatted {
 				crate::select::Artwork {
 					rect: *rect,
 					image: match inline.custom {
-						Some(id) => images.custom_image(ui.ctx(), id, size, demo),
+						Some((id, animated)) => {
+							images.custom_image_animated(ui.ctx(), id, animated, size, demo)
+						}
 						None => inline.image.clone(),
 					},
 				}
@@ -1832,7 +1863,9 @@ impl Formatted {
 				}
 				let inline = &inlines[*index];
 				let image = match inline.custom {
-					Some(id) => images.custom_image(ui.ctx(), id, size, demo),
+					Some((id, animated)) => {
+						images.custom_image_animated(ui.ctx(), id, animated, size, demo)
+					}
 					None => inline.image.clone(),
 				};
 				if !link {
@@ -3137,6 +3170,7 @@ mod tests {
 	#[test]
 	fn selecting_across_images_copies_unicode_and_custom_markup() {
 		let ctx = egui::Context::default();
+		crate::select::install(&ctx);
 		crate::emoji::install(&ctx).unwrap();
 		let source = "A 👩🏽‍💻 ❤️ <:serein_wave:9001> Z";
 		let parsed = Formatted::parse(source);
@@ -4129,6 +4163,23 @@ mod tests {
 				modifiers: egui::Modifiers::NONE,
 			}]);
 		}
+	}
+	#[test]
+	fn discord_custom_emoji_cdn_urls_render_as_art_instead_of_links() {
+		let url = "https://cdn.discordapp.com/emojis/1452181583720222731.png?quality=lossless&name=dtm&size=64";
+		let parsed = Formatted::parse(&format!("before {url} after"));
+		assert!(parsed.links.is_empty());
+		assert!(parsed.artwork);
+		assert!(parsed.spans.iter().any(|(text, style)| {
+			text == url && style.emoji_url == Some((Id(1452181583720222731), false))
+		}));
+		let plain = Formatted::parse("https://example.com/emojis/1452181583720222731.png");
+		assert_eq!(
+			plain.links,
+			["https://example.com/emojis/1452181583720222731.png"]
+		);
+		let markup = Formatted::parse("<a:dtm:1452181583720222731>");
+		assert!(markup.jumbo());
 	}
 	#[test]
 	fn bounded_formatting_and_inert_external_content() {

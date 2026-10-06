@@ -1,14 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "Tesktop Stereo Proof",
-  "version": "0.1.0",
-  "description": "Read-only Discord WebRTC receive statistics for Tesktop's local voice verifier.",
+  "name": "AscendCord Stereo Proof",
+  "version": "0.3.2",
+  "description": "Read-only Discord WebRTC receive statistics for AscendCord's local voice verifier.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3eGUbLwcHWH5avadMXzZ9MJwkG3XaOOz7MRhaoNpaXoHFwDb5wxcbtJOneMJIBw3V5fVXAeIxNMdLCLblpH/VG3AZBq7JTLb7IiyooFGOA8G/YacyqxFCPSFBJZJ78WjjfUCd/1eVJprJ3JL/xRIXMh2nhkg343BfPTuZJST0hDPM3rxfNXpzeuucdu3X27eJGITkXDrOP1EFX49nLbjPVlCRoJfM8aI8xZVR4p9EkKDJRAKKySx8zQMimtTa5yGySSlavedDbmVvkKoA/fDnbLtdCvXVz3TnwGj9INkrRSIF4LTPj575lOjHrj3BeQUIVXG4wSQdDrNM/YoedJTOwIDAQAB",
-  "permissions": [],
+  "permissions": ["storage"],
   "host_permissions": ["http://127.0.0.1/*"],
   "background": { "service_worker": "service-worker.js" },
   "action": {
-    "default_title": "Tesktop Stereo Proof",
+    "default_title": "AscendCord Stereo Proof",
     "default_popup": "popup.html"
   },
   "content_scripts": [

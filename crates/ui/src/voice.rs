@@ -7,10 +7,7 @@ use client_core::{
 	voice::{Participant, Phase, RosterEntry},
 };
 use egui::RichText;
-use model::{
-	Id,
-	voice_settings::{OpusApplication, OpusSignal},
-};
+use model::Id;
 
 /// Local mutes share the 64 per-user volume slots sent to the mixer.
 const MAX_USER_MUTES: usize = 64;
@@ -1569,7 +1566,11 @@ impl MessagingUi {
 			if input {
 				device_combo(ui, "voice-input", &self.voice_inputs, &mut self.voice_input)
 					.labelled_by(label.id);
-				gain_slider(ui, &mut self.voice_gain.input_percent, "Microphone gain");
+				ui.label(
+					RichText::new("Unfiltered mic · unity gain · PTT/mute still apply")
+						.size(12.0)
+						.color(colors.muted),
+				);
 			} else {
 				device_combo(
 					ui,
@@ -1590,17 +1591,11 @@ impl MessagingUi {
 			});
 			ui.separator();
 			if input {
-				let mut suppression = self.voice_processing.noise_suppression;
-				if design::switch(
-					ui,
-					"Noise suppression",
-					Some("Choose an algorithm in all voice settings."),
-					&mut suppression,
-				)
-				.changed()
-				{
-					self.voice_processing.noise_suppression = suppression;
-				}
+				ui.label(
+					RichText::new("Unfiltered mic · unity gain · PTT/mute still apply")
+						.size(12.0)
+						.color(colors.muted),
+				);
 				design::switch(
 					ui,
 					"Push to talk",
@@ -2218,7 +2213,7 @@ impl MessagingUi {
 			device(ui, true);
 			device(ui, false);
 		}
-		gain_controls(ui, &mut self.voice_gain);
+		gain_slider(ui, &mut self.voice_gain.output_percent, "Speaker volume");
 		ui.horizontal(|ui| {
 			ui.spacing_mut().item_spacing.x = 4.0;
 			if design::text_action(ui, "Refresh devices").clicked() {
@@ -2249,79 +2244,16 @@ impl MessagingUi {
 	fn voice_processing_controls(&mut self, ui: &mut egui::Ui) {
 		design::section(
 			ui,
-			"Microphone processing",
+			"Microphone signal",
 			Some(
-				"Acheron-style voice controls. The mic path has no echo canceller or automatic gain control.",
+				"The selected mic is sent at unity gain without suppression, speech detection, mixing, limiting, or EQ. Mute, permissions, and push-to-talk remain active.",
 			),
 		);
-		let mut suppress = self.voice_processing.noise_suppression;
-		if design::switch(
-			ui,
-			"Noise suppression",
-			Some("Process left and right channels independently with RNNoise."),
-			&mut suppress,
-		)
-		.changed()
-		{
-			self.voice_processing.noise_suppression = suppress;
-		}
-		design::switch(
-			ui,
-			"RNNoise voice detection",
-			Some("Use RNNoise voice probability for gating; otherwise use raw PCM RMS."),
-			&mut self.voice_processing.use_rnnoise_vad,
+		ui.label(
+			RichText::new("Discord still encodes voice with Opus for network transport.")
+				.size(12.0)
+				.color(ui.visuals().weak_text_color()),
 		);
-		design::switch(
-			ui,
-			"Always transmit raw audio",
-			Some(
-				"For music and line-level sources: bypass speech gating and RNNoise so playback is not mistaken for silence.",
-			),
-			&mut self.voice_processing.always_transmit,
-		);
-		let mut threshold = i32::from(self.voice_processing.vad_threshold_rms.min(2_000));
-		ui.add(egui::Slider::new(&mut threshold, 0..=2_000).text("VAD RMS threshold"));
-		self.voice_processing.vad_threshold_rms = threshold as u16;
-		design::card_divider(ui);
-		design::section(
-			ui,
-			"Opus encoder",
-			Some("Controls take effect during the call."),
-		);
-		let opus = &mut self.voice_processing.opus;
-		egui::ComboBox::from_label("Application")
-			.selected_text(match opus.application {
-				OpusApplication::Voip => "VoIP",
-				OpusApplication::Audio => "Audio",
-			})
-			.show_ui(ui, |ui| {
-				ui.selectable_value(&mut opus.application, OpusApplication::Voip, "VoIP");
-				ui.selectable_value(&mut opus.application, OpusApplication::Audio, "Audio");
-			});
-		let mut bitrate = (opus.bitrate / 1_000).clamp(8, 510) as i32;
-		ui.add(egui::Slider::new(&mut bitrate, 8..=510).text("Bitrate kbps"));
-		opus.bitrate = bitrate as u32 * 1_000;
-		ui.checkbox(&mut opus.vbr, "Variable bitrate")
-			.on_hover_text("Off locks every packet to the bitrate above (constant bitrate).");
-		let mut complexity = i32::from(opus.complexity.min(10));
-		ui.add(egui::Slider::new(&mut complexity, 0..=10).text("Complexity"));
-		opus.complexity = complexity as u8;
-		egui::ComboBox::from_label("Signal")
-			.selected_text(match opus.signal {
-				OpusSignal::Auto => "Auto",
-				OpusSignal::Voice => "Voice",
-				OpusSignal::Music => "Music",
-			})
-			.show_ui(ui, |ui| {
-				ui.selectable_value(&mut opus.signal, OpusSignal::Auto, "Auto");
-				ui.selectable_value(&mut opus.signal, OpusSignal::Voice, "Voice");
-				ui.selectable_value(&mut opus.signal, OpusSignal::Music, "Music");
-			});
-		ui.checkbox(&mut opus.fec, "Forward error correction");
-		let mut loss = i32::from(opus.packet_loss_percent.min(100));
-		ui.add(egui::Slider::new(&mut loss, 0..=100).text("Expected packet loss %"));
-		opus.packet_loss_percent = loss as u8;
-		design::card_divider(ui);
 		design::switch(
 			ui,
 			"Push to talk",
@@ -3067,12 +2999,11 @@ impl MessagingUi {
 					|| state.demo || (self.screen.supported
 					&& matches!(phase, Phase::Connected | Phase::Waiting)
 					&& state.can_stream(channel_id));
-				let processing = !state.demo && self.voice_available;
 				let mut camera_clicked = false;
 				let mut share_clicked = false;
 				ui.horizontal(|ui| {
 					ui.spacing_mut().item_spacing.x = 8.0;
-					let width = ((ui.available_width() - 3.0 * 8.0 - 24.0) / 3.0).max(24.0);
+					let width = ((ui.available_width() - 2.0 * 8.0 - 24.0) / 2.0).max(24.0);
 					camera_clicked = card_action(
 						ui,
 						width,
@@ -3132,28 +3063,6 @@ impl MessagingUi {
 						},
 					)
 					.clicked();
-					if card_action(
-						ui,
-						width,
-						crate::icons::Icon::Soundboard,
-						processing,
-						self.voice_processing.noise_suppression,
-						if self.voice_processing.noise_suppression {
-							"Turn off noise suppression"
-						} else {
-							"Turn on noise suppression"
-						},
-						if processing {
-							"Noise suppression reduces keyboard noise, breathing and fans locally."
-						} else {
-							"Noise suppression is unavailable in this build or preview."
-						},
-					)
-					.clicked()
-					{
-						self.voice_processing.noise_suppression =
-							!self.voice_processing.noise_suppression;
-					}
 				});
 				if camera_clicked && let Some(command) = state.set_call_camera(!camera) {
 					self.voice_camera_status.clear();
@@ -3690,25 +3599,6 @@ fn gain_slider(ui: &mut egui::Ui, value: &mut u16, title: &str) -> egui::Respons
 		design::slider(ui, value, 0..=200, "%").labelled_by(label.id)
 	})
 	.inner
-}
-
-fn gain_controls(ui: &mut egui::Ui, gain: &mut crate::VoiceGain) -> [egui::Response; 2] {
-	let slider = gain_slider;
-	let responses = if ui.available_width() >= 480.0 {
-		ui.columns(2, |columns| {
-			[
-				slider(&mut columns[0], &mut gain.input_percent, "Microphone gain"),
-				slider(&mut columns[1], &mut gain.output_percent, "Speaker volume"),
-			]
-		})
-	} else {
-		[
-			slider(ui, &mut gain.input_percent, "Microphone gain"),
-			slider(ui, &mut gain.output_percent, "Speaker volume"),
-		]
-	};
-	design::hint(ui, "100% is the original level. Higher levels may distort.");
-	responses
 }
 
 fn elapsed_label(call: &client_core::voice::Call) -> Option<String> {
@@ -4384,7 +4274,7 @@ mod tests {
 	}
 
 	#[test]
-	fn gain_sliders_accept_keyboard_input_and_reset_with_the_session() {
+	fn speaker_volume_slider_accepts_keyboard_input_and_resets_with_the_session() {
 		let mut messaging = MessagingUi::default();
 		assert_eq!(messaging.voice_gain.input_percent, 100);
 		assert_eq!(messaging.voice_gain.output_percent, 100);
@@ -4397,7 +4287,12 @@ mod tests {
 			..Default::default()
 		};
 		ctx.run_ui(raw(), |ui| {
-			gain_controls(ui, &mut messaging.voice_gain)[0].request_focus();
+			gain_slider(
+				ui,
+				&mut messaging.voice_gain.output_percent,
+				"Speaker volume",
+			)
+			.request_focus();
 		})
 		.drop_without_applying_deltas();
 		let mut input = raw();
@@ -4409,30 +4304,30 @@ mod tests {
 			modifiers: egui::Modifiers::NONE,
 		});
 		ctx.run_ui(input, |ui| {
-			let controls = gain_controls(ui, &mut messaging.voice_gain);
-			assert!(
-				controls
-					.iter()
-					.all(|r| r.rect.right() <= ui.max_rect().right() + 1.0)
+			let control = gain_slider(
+				ui,
+				&mut messaging.voice_gain.output_percent,
+				"Speaker volume",
 			);
+			assert!(control.rect.right() <= ui.max_rect().right() + 1.0);
 		})
 		.drop_without_applying_deltas();
-		assert_eq!(messaging.voice_gain.input_percent, 101);
-		assert_eq!(messaging.voice_gain.output_percent, 100);
+		assert_eq!(messaging.voice_gain.output_percent, 101);
 		assert!(
 			!messaging.voice_refresh_devices,
 			"Gain does not enumerate devices"
 		);
-		messaging.voice_gain.input_percent = u16::MAX;
-		messaging.voice_gain.output_percent = 0;
+		messaging.voice_gain.output_percent = u16::MAX;
 		ctx.run_ui(raw(), |ui| {
-			gain_controls(ui, &mut messaging.voice_gain);
+			gain_slider(
+				ui,
+				&mut messaging.voice_gain.output_percent,
+				"Speaker volume",
+			);
 		})
 		.drop_without_applying_deltas();
-		assert_eq!(messaging.voice_gain.input_percent, 200);
-		assert_eq!(messaging.voice_gain.output_percent, 0);
+		assert_eq!(messaging.voice_gain.output_percent, 200);
 		messaging.clear();
-		assert_eq!(messaging.voice_gain.input_percent, 100);
 		assert_eq!(messaging.voice_gain.output_percent, 100);
 	}
 
