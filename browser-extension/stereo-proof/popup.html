@@ -30,7 +30,7 @@
       <div class="section-heading">
         <div>
           <h2>Receiver test capture</h2>
-          <p class="caption">Starts and stops with the synthetic sweep. The numeric JSON report is prepared automatically in extension memory; no audio is recorded.</p>
+          <p class="caption">Starts and stops with the synthetic sweep. The numeric JSON report is prepared automatically and saved in extension storage; no audio is recorded.</p>
         </div>
       </div>
       <div class="toolbar">
@@ -55,12 +55,13 @@
     <section>
       <div class="section-heading">
         <div>
-          <h2>Matched audio curve · 20 Hz–20 kHz</h2>
-          <p class="caption">Received response relative to its median, measured across the matched 48-point sweep.</p>
+            <h2>Measured receive response · 20 Hz–20 kHz</h2>
+            <p class="caption">Two-pass matched-SSRC sweep · measured pipeline gain and response relative to the median. Error bars show variation across independent sweep passes.</p>
         </div>
         <button id="capture-curve" class="action" disabled>Capture sweep curve</button>
       </div>
-      <canvas id="spectrum" width="696" height="250" aria-label="Log frequency spectrum of the matched received audio"></canvas>
+        <canvas id="spectrum" width="2400" height="1200" aria-label="Scientific log-frequency graph of measured Discord receive level and median-relative response"></canvas>
+        <button id="save-graph" class="action" disabled>Save high-resolution graph (PNG)</button>
       <p id="curve-note" class="caption">Enable ASCENDCORD_TEST_SWEEP=1 before launching AscendCord. The diagnostic replaces microphone audio with an equal-level stepped sweep.</p>
     </section>
     <footer>Local statistics only · no audio is captured, stored, or relayed.</footer>

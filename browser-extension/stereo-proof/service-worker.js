@@ -1,15 +1,25 @@
 const BASE = "http://127.0.0.1:43721";
 const MIN_INTERVAL_MS = 1500;
 const MAX_TEST_SAMPLES = 1800;
-// The synthetic sender cycles through 48 bands at 700 ms each (33.6 s).
-// Capture a full pass plus a margin after the first exact SSRC match.
-const AUTO_CAPTURE_DURATION_MS = 40_000;
+// Two full 48-band passes (2 × 48 × 700 ms), with a margin for phase alignment.
+const AUTO_CAPTURE_DURATION_MS = 72_000;
+const COMPLETED_EXPORT_KEY = "tesktopCompletedSweepExport";
+const MIN_SIGNAL_DBFS = -90;
+const MIN_BIN_SAMPLES = 2;
+const SWEEP_BANDS = 48;
+const SWEEP_LOW_HZ = 20;
+const SWEEP_HIGH_HZ = 20_000;
+const MAX_PEAK_FREQUENCY_ERROR_PERCENT = 8.5;
+const MIN_REPEAT_INTERVAL_MS = 5_000;
+const SOURCE_PEAK_DBFS = 20 * Math.log10(0.25);
 const lastSentByTab = new Map();
 let latestSpectrum = null;
 let curveCaptureActive = false;
 const capturedCurves = new Map();
 let diagnosticsPostActive = false;
 let lastDiagnosticsPostAt = 0;
+let diagnosticsPostDirty = false;
+let diagnosticsPostTimer = null;
 const diagnostics = {
   contentBridgeAt: 0,
   observerReportAt: 0,
@@ -23,28 +33,74 @@ const diagnostics = {
   observerAt: 0,
   healthForwardError: "",
   senderStatusError: "",
+  storageError: "",
 };
 let latestSenderSsrc = null;
 let latestSender = null;
 let activeTest = null;
 let completedTest = null;
 let completedExport = null;
+let completedExportPersisted = false;
+let exportPersistPromise = Promise.resolve();
 let autoSweepActive = false;
 let autoSweepRunStarted = false;
 let autoCaptureStartedAt = 0;
 let senderStatusRequest = null;
 let lastSenderStatusAt = 0;
 
-function beginTest(automatic = false) {
+// MV3 service workers can be suspended between the automatic capture and the
+// user's next popup visit. Keep the completed numeric report in extension-local
+// storage so a browser worker restart does not make the result disappear.
+const restoreCompletedExport = chrome.storage?.local?.get
+  ? chrome.storage.local.get(COMPLETED_EXPORT_KEY).then(saved => {
+    const restored = saved?.[COMPLETED_EXPORT_KEY];
+    if (restored?.format === "AscendCord Stereo Proof receiver test v1" &&
+        restored?.test && Array.isArray(restored.test.samples) &&
+        restored.test.samples.length <= MAX_TEST_SAMPLES) {
+      completedExport = restored;
+      completedTest = restored.test;
+      completedExportPersisted = true;
+    }
+  }).catch(error => {
+    diagnostics.storageError = String(error?.message ?? error).slice(0, 180);
+  })
+  : Promise.resolve();
+
+function persistCompletedExport() {
+  if (!chrome.storage?.local?.set || !completedExport) return Promise.resolve();
+  exportPersistPromise = chrome.storage.local.set({
+    [COMPLETED_EXPORT_KEY]: completedExport,
+  }).then(() => {
+    diagnostics.storageError = "";
+    completedExportPersisted = true;
+  }).catch(error => {
+    completedExportPersisted = false;
+    diagnostics.storageError = String(error?.message ?? error).slice(0, 180);
+  });
+  return exportPersistPromise;
+}
+
+function clearCompletedExport() {
+  completedExportPersisted = false;
+  if (!chrome.storage?.local?.remove) return;
+  chrome.storage.local.remove(COMPLETED_EXPORT_KEY).catch(error => {
+    diagnostics.storageError = String(error?.message ?? error).slice(0, 180);
+  });
+}
+
+function beginTest(automatic = false, tabId = null) {
   activeTest = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     started_at_ms: Date.now(),
     sender_ssrc: latestSenderSsrc,
+    tab_id: Number.isInteger(tabId) ? tabId : null,
     automatic,
     samples: [],
   };
   completedTest = null;
   completedExport = null;
+  completedExportPersisted = false;
+  clearCompletedExport();
 }
 
 function finishTest() {
@@ -53,8 +109,9 @@ function finishTest() {
   completedTest = activeTest;
   activeTest = null;
   const curve = [...capturedCurves.values()].find(item =>
-    item.ssrc === completedTest.sender_ssrc);
-  const curveSummary = curve ? summarizeCurve(curve.spectrum_dbfs) : null;
+    item.ssrc === completedTest.sender_ssrc &&
+    (completedTest.tab_id == null || item.tabId === completedTest.tab_id));
+  const curveSummary = curve ? summarizeCurve(curve) : null;
   completedExport = {
     format: "AscendCord Stereo Proof receiver test v1",
     exported_at: new Date().toISOString(),
@@ -77,29 +134,109 @@ function finishTest() {
       test_summary: summarizeSamples(completedTest.samples),
       sweep_curve: curve ? {
         ssrc: curve.ssrc,
+        analysis_sample_rate_hz: curve.analysis_sample_rate_hz,
+        frequency_hz: sweepFrequencies(),
         spectrum_dbfs: [...curve.spectrum_dbfs],
+        gain_db: curve.spectrum_dbfs.map(value => value - SOURCE_PEAK_DBFS),
+        peak_frequency_hz: curve.mean_peak_frequency_hz.map((mean, index) =>
+          curve.samples_per_band[index] > 0 ? mean : null),
+        peak_frequency_error_percent: curve.mean_peak_frequency_hz.map((mean, index) =>
+          curve.samples_per_band[index] > 0
+            ? (mean / sweepFrequencies()[index] - 1) * 100 : null),
+        standard_deviation_db: curve.mean_dbfs.map((_, index) =>
+          curve.samples_per_band[index] > 1
+            ? Math.sqrt(curve.m2_db[index] / (curve.samples_per_band[index] - 1)) : null),
+        samples_per_band: [...curve.samples_per_band],
+        measured_bins: curve.covered_bins.filter(Boolean).length,
+        coverage_complete: curve.covered_bins.every(Boolean),
         ...curveSummary,
       } : null,
+      pipeline_validation: validateCompletedPipeline(completedTest, curve, curveSummary),
       test_samples: completedTest.samples.slice(-300),
     },
     test: { ...completedTest, samples: [...completedTest.samples] },
   };
+  persistCompletedExport();
 }
 
-function summarizeCurve(values) {
+function validateCompletedPipeline(test, curve, curveSummary) {
+  const matched = test.samples.filter(sample => sample.sender_match === true);
+  const stereoSamples = matched.filter(sample => sample.channels === 2 &&
+    sample.track_channels === 2 && sample.sdp_fmtp_stereo === true && sample.active === true);
+  const curveCovered = curveSummary !== null &&
+    curve.covered_bins.every(Boolean) &&
+    curve.samples_per_band.every(count => count >= MIN_BIN_SAMPLES) &&
+    Math.max(...curve.spectrum_dbfs) > MIN_SIGNAL_DBFS;
+  const expectedFrequencies = sweepFrequencies();
+  const frequencyAssignmentValid = curveCovered && curve.mean_peak_frequency_hz.every((frequency, index) =>
+    Number.isFinite(frequency) && Math.abs(frequency / expectedFrequencies[index] - 1) * 100 <=
+      MAX_PEAK_FREQUENCY_ERROR_PERCENT);
+  const checks = {
+    matched_receiver_samples: matched.length >= 3,
+    stereo_opus_receive: stereoSamples.length >= 3,
+    all_48_sweep_bands_measured: curveCovered,
+    measured_peak_frequencies_match_sweep: frequencyAssignmentValid,
+  };
+  return {
+    passed: Object.values(checks).every(Boolean),
+    checks,
+    stereo_samples: stereoSamples.length,
+    measured_bands: curve?.covered_bins.filter(Boolean).length ?? 0,
+    signal_threshold_dbfs: MIN_SIGNAL_DBFS,
+    max_peak_frequency_error_percent: MAX_PEAK_FREQUENCY_ERROR_PERCENT,
+  };
+}
+
+function sweepFrequencies() {
+  return Array.from({ length: SWEEP_BANDS }, (_, index) =>
+    SWEEP_LOW_HZ * (SWEEP_HIGH_HZ / SWEEP_LOW_HZ) ** (index / (SWEEP_BANDS - 1)));
+}
+
+function addCurveSample(curve, frequencyHz, peakLevel) {
+  if (!Number.isFinite(frequencyHz) || frequencyHz < SWEEP_LOW_HZ * 0.9 ||
+      frequencyHz > SWEEP_HIGH_HZ * 1.1 || !Number.isFinite(peakLevel) ||
+      peakLevel <= MIN_SIGNAL_DBFS) return;
+  const logStep = Math.log(SWEEP_HIGH_HZ / SWEEP_LOW_HZ) / (SWEEP_BANDS - 1);
+  const peakIndex = Math.round(Math.log(frequencyHz / SWEEP_LOW_HZ) / logStep);
+  if (peakIndex < 0 || peakIndex >= SWEEP_BANDS) return;
+  const expectedHz = SWEEP_LOW_HZ * Math.exp(peakIndex * logStep);
+  if (Math.abs(Math.log(frequencyHz / expectedHz)) > logStep * 0.51) return;
+  const now = Date.now();
+  if (now - curve.last_sample_at_ms[peakIndex] < MIN_REPEAT_INTERVAL_MS) return;
+  curve.last_sample_at_ms[peakIndex] = now;
+  const count = ++curve.samples_per_band[peakIndex];
+  const delta = peakLevel - curve.mean_dbfs[peakIndex];
+  curve.mean_dbfs[peakIndex] += delta / count;
+  curve.m2_db[peakIndex] += delta * (peakLevel - curve.mean_dbfs[peakIndex]);
+  curve.mean_peak_frequency_hz[peakIndex] +=
+    (frequencyHz - curve.mean_peak_frequency_hz[peakIndex]) / count;
+  curve.mean_power[peakIndex] +=
+    ((10 ** (peakLevel / 10)) - curve.mean_power[peakIndex]) / count;
+  curve.spectrum_dbfs[peakIndex] = 10 * Math.log10(curve.mean_power[peakIndex]);
+  curve.covered_bins[peakIndex] = count >= MIN_BIN_SAMPLES;
+}
+
+function summarizeCurve(curve) {
+  const values = curve?.spectrum_dbfs;
   if (!Array.isArray(values) || values.length !== 48 ||
       !values.every(value => Number.isFinite(value) && value >= -120 && value <= 12)) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const median_dbfs = (sorted[23] + sorted[24]) / 2;
-  const relative_db = values.map(value => value - median_dbfs);
-  const minimum_dbfs = Math.min(...values);
-  const maximum_dbfs = Math.max(...values);
+  const usable = values.filter((value, index) =>
+    curve.covered_bins[index] && value > -120);
+  if (!usable.length) return null;
+  const sorted = [...usable].sort((a, b) => a - b);
+  const median_dbfs = sorted.length % 2
+    ? sorted[(sorted.length - 1) / 2]
+    : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2;
+  const relative_db = values.map((value, index) =>
+    curve.covered_bins[index] && value > -120 ? value - median_dbfs : null);
+  const minimum_dbfs = Math.min(...usable);
+  const maximum_dbfs = Math.max(...usable);
   return {
     median_dbfs,
     minimum_dbfs,
     maximum_dbfs,
     peak_to_peak_db: maximum_dbfs - minimum_dbfs,
-    peak_deviation_db: Math.max(...relative_db.map(Math.abs)),
+    peak_deviation_db: Math.max(...relative_db.filter(Number.isFinite).map(Math.abs)),
     relative_db,
   };
 }
@@ -128,6 +265,8 @@ function updateSenderStatus(status) {
     autoCaptureStartedAt = 0;
     completedTest = null;
     completedExport = null;
+    completedExportPersisted = false;
+    clearCompletedExport();
   } else if (!sweepNow && autoSweepActive) {
     autoSweepActive = false;
     if (autoSweepRunStarted) finishTest();
@@ -190,8 +329,9 @@ function collectTestSamples(report, tabId) {
   const exactMatch = latestSenderSsrc == null ? null :
     report.streams.find(stream => stream.ssrc === latestSenderSsrc) ?? null;
   if (autoSweepActive && !autoSweepRunStarted && exactMatch) {
-    if (!activeTest) beginTest(true);
+    if (!activeTest) beginTest(true, tabId);
     else if (activeTest.sender_ssrc == null) activeTest.sender_ssrc = latestSenderSsrc;
+    if (activeTest && activeTest.tab_id == null) activeTest.tab_id = tabId;
     autoSweepRunStarted = true;
     autoCaptureStartedAt = Date.now();
     setCurveCapture(true, tabId);
@@ -238,14 +378,25 @@ function collectTestSamples(report, tabId) {
   }
 }
 
-function publishDiagnostics() {
-  if (diagnosticsPostActive || Date.now() - lastDiagnosticsPostAt < 1000) return;
+function publishDiagnostics(rateLimitElapsed = false) {
+  diagnosticsPostDirty = true;
+  if (diagnosticsPostActive || diagnosticsPostTimer) return;
+  const delay = rateLimitElapsed ? 0 : Math.max(0, 1000 - (Date.now() - lastDiagnosticsPostAt));
+  if (delay > 0) {
+    diagnosticsPostTimer = setTimeout(() => {
+      diagnosticsPostTimer = null;
+      publishDiagnostics(true);
+    }, delay);
+    return;
+  }
+  diagnosticsPostDirty = false;
   diagnosticsPostActive = true;
   lastDiagnosticsPostAt = Date.now();
   const currentTest = activeTest ?? completedTest;
   const testSummary = currentTest ? summarizeSamples(currentTest.samples) : null;
   const curve = [...capturedCurves.values()].find(item =>
-    item.ssrc === (currentTest?.sender_ssrc ?? latestSenderSsrc));
+    item.ssrc === (currentTest?.sender_ssrc ?? latestSenderSsrc) &&
+    (currentTest?.tab_id == null || item.tabId === currentTest.tab_id));
   const payload = {
     protocol: 1,
     sampled_at_ms: Date.now(),
@@ -285,6 +436,7 @@ function publishDiagnostics() {
     diagnostics.healthForwardError = String(error?.message ?? error).slice(0, 180);
   }).finally(() => {
     diagnosticsPostActive = false;
+    if (diagnosticsPostDirty) publishDiagnostics();
   });
 }
 
@@ -318,14 +470,14 @@ async function request(path, options = {}) {
   }
 }
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+function handleMessage(message, sender, sendResponse) {
   if (message?.kind === "tesktop-content-bridge-heartbeat") {
     if (!isDiscordSender(sender)) {
       sendResponse({ ok: false, error: "Heartbeat did not come from a Discord tab." });
       return;
     }
     diagnostics.contentBridgeAt = Date.now();
-    refreshSenderStatus().catch(() => null);
+    refreshSenderStatus().catch(() => null).finally(publishDiagnostics);
     publishDiagnostics();
     sendResponse({ ok: true });
     return;
@@ -364,6 +516,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // before matching so tests don't permanently record a null sender SSRC.
     refreshSenderStatus().catch(() => null).then(() => {
       collectTestSamples(message.report, sender.tab.id);
+      publishDiagnostics();
     });
 
     // Keep only numeric spectrum points in extension memory for the popup graph. Never
@@ -372,6 +525,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const streams = message.report.streams.filter(stream =>
       Number.isInteger(stream?.ssrc) && Array.isArray(stream.spectrum_dbfs) &&
       stream.spectrum_dbfs.length === 48 &&
+      Number.isFinite(stream.peak_frequency_hz) && Number.isFinite(stream.peak_dbfs) &&
+      Number.isFinite(stream.analysis_sample_rate_hz) &&
       stream.spectrum_dbfs.every(value => Number.isFinite(value) && value >= -120 && value <= 12));
     latestSpectrum = {
       at: Date.now(),
@@ -379,22 +534,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       streams: streams.slice(0, 16).map(stream => ({
         ssrc: stream.ssrc,
         spectrum_dbfs: stream.spectrum_dbfs,
+        peak_frequency_hz: stream.peak_frequency_hz,
+        peak_dbfs: stream.peak_dbfs,
+        analysis_sample_rate_hz: stream.analysis_sample_rate_hz,
       })),
     };
     if (curveCaptureActive) {
       for (const stream of latestSpectrum.streams) {
+        if (!activeTest || stream.ssrc !== activeTest.sender_ssrc ||
+            (activeTest.tab_id != null && activeTest.tab_id !== sender.tab.id)) continue;
         const curveKey = `${sender.tab.id}:${stream.ssrc}`;
         let curve = capturedCurves.get(curveKey);
         if (!curve) {
           if (capturedCurves.size >= 32) {
             capturedCurves.delete(capturedCurves.keys().next().value);
           }
-          curve = { tabId: sender.tab.id, ssrc: stream.ssrc, spectrum_dbfs: Array(48).fill(-120) };
+          curve = {
+            tabId: sender.tab.id,
+            ssrc: stream.ssrc,
+            analysis_sample_rate_hz: stream.analysis_sample_rate_hz,
+            spectrum_dbfs: Array(SWEEP_BANDS).fill(-120),
+            mean_power: Array(SWEEP_BANDS).fill(0),
+            mean_peak_frequency_hz: Array(SWEEP_BANDS).fill(0),
+            mean_dbfs: Array(SWEEP_BANDS).fill(0),
+            m2_db: Array(SWEEP_BANDS).fill(0),
+            samples_per_band: Array(SWEEP_BANDS).fill(0),
+            covered_bins: Array(SWEEP_BANDS).fill(false),
+            last_sample_at_ms: Array(SWEEP_BANDS).fill(0),
+          };
           capturedCurves.set(curveKey, curve);
         }
-        stream.spectrum_dbfs.forEach((db, index) => {
-          curve.spectrum_dbfs[index] = Math.max(curve.spectrum_dbfs[index], db);
-        });
+        addCurveSample(curve, stream.peak_frequency_hz, stream.peak_dbfs);
       }
     }
 
@@ -408,7 +578,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     const desktopReport = {
       ...message.report,
-      streams: message.report.streams.map(({ spectrum_dbfs, ...stream }) => stream),
+      streams: message.report.streams.map(({
+        spectrum_dbfs, peak_frequency_hz, peak_dbfs, analysis_sample_rate_hz, ...stream
+      }) => stream),
     };
     request("/v1/receiver", {
       method: "POST",
@@ -443,19 +615,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sender_ssrc: completedTest.sender_ssrc,
         sample_count: completedTest.samples.length,
       } : { running: false, sample_count: 0 },
-      auto_sweep_active: autoSweepActive,
       auto_capture_waiting: autoSweepActive && !autoSweepRunStarted,
+      auto_sweep_active: autoSweepActive,
+      auto_sweep_run_started: autoSweepRunStarted,
+      auto_capture_elapsed_ms: autoCaptureStartedAt > 0
+        ? Math.max(0, Date.now() - autoCaptureStartedAt) : 0,
+      latest_sender_ssrc: latestSenderSsrc,
+      sender_status_at: lastSenderStatusAt,
+      sender_status_error: diagnostics.senderStatusError,
       curve_capture_active: curveCaptureActive,
       auto_export_ready: completedExport !== null,
+      auto_export_saved: completedExport !== null && completedExportPersisted,
       test_summary: test ? summarizeSamples(test.samples) : null,
       test_samples: test ? test.samples.slice(-300) : [],
+      pipeline_validation: completedExport?.diagnostics?.pipeline_validation ?? null,
+      sweep_curve: completedExport?.diagnostics?.sweep_curve ?? null,
+      storage_error: diagnostics.storageError,
     });
     return;
   }
 
   if (message?.kind === "tesktop-start-test") {
     refreshSenderStatus(true).catch(() => null).finally(() => {
-      beginTest(false);
+      beginTest(false, Number.isInteger(sender?.tab?.id) ? sender.tab.id : null);
       sendResponse({ ok: true, test: { ...activeTest, samples: undefined } });
     });
     return true;
@@ -476,17 +658,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     activeTest = null;
     completedTest = null;
     completedExport = null;
+    clearCompletedExport();
     sendResponse({ ok: true });
     return;
   }
 
   if (message?.kind === "tesktop-read-test-data") {
-    const test = activeTest ?? completedTest;
-    sendResponse({
-      ok: true,
-      test: test ? { ...test, samples: [...test.samples] } : null,
-      export: completedExport ? { ...completedExport, test: { ...completedExport.test, samples: [...completedExport.test.samples] } } : null,
+    exportPersistPromise.finally(() => {
+      const test = activeTest ?? completedTest;
+      sendResponse({
+        ok: true,
+        test: test ? { ...test, samples: [...test.samples] } : null,
+        export: completedExport ? { ...completedExport, test: { ...completedExport.test, samples: [...completedExport.test.samples] } } : null,
+      });
     });
+    return true;
     return;
   }
 
@@ -497,7 +683,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       report: fresh ? latestSpectrum : null,
       curve_capture_active: curveCaptureActive,
       curves: [...capturedCurves.values()].map(curve => ({
-        tabId: curve.tabId, ssrc: curve.ssrc, spectrum_dbfs: curve.spectrum_dbfs,
+        tabId: curve.tabId,
+        ssrc: curve.ssrc,
+        analysis_sample_rate_hz: curve.analysis_sample_rate_hz,
+        spectrum_dbfs: curve.spectrum_dbfs,
+        gain_db: curve.spectrum_dbfs.map(value => value - SOURCE_PEAK_DBFS),
+        standard_deviation_db: curve.mean_dbfs.map((_, index) =>
+          curve.samples_per_band[index] > 1
+            ? Math.sqrt(curve.m2_db[index] / (curve.samples_per_band[index] - 1)) : null),
+        samples_per_band: curve.samples_per_band,
+        frequency_hz: sweepFrequencies(),
+        covered_bins: curve.covered_bins,
+        peak_frequency_hz: curve.mean_peak_frequency_hz.map((mean, index) =>
+          curve.samples_per_band[index] > 0 ? mean : null),
+        peak_frequency_error_percent: curve.mean_peak_frequency_hz.map((mean, index) =>
+          curve.samples_per_band[index] > 0
+            ? (mean / sweepFrequencies()[index] - 1) * 100 : null),
       })),
     });
     return;
@@ -519,6 +720,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   sendResponse({ ok: false, error: "Unknown request." });
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Hydrate a saved result before any event can clear it or report that no export
+  // exists. MV3 workers are routinely restarted while their extension stays enabled.
+  restoreCompletedExport
+    .then(() => handleMessage(message, sender, sendResponse))
+    .catch(error => {
+      diagnostics.storageError = String(error?.message ?? error).slice(0, 180);
+      handleMessage(message, sender, sendResponse);
+    });
+  return true;
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {

@@ -1,4 +1,5 @@
 const byId = id => document.getElementById(id);
+const MIN_BIN_SAMPLES = 2;
 const colors = { grid: "#3b3e46", text: "#969aa4", line: "#5ce0ae", warn: "#f2c46d" };
 
 function showPopupError(error) {
@@ -83,17 +84,21 @@ function render(status, localSpectrum, diagnostics, bridgeError = "") {
   captureCurve.disabled = true;
   const audio = Array.isArray(report?.streams) ? report.streams : [];
   const match = audio.find(stream => stream.ssrc != null && stream.ssrc === sender?.audio_ssrc);
-  const measuredMatch = localSpectrum?.streams?.find(stream => stream.ssrc === sender?.audio_ssrc);
-  const curve = localSpectrum?.curves?.find(stream =>
+  const liveCurve = localSpectrum?.curves?.find(stream =>
     stream.tabId === localSpectrum?.report?.tabId && stream.ssrc === sender?.audio_ssrc);
-  const curveValues = curve?.spectrum_dbfs ?? measuredMatch?.spectrum_dbfs;
-  const curveSummary = summarizeCurve(curveValues);
-  drawSpectrum(curveValues);
+  const savedCurve = diagnostics?.sweep_curve?.ssrc === sender?.audio_ssrc
+    ? diagnostics.sweep_curve : null;
+  const curve = liveCurve ?? savedCurve;
+  const curveValues = curve?.spectrum_dbfs;
+  const curveSummary = summarizeCurve(curve);
+  const measuredBins = curve?.measured_bins ?? curve?.covered_bins?.filter(Boolean).length ?? 0;
+  drawSpectrum(curve);
+  byId("save-graph").disabled = !curve || measuredBins < 48;
   captureCurve.disabled = !(sender?.test_sweep_active && sender?.send_enabled && match);
   captureCurve.textContent = localSpectrum?.curve_capture_active
     ? "Stop curve capture" : "Capture sweep curve";
-  byId("curve-note").textContent = curve
-    ? `Sweep response captured · ${curveValues.length} matched bands · ${curveSummary.peak_to_peak_db.toFixed(2)} dB peak-to-peak · ±${curveSummary.peak_deviation_db.toFixed(2)} dB from median.`
+  byId("curve-note").textContent = curve && curveSummary
+    ? `Sweep response measured · ${measuredBins}/48 bands have repeated signal measurements · ${curveSummary.peak_to_peak_db.toFixed(2)} dB peak-to-peak relative to median · two sweep passes.`
     : sender?.test_sweep_active && sender?.send_enabled && match
       ? localSpectrum?.curve_capture_active
         ? "Exact sender SSRC matched · capturing the log-frequency response automatically."
@@ -190,13 +195,15 @@ function renderTest(diagnostics) {
   const senderLabel = Number.isInteger(run.sender_ssrc)
     ? `· sender SSRC ${run.sender_ssrc}` : "· waiting for sender match";
   text(byId("test-status"), active
-    ? `${run.automatic ? "AUTO-CAPTURING" : "CAPTURING"} · ${elapsed.toFixed(0)} s · ${run.sample_count} samples ${senderLabel} · stops after a full sweep pass.`
-    : diagnostics?.auto_capture_waiting
-      ? "AUTO-ARMED · synthetic sweep detected; waiting for the exact sender SSRC in browser RTP stats. It will capture and stop automatically."
+    ? `${run.automatic ? "AUTO-CAPTURING" : "CAPTURING"} · ${elapsed.toFixed(0)} s · ${run.sample_count} samples ${senderLabel} · two sweep passes, then automatic report.`
+      : diagnostics?.auto_capture_waiting
+        ? "AUTO-ARMED · synthetic sweep detected; waiting for the exact sender SSRC in browser RTP stats. It will capture and stop automatically."
+      : diagnostics?.sender_status_error
+        ? `AUTO-CAPTURE PAUSED · cannot read current AscendCord sender status: ${diagnostics.sender_status_error}`
       : summary && summary.matched_samples === 0
         ? `CAPTURED · ${run.sample_count} samples, but none matched an AscendCord sender SSRC. Receiver metrics are omitted as unverified.`
       : run.sample_count > 0
-        ? `CAPTURED · ${elapsed.toFixed(0)} s · ${run.sample_count} samples · JSON report prepared automatically · run ${run.id}`
+        ? completedTestStatus(diagnostics, run, elapsed)
       : "Waiting for an AscendCord synthetic sweep; capture and JSON preparation start automatically.");
 
   const metrics = byId("test-summary");
@@ -223,6 +230,22 @@ function renderTest(diagnostics) {
     metrics.append(card);
   }
   drawTimeline(diagnostics?.test_samples ?? []);
+}
+
+function completedTestStatus(diagnostics, run, elapsed) {
+  if (diagnostics?.storage_error) {
+    return `CAPTURED · ${elapsed.toFixed(0)} s · ${run.sample_count} samples · report ready in memory, but local persistence failed: ${diagnostics.storage_error}`;
+  }
+  const validation = diagnostics?.pipeline_validation;
+  if (!validation) {
+    return `CAPTURED · ${elapsed.toFixed(0)} s · ${run.sample_count} samples · JSON report prepared automatically · run ${run.id} · pipeline validation unavailable.`;
+  }
+  const failed = Object.entries(validation.checks ?? {})
+    .filter(([, passed]) => passed !== true)
+    .map(([check]) => check.replaceAll("_", " "));
+  return validation.passed
+    ? `AUTO-COMPLETE · verified ${validation.measured_bands}/48 curve bands and stereo receive · ${elapsed.toFixed(0)} s · ${diagnostics.auto_export_saved ? "report persisted in extension storage" : "JSON report prepared"} · run ${run.id}.`
+    : `AUTO-COMPLETE · report saved, but pipeline did not verify: ${failed.join(", ") || "unknown check"}. ${validation.measured_bands}/48 curve bands measured.`;
 }
 
 function drawTimeline(samples) {
@@ -264,61 +287,138 @@ function drawTimeline(samples) {
   ctx.textAlign = "right"; ctx.fillText("newest", right, height - 12);
 }
 
-function drawSpectrum(values) {
+function drawSpectrum(curve) {
   const canvas = byId("spectrum");
   const ctx = canvas.getContext("2d");
   const width = canvas.width, height = canvas.height;
-  const left = 42, right = width - 8, top = 10, bottom = height - 27;
+  const left = 190, right = width - 34;
+  const upper = { top: 118, bottom: 565 };
+  const lower = { top: 760, bottom: 1094 };
   ctx.clearRect(0, 0, width, height);
-  ctx.font = "11px Segoe UI, sans-serif";
-  ctx.textBaseline = "middle"; ctx.textAlign = "right";
-  const summary = summarizeCurve(values);
-  const bound = summary ? Math.max(0.5, Math.ceil(summary.peak_deviation_db * 2) / 2) : 1;
-  for (let line = 0; line <= 4; line++) {
-    const deviation = bound - line * bound / 2;
-    const y = top + line * (bottom - top) / 4;
-    ctx.strokeStyle = colors.grid; ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(right, y); ctx.stroke();
-    ctx.fillStyle = colors.text; ctx.fillText(`${deviation > 0 ? "+" : ""}${deviation.toFixed(1)} dB`, left - 5, y);
-  }
-  ctx.textAlign = "center";
-  for (const [hz, label] of [[20, "20"], [100, "100"], [1000, "1k"], [10000, "10k"], [20000, "20k Hz"]]) {
-    const x = left + Math.log(hz / 20) / Math.log(1000) * (right - left);
-    ctx.strokeStyle = "#30333a"; ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, bottom); ctx.stroke();
-    ctx.fillStyle = colors.text; ctx.fillText(label, x, height - 12);
-  }
-  if (!Array.isArray(values) || values.length !== 48) {
+  ctx.fillStyle = "#202226"; ctx.fillRect(0, 0, width, height);
+  ctx.font = "24px Segoe UI, sans-serif";
+  ctx.textBaseline = "middle"; ctx.textAlign = "left";
+  ctx.fillStyle = "#e1e4eb";
+  ctx.fillText("AscendCord synthetic sweep · Discord decoded receive", left, 40);
+  if (!curve || !Array.isArray(curve.spectrum_dbfs) || curve.spectrum_dbfs.length !== 48) {
     ctx.fillStyle = "#a8abb4"; ctx.textAlign = "center";
-    ctx.fillText("Waiting for exact matched sender spectrum", width / 2, height / 2);
+    ctx.fillText("Waiting for automatic, SSRC-matched sweep measurements", width / 2, height / 2);
     return;
   }
-  const relative = summary.relative_db;
-  ctx.strokeStyle = colors.line; ctx.lineWidth = 2; ctx.beginPath();
-  relative.forEach((db, index) => {
-    const x = left + index / (relative.length - 1) * (right - left);
-    const y = top + (bound - Math.max(-bound, Math.min(bound, db))) / (2 * bound) * (bottom - top);
-    index ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-  });
-  ctx.stroke();
-  ctx.strokeStyle = "#727782"; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
-  const centerY = top + (bottom - top) / 2;
-  ctx.beginPath(); ctx.moveTo(left, centerY); ctx.lineTo(right, centerY); ctx.stroke(); ctx.setLineDash([]);
+
+  const values = curve.spectrum_dbfs;
+  const gain = curve.gain_db ?? values.map(value => value + 12.041199826559248);
+  const counts = curve.samples_per_band ?? values.map((_, index) =>
+    curve.covered_bins?.[index] ? MIN_BIN_SAMPLES : 0);
+  const deviations = curve.standard_deviation_db ?? values.map(() => 0);
+  const summary = summarizeCurve(curve);
+  const usable = values.map((value, index) => ({ value, index }))
+    .filter(point => counts[point.index] > 0 && Number.isFinite(point.value) && point.value > -120);
+  if (!summary || usable.length === 0) {
+    ctx.fillStyle = "#a8abb4"; ctx.textAlign = "center";
+    ctx.fillText("No valid signal bands measured yet", width / 2, height / 2);
+    return;
+  }
+
+  const frequencies = curve.frequency_hz ?? Array.from({ length: 48 }, (_, index) =>
+    20 * 1000 ** (index / 47));
+  const x = index => left + Math.log(frequencies[index] / 20) / Math.log(1000) * (right - left);
+  const xTicks = [[20, "20 Hz"], [50, "50"], [100, "100"], [200, "200"],
+    [500, "500"], [1000, "1 kHz"], [2000, "2 kHz"], [5000, "5 kHz"],
+    [10000, "10 kHz"], [20000, "20 kHz"]];
+
+  const drawPanel = ({ area, title, low, high, valuesForPoint, errorForPoint, unit, zero = false }) => {
+    ctx.textAlign = "left"; ctx.fillStyle = "#e1e4eb";
+    ctx.font = "26px Segoe UI, sans-serif"; ctx.fillText(title, left, area.top - 54);
+    ctx.font = "21px Segoe UI, sans-serif"; ctx.textAlign = "right";
+    for (let line = 0; line <= 4; line++) {
+      const value = high - line * (high - low) / 4;
+      const yy = area.top + line * (area.bottom - area.top) / 4;
+      ctx.strokeStyle = colors.grid; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(left, yy); ctx.lineTo(right, yy); ctx.stroke();
+      ctx.fillStyle = colors.text; ctx.fillText(`${value.toFixed(1)} ${unit}`, left - 16, yy);
+    }
+    for (const [hz, label] of xTicks) {
+      const xx = left + Math.log(hz / 20) / Math.log(1000) * (right - left);
+      ctx.strokeStyle = "#30333a"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(xx, area.top); ctx.lineTo(xx, area.bottom); ctx.stroke();
+      if (area === lower) {
+        ctx.textAlign = "center"; ctx.fillStyle = colors.text;
+        ctx.fillText(label, xx, area.bottom + 30);
+      }
+    }
+    if (zero) {
+      const yy = area.top + (high / (high - low)) * (area.bottom - area.top);
+      ctx.strokeStyle = "#8b909a"; ctx.setLineDash([8, 8]);
+      ctx.beginPath(); ctx.moveTo(left, yy); ctx.lineTo(right, yy); ctx.stroke(); ctx.setLineDash([]);
+    }
+    const mapY = value => area.top + (high - Math.max(low, Math.min(high, value))) /
+      (high - low) * (area.bottom - area.top);
+    ctx.strokeStyle = colors.line; ctx.fillStyle = colors.line; ctx.lineWidth = 5;
+    ctx.beginPath(); let started = false;
+    values.forEach((_, index) => {
+      const value = valuesForPoint(index);
+      if (counts[index] <= 0 || !Number.isFinite(value)) { started = false; return; }
+      const xx = x(index), yy = mapY(value);
+      if (started) ctx.lineTo(xx, yy); else ctx.moveTo(xx, yy);
+      started = true;
+    });
+    ctx.stroke();
+    values.forEach((_, index) => {
+      const value = valuesForPoint(index);
+      if (counts[index] <= 0 || !Number.isFinite(value)) return;
+      const xx = x(index), sd = Number.isFinite(errorForPoint(index)) ? errorForPoint(index) : 0;
+      const y1 = mapY(value - sd), y2 = mapY(value + sd);
+      ctx.strokeStyle = colors.line; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(xx, y1); ctx.lineTo(xx, y2);
+      ctx.moveTo(xx - 8, y1); ctx.lineTo(xx + 8, y1);
+      ctx.moveTo(xx - 8, y2); ctx.lineTo(xx + 8, y2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(xx, mapY(value), 6, 0, Math.PI * 2); ctx.fill();
+    });
+  };
+
+  const minAbsolute = Math.min(...usable.map(({ index }) =>
+    gain[index] - (Number.isFinite(deviations[index]) ? deviations[index] : 0)));
+  const maxAbsolute = Math.max(...usable.map(({ index }) =>
+    gain[index] + (Number.isFinite(deviations[index]) ? deviations[index] : 0)));
+  const absoluteLow = Math.max(-120, Math.floor((minAbsolute - 2) / 2) * 2);
+  const absoluteHigh = Math.min(12, Math.ceil((maxAbsolute + 2) / 2) * 2);
+  const relativeBound = Math.max(0.5, Math.ceil(Math.max(...summary.relative_db
+    .filter(Number.isFinite).map(Math.abs)) * 2) / 2);
+  drawPanel({ area: upper, title: "Measured pipeline gain · dB · error bars ±1 SD across passes",
+    low: absoluteLow, high: absoluteHigh, valuesForPoint: index => gain[index],
+    errorForPoint: index => deviations[index], unit: "dB" });
+  drawPanel({ area: lower, title: "Frequency response relative to measured median · dB",
+    low: -relativeBound, high: relativeBound,
+    valuesForPoint: index => summary.relative_db[index],
+    errorForPoint: index => deviations[index], unit: "dB", zero: true });
+  ctx.textAlign = "left"; ctx.font = "20px Segoe UI, sans-serif"; ctx.fillStyle = colors.text;
+  const analysisRate = Number.isFinite(curve.analysis_sample_rate_hz)
+    ? `${(curve.analysis_sample_rate_hz / 1000).toFixed(1)} kHz analyser` : "analyser rate unknown";
+  ctx.fillText(`Input tone −12.04 dBFS peak · median received ${summary.median_dbfs.toFixed(2)} dBFS · ${analysisRate} · ${summary.measured_bins}/48 bands · ${summary.total_samples} pass samples`, left, height - 14);
 }
 
-function summarizeCurve(values) {
+function summarizeCurve(curve) {
+  const values = curve?.spectrum_dbfs;
   if (!Array.isArray(values) || values.length !== 48 ||
       !values.every(value => Number.isFinite(value) && value >= -120 && value <= 12)) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const median_dbfs = (sorted[23] + sorted[24]) / 2;
-  const relative_db = values.map(value => value - median_dbfs);
-  const minimum_dbfs = Math.min(...values);
-  const maximum_dbfs = Math.max(...values);
+  const counts = curve.samples_per_band ?? values.map((_, index) =>
+    curve.covered_bins?.[index] ? MIN_BIN_SAMPLES : 0);
+  const usable = values.filter((value, index) => counts[index] > 0 && value > -120);
+  if (usable.length === 0) return null;
+  const sorted = [...usable].sort((a, b) => a - b);
+  const median_dbfs = sorted.length % 2
+    ? sorted[(sorted.length - 1) / 2]
+    : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2;
+  const relative_db = values.map((value, index) =>
+    counts[index] > 0 && value > -120 ? value - median_dbfs : null);
   return {
     median_dbfs,
-    minimum_dbfs,
-    maximum_dbfs,
-    peak_to_peak_db: maximum_dbfs - minimum_dbfs,
-    peak_deviation_db: Math.max(...relative_db.map(Math.abs)),
+    peak_to_peak_db: Math.max(...usable) - Math.min(...usable),
+    peak_deviation_db: Math.max(...relative_db.filter(Number.isFinite).map(Math.abs)),
     relative_db,
+    measured_bins: usable.length,
+    total_samples: counts.reduce((sum, count) => sum + count, 0),
   };
 }
 
@@ -364,6 +464,18 @@ byId("export-test").addEventListener("click", async () => {
   link.href = url; link.download = `ascendcord-receiver-test-${Date.now()}.json`;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+byId("save-graph").addEventListener("click", () => {
+  const canvas = byId("spectrum");
+  canvas.toBlob(blob => {
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `ascendcord-measured-response-${Date.now()}.png`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, "image/png");
 });
 byId("capture-curve").addEventListener("click", async () => {
   const local = await safeSend({ kind: "tesktop-read-local-spectrum" });

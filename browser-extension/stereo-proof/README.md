@@ -29,20 +29,24 @@ and jitter-buffer delay. They cannot prove the physical speakers are audible or 
 possible output filter. No media samples or identities are sent to AscendCord.
 
 The popup includes a four-stage injection/forwarding diagnosis, live sender and receiver
-summaries, and a receiver-test dashboard. It auto-arms a capture when the synthetic sweep is
-enabled, starts when the exact sender SSRC appears in browser RTP stats, and captures one full
-48-band sweep pass (33.6 seconds plus a short margin). It then stops and prepares the JSON report
-automatically. The controls collect loss, jitter, concealment, discarded packets, bitrate, decoded levels,
-and exact-SSRC matches into a bounded timeline. The timeline can be exported as a local JSON file.
-It contains numeric WebRTC diagnostics only; no audio samples, Discord messages, tokens, or account
-names are collected or exported. To compare
-the response curve, the popup also graphs a live, logarithmic 20 Hz–20 kHz spectrum from the exact
-matched receiver. The graph updates while the popup is open and holds only 48 numeric spectrum
-bins in extension memory. To capture a response curve, set
+summaries, and an unattended receiver-test dashboard. It starts when the exact sender SSRC appears
+in browser RTP stats, captures two full 48-band sweep passes, and then stops and prepares the JSON
+report automatically. It collects loss, jitter, concealment, discarded packets, bitrate, decoded
+levels, and exact-SSRC matches into a bounded timeline. The completed numeric report persists in
+extension-local storage across service-worker restarts. It can also be exported as JSON; no audio
+samples, Discord messages, tokens, or account names are collected or exported. The full FFT
+identifies the received tone; a sine fit to decoded time-domain PCM estimates its peak amplitude.
+Mixed-tone transition windows are rejected. The graph plots pipeline gain relative to the known
+−12.04 dBFS peak input. One valid sample per band per sweep pass is averaged in linear power, and
+error bars show standard deviation across independent passes. The second panel shows gain relative
+to the measured median across 20 Hz–20 kHz. To capture a response
+curve, set
 `ASCENDCORD_TEST_SWEEP=1` in the AscendCord process environment before launching it, and join the
 controlled test call. The extension captures the matched response curve automatically; keep
-Discord joined until the capture completes. The diagnostic
-replaces live microphone content with a 20 Hz–20 kHz equal-level stepped sine sweep at −12 dBFS.
+Discord joined until the two-pass capture completes. The diagnostic replaces live microphone
+content with a 20 Hz–20 kHz equal-level stepped sine sweep at −12.04 dBFS peak. The popup can save the
+actual graph canvas as a 2400×1200 PNG; it is rendered from the numeric capture, not generated
+imagery.
 The resulting curve measures the known 48 kHz test signal from the encoder input, through Opus,
 Discord transport and the browser decoder. It does not include the physical microphone, Windows
 capture driver, or native-rate resampling, and it cannot prove speaker acoustics. Ordinary voice
@@ -56,15 +60,15 @@ separately measures native-rate sample conversion at the source code's resampler
 3. Select this `stereo-proof` folder. Keep the extension enabled.
 4. Keep AscendCord open and join the same voice call from the browser alt account.
 5. Keep the Discord browser call joined. The extension automatically starts receiver capture
-   when the browser sees the active AscendCord synthetic sweep, stops after one full sweep pass,
-   and prepares a numeric JSON report in extension memory. Open the popup to review it; downloading
-   the prepared JSON file is optional.
+   when the browser sees the active AscendCord synthetic sweep, stops after two sweep passes,
+   and prepares and persists a numeric JSON report. Open the popup to review it, save the measured
+   graph as PNG, or export the JSON report.
 
 After editing an unpacked install, use the extension card's **Reload** button and reload the
-Discord tab. The manifest version for this diagnostic dashboard is 0.3.1.
+Discord tab. The manifest version for this diagnostic dashboard is 0.3.2.
 
 The desktop listener is bound only to IPv4 loopback, requires this extension's fixed origin, rejects
 large or unknown report fields, and keeps the latest report in memory for five seconds. The health
 endpoint accepts only bounded stage labels, counters, and error text. Receiver-test history and
-the automatically prepared report stay inside extension memory until the user resets the test;
+the automatically prepared report stay in extension-local storage until the user resets the test;
 no audio is recorded or sent.

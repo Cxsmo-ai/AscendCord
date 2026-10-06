@@ -3,6 +3,30 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 
+test("calibrates peak sine amplitude and rejects mixed-tone windows", async () => {
+  const source = await readFile(new URL("../rtc-observer.js", import.meta.url), "utf8");
+  const start = source.indexOf("function fitSinePeak(");
+  const end = source.indexOf("\n(() => {", start);
+  assert.ok(start >= 0 && end > start, "the observer exposes its pure analysis function to this test");
+  const analysisContext = vm.createContext({});
+  vm.runInContext(`${source.slice(start, end)}\nglobalThis.fitSinePeak = fitSinePeak;`, analysisContext);
+  const { fitSinePeak } = analysisContext;
+  const sampleRate = 48_000;
+  const length = 16_384;
+  const pureTone = Float32Array.from({ length }, (_, index) =>
+    0.25 * Math.sin(2 * Math.PI * 1_000 * index / sampleRate + 0.7));
+  const fit = fitSinePeak(pureTone, 1_000, sampleRate);
+  assert.ok(Math.abs(fit.amplitude - 0.25) < 1e-5);
+  assert.ok(Math.abs(20 * Math.log10(fit.amplitude) - 20 * Math.log10(0.25)) < 0.001);
+  assert.ok(fit.explained > 0.999);
+
+  const transition = Float32Array.from({ length }, (_, index) =>
+    0.125 * (Math.sin(2 * Math.PI * 1_000 * index / sampleRate) +
+      Math.sin(2 * Math.PI * 1_300 * index / sampleRate)));
+  const mixedFit = fitSinePeak(transition, 1_000, sampleRate);
+  assert.ok(mixedFit.explained < 0.8, "a band transition should fail the fit-quality gate");
+});
+
 test("auto-starts a matched sweep capture without a popup button press", async () => {
   const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
   let onMessage;
@@ -40,9 +64,12 @@ test("auto-starts a matched sweep capture without a popup button press", async (
   vm.runInNewContext(source, context);
 
   const spectrum = Array.from({ length: 48 }, (_, index) => -90 + index);
+  const peakFrequency = 20_000;
   const report = {
     protocol: 1, sampled_at_ms: now, peer_connections: 1,
-    streams: [{ ssrc: 77, codec: "audio/opus", spectrum_dbfs: spectrum }],
+    streams: [{ ssrc: 77, codec: "audio/opus", channels: 2, track_channels: 2,
+      sdp_fmtp_stereo: true, active: true, spectrum_dbfs: spectrum,
+      peak_frequency_hz: peakFrequency, peak_dbfs: -18, analysis_sample_rate_hz: 48_000 }],
   };
   const sender = { tab: { id: 5, url: "https://discord.com/channels/1/2" } };
   const send = message => new Promise(resolve => {
@@ -52,7 +79,7 @@ test("auto-starts a matched sweep capture without a popup button press", async (
 
   const heartbeat = await send({ kind: "tesktop-content-bridge-heartbeat" });
   assert.equal(heartbeat.ok, true);
-  await new Promise(resolve => setTimeout(resolve, 0));
+  await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(healthForwarded.content_bridge, true);
   assert.equal(healthForwarded.observer_state, "not-seen");
   let diagnostics = await send({ kind: "tesktop-read-diagnostics" });
@@ -61,7 +88,7 @@ test("auto-starts a matched sweep capture without a popup button press", async (
   now += 1_100;
 
   await send({ kind: "tesktop-receiver-report", report });
-  await new Promise(resolve => setTimeout(resolve, 0));
+  await new Promise(resolve => setTimeout(resolve, 10));
   diagnostics = await send({ kind: "tesktop-read-diagnostics" });
   assert.equal(diagnostics.observerReportAt, now);
   assert.equal(diagnostics.inboundStreams, 1);
@@ -70,9 +97,14 @@ test("auto-starts a matched sweep capture without a popup button press", async (
   assert.equal(diagnostics.test.automatic, true);
   assert.equal(diagnostics.test.sender_ssrc, 77);
   assert.equal(diagnostics.test_summary.matched_samples, 1);
-  await new Promise(resolve => setTimeout(resolve, 0));
+  await new Promise(resolve => setTimeout(resolve, 1_050));
   assert.equal(healthForwarded.inbound_streams, 1);
   assert.equal(healthForwarded.peer_connections, 1);
+  assert.equal(healthForwarded.sweep_test.running, true,
+    "the post-capture diagnostic must include the automatically started test");
+  assert.equal(healthForwarded.sweep_test.automatic, true);
+  assert.equal("gain_db" in (healthForwarded.sweep_curve ?? {}), false,
+    "the desktop endpoint keeps its strict schema; richer curve fields remain local");
   const testData = await send({ kind: "tesktop-read-test-data" });
   assert.equal(testData.test.samples[0].ssrc, 77);
   assert.equal(testData.test.samples[0].sender_match, true);
@@ -85,14 +117,16 @@ test("auto-starts a matched sweep capture without a popup button press", async (
   assert.equal(captureControl.active, true);
   now += 2_000;
   const next = { ...report, sampled_at_ms: now, streams: [{
-    ssrc: 77, codec: "audio/opus", spectrum_dbfs: spectrum.map(value => value + 1),
+    ...report.streams[0], ssrc: 77, codec: "audio/opus",
+    spectrum_dbfs: spectrum.map(value => value + 1), peak_dbfs: -17, analysis_sample_rate_hz: 48_000,
   }] };
   await send({ kind: "tesktop-receiver-report", report: next });
   local = await send({ kind: "tesktop-read-local-spectrum" });
   assert.equal(local.curve_capture_active, true);
   assert.equal(local.curves[0].ssrc, 77);
   assert.equal(local.curves[0].tabId, 5);
-  assert.equal(local.curves[0].spectrum_dbfs[0], spectrum[0] + 1);
+  assert.equal(local.curves[0].spectrum_dbfs[47], -17);
+  assert.equal(local.curves[0].samples_per_band[47], 1);
   senderSweep = false;
   await send({ kind: "tesktop-read-status" });
   diagnostics = await send({ kind: "tesktop-read-diagnostics" });
@@ -173,7 +207,7 @@ test("manual capture binds a sender that appears after capture starts and exclud
   assert.equal(data.test.samples[1].sender_match, true);
 });
 
-test("automatically stops after a full sweep pass and prepares the JSON report", async () => {
+test("automatically captures two full sweeps and prepares a measured response report", async () => {
   const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
   let onMessage;
   let now = 30_000;
@@ -203,33 +237,114 @@ test("automatically stops after a full sweep pass and prepares the JSON report",
     const result = onMessage(message, sender, resolve);
     if (result !== true) resolve(undefined);
   });
-  const report = { protocol: 1, sampled_at_ms: now, peer_connections: 1, streams: [
-    { ssrc: 99, codec: "audio/opus", loss_percent: 0, spectrum_dbfs: Array(48).fill(-18) },
-  ] };
+  const startAt = now;
+  const expectedFrequency = index => 20 * 1000 ** (index / 47);
+  const reportAt = sampleAt => {
+    const elapsed = sampleAt - startAt;
+    const band = Math.floor(elapsed / 700) % 48;
+    const pass = Math.floor(elapsed / (48 * 700));
+    return { protocol: 1, sampled_at_ms: sampleAt, peer_connections: 1, streams: [{
+      ssrc: 99, codec: "audio/opus", channels: 2, track_channels: 2,
+      sdp_fmtp_stereo: true, active: true, loss_percent: 0,
+      spectrum_dbfs: Array(48).fill(-100),
+      peak_frequency_hz: expectedFrequency(band), peak_dbfs: -18 + pass * 0.5,
+      analysis_sample_rate_hz: 48_000,
+    }] };
+  };
 
-  await send({ kind: "tesktop-receiver-report", report });
+  await send({ kind: "tesktop-receiver-report", report: reportAt(now) });
   await new Promise(resolve => setTimeout(resolve, 0));
   let diagnostics = await send({ kind: "tesktop-read-diagnostics" });
   assert.equal(diagnostics.test.running, true);
   assert.equal(diagnostics.curve_capture_active, true);
 
-  now += 39_999;
-  await send({ kind: "tesktop-receiver-report", report: { ...report, sampled_at_ms: now } });
-  await new Promise(resolve => setTimeout(resolve, 0));
-  diagnostics = await send({ kind: "tesktop-read-diagnostics" });
-  assert.equal(diagnostics.test.running, true);
-
-  now += 1;
-  await send({ kind: "tesktop-receiver-report", report: { ...report, sampled_at_ms: now } });
-  await new Promise(resolve => setTimeout(resolve, 0));
+  for (let elapsed = 250; elapsed <= 72_000; elapsed += 250) {
+    now = startAt + elapsed;
+    await send({ kind: "tesktop-receiver-report", report: reportAt(now) });
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
   diagnostics = await send({ kind: "tesktop-read-diagnostics" });
   assert.equal(diagnostics.test.running, false);
   assert.equal(diagnostics.auto_export_ready, true);
   assert.equal(diagnostics.curve_capture_active, false);
   const exported = await send({ kind: "tesktop-read-test-data" });
-  assert.equal(exported.export.test.samples.length, 3);
+  assert.ok(exported.export.test.samples.length > 100);
   assert.equal(exported.export.test.samples.every(sample => sample.sender_match), true);
   assert.equal(exported.export.diagnostics.sweep_curve.ssrc, 99);
   assert.equal(exported.export.diagnostics.sweep_curve.spectrum_dbfs.length, 48);
-  assert.equal(exported.export.diagnostics.sweep_curve.peak_to_peak_db, 0);
+  assert.equal(exported.export.diagnostics.sweep_curve.samples_per_band.length, 48);
+  assert.ok(exported.export.diagnostics.sweep_curve.samples_per_band.every(count => count >= 2));
+  assert.equal(exported.export.diagnostics.sweep_curve.measured_bins, 48);
+  assert.equal(exported.export.diagnostics.sweep_curve.coverage_complete, true);
+  assert.equal(exported.export.diagnostics.pipeline_validation.passed, true);
+  assert.equal(exported.export.diagnostics.sweep_curve.peak_frequency_hz.length, 48);
+});
+
+test("automatically persists a completed proof so an MV3 worker restart keeps the report", async () => {
+  const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
+  let onMessage;
+  let now = 40_000;
+  let savedExport = null;
+  const storage = {
+    async get() { return savedExport ? { tesktopCompletedSweepExport: savedExport } : {}; },
+    async set(value) { savedExport = value.tesktopCompletedSweepExport; },
+    async remove() { savedExport = null; },
+  };
+  const sender = { tab: { id: 8, url: "https://discord.com/channels/1/2" } };
+  const report = () => ({
+    protocol: 1, sampled_at_ms: now, peer_connections: 1,
+    streams: [{
+      ssrc: 101, codec: "audio/opus", channels: 2, track_channels: 2,
+      sdp_fmtp_stereo: true, active: true, loss_percent: 0, jitter_ms: 1,
+      spectrum_dbfs: Array(48).fill(-18),
+      peak_frequency_hz: 20 * 1000 ** (Math.floor((now - 40_000) / 700) % 48 / 47),
+      peak_dbfs: -18, analysis_sample_rate_hz: 48_000,
+    }],
+  });
+
+  const createWorker = () => {
+    const chrome = {
+      storage: { local: storage },
+      runtime: { onMessage: { addListener(listener) { onMessage = listener; } } },
+      tabs: {
+        onRemoved: { addListener() {} },
+        sendMessage: async () => ({}),
+      },
+    };
+    vm.runInNewContext(source, {
+      chrome, URL,
+      Date: class extends Date { static now() { return now; } },
+      AbortController, setTimeout, clearTimeout,
+      fetch: async url => url.endsWith("/v1/status")
+        ? { ok: true, status: 200, json: async () => ({ sender: {
+          audio_ssrc: 101, test_sweep_active: true, send_enabled: true,
+        } }) }
+        : { ok: true, status: 204 },
+    });
+    return message => new Promise(resolve => {
+      onMessage(message, sender, resolve);
+    });
+  };
+  const waitForWork = () => new Promise(resolve => setTimeout(resolve, 5));
+
+  const firstWorker = createWorker();
+  await firstWorker({ kind: "tesktop-receiver-report", report: report() });
+  await waitForWork();
+  for (let elapsed = 250; elapsed <= 72_000; elapsed += 250) {
+    now = 40_000 + elapsed;
+    await firstWorker({ kind: "tesktop-receiver-report", report: report() });
+    if (elapsed % 1_000 === 0) await waitForWork();
+  }
+  const beforeRestart = await firstWorker({ kind: "tesktop-read-test-data" });
+  assert.equal(beforeRestart.export.diagnostics.pipeline_validation.passed, true);
+  assert.ok(savedExport, "the completed JSON is written to extension local storage");
+
+  const restartedWorker = createWorker();
+  const afterRestart = await restartedWorker({ kind: "tesktop-read-test-data" });
+  const diagnostics = await restartedWorker({ kind: "tesktop-read-diagnostics" });
+  assert.equal(afterRestart.export.test.id, beforeRestart.export.test.id);
+  assert.ok(afterRestart.export.test.samples.length > 100);
+  assert.equal(diagnostics.auto_export_ready, true);
+  assert.equal(diagnostics.auto_export_saved, true);
+  assert.equal(diagnostics.pipeline_validation.passed, true);
 });

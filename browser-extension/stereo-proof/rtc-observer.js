@@ -1,3 +1,26 @@
+function fitSinePeak(samples, frequencyHz, sampleRate) {
+  const mean = samples.reduce((sum, value) => sum + value, 0) / samples.length;
+  let cc = 0, ss = 0, cs = 0, yc = 0, ys = 0, total = 0;
+  const phaseStep = Math.PI * 2 * frequencyHz / sampleRate;
+  const stepCos = Math.cos(phaseStep), stepSin = Math.sin(phaseStep);
+  let c = 1, s = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const value = samples[i] - mean;
+    cc += c * c; ss += s * s; cs += c * s;
+    yc += value * c; ys += value * s; total += value * value;
+    const nextC = c * stepCos - s * stepSin;
+    s = s * stepCos + c * stepSin;
+    c = nextC;
+  }
+  const determinant = cc * ss - cs * cs;
+  if (determinant <= 0 || total <= 0) return null;
+  const a = (yc * ss - ys * cs) / determinant;
+  const b = (ys * cc - yc * cs) / determinant;
+  const amplitude = Math.hypot(a, b);
+  const explained = Math.max(0, Math.min(1, (a * yc + b * ys) / total));
+  return { amplitude, explained };
+}
+
 (() => {
   "use strict";
 
@@ -55,9 +78,13 @@
   function context() {
     if (!audioContext) {
       try {
-        audioContext = new AudioContext({ latencyHint: "playback" });
+        audioContext = new AudioContext({ latencyHint: "playback", sampleRate: 48_000 });
       } catch {
-        return null;
+        try {
+          audioContext = new AudioContext({ latencyHint: "playback" });
+        } catch {
+          return null;
+        }
       }
     }
     if (audioContext.state === "suspended") audioContext.resume().catch(() => {});
@@ -77,6 +104,9 @@
       const left = ctx.createAnalyser();
       const right = ctx.createAnalyser();
       left.fftSize = right.fftSize = 16384;
+      // Keep each capture independent so a band transition does not smear into
+      // the next measurement window.
+      left.smoothingTimeConstant = right.smoothingTimeConstant = 0;
       left.minDecibels = right.minDecibels = -120;
       left.maxDecibels = right.maxDecibels = 12;
       source.connect(splitter);
@@ -128,12 +158,52 @@
       const power = (10 ** (leftDb / 10) + 10 ** (rightDb / 10)) / 2;
       spectrumDbfs.push(Math.max(-120, Math.min(12, 10 * Math.log10(power))));
     }
+    // Identify the received sine using every FFT bin instead of assigning the
+    // loudest of 48 sparse display probes to a sweep band.
+    let peakBin = 1;
+    let peakPower = 0;
+    for (let bin = 1; bin < entry.leftSpectrum.length; bin++) {
+      const power = (10 ** (entry.leftSpectrum[bin] / 10) +
+        10 ** (entry.rightSpectrum[bin] / 10)) / 2;
+      if (power > peakPower) {
+        peakPower = power;
+        peakBin = bin;
+      }
+    }
+    // Refine the FFT peak between bins before assigning it to a known sweep
+    // tone. The analyser spectrum is windowed (Blackman), so its displayed
+    // magnitude is not an absolute dBFS amplitude measurement. Estimate the
+    // sine's peak amplitude directly from the time-domain PCM instead.
+    const bin = entry.leftSpectrum;
+    const leftDb = bin[Math.max(1, peakBin - 1)];
+    const centerDb = bin[peakBin];
+    const rightDb = bin[Math.min(bin.length - 1, peakBin + 1)];
+    const curvature = leftDb - 2 * centerDb + rightDb;
+    const binOffset = curvature < 0
+      ? Math.max(-0.5, Math.min(0.5, 0.5 * (leftDb - rightDb) / curvature)) : 0;
+    const peakFrequencyHz = (peakBin + binOffset) * audioContext.sampleRate / entry.left.fftSize;
+    const logStep = Math.log(20_000 / 20) / 47;
+    const toneIndex = Math.max(0, Math.min(47,
+      Math.round(Math.log(Math.max(20, peakFrequencyHz) / 20) / logStep)));
+    const expectedFrequencyHz = 20 * Math.exp(toneIndex * logStep);
+    const frequencyError = Math.abs(peakFrequencyHz / expectedFrequencyHz - 1);
+    const leftFit = fitSinePeak(entry.l, expectedFrequencyHz, audioContext.sampleRate);
+    const rightFit = fitSinePeak(entry.r, expectedFrequencyHz, audioContext.sampleRate);
+    const fitValid = frequencyError <= 0.085 && leftFit && rightFit &&
+      leftFit.explained >= 0.8 && rightFit.explained >= 0.8;
+    const tonePower = fitValid
+      ? (leftFit.amplitude ** 2 + rightFit.amplitude ** 2) / 2 : 0;
     return {
       left_dbfs: db(ll),
       right_dbfs: db(rr),
       side_dbfs: db(diff / 4),
       lr_correlation: correlation === null ? null : Math.max(-1, Math.min(1, correlation)),
       spectrum_dbfs: spectrumDbfs,
+      peak_frequency_hz: peakFrequencyHz,
+      analysis_sample_rate_hz: audioContext.sampleRate,
+      // Peak amplitude referenced to full scale, averaged as channel power.
+      // Mixed-tone transition windows are rejected instead of biasing the curve.
+      peak_dbfs: tonePower > 0 ? Math.max(-120, Math.min(12, 10 * Math.log10(tonePower))) : -120,
     };
   }
   const previous = new Map();
@@ -293,6 +363,9 @@
         side_dbfs: stereo?.side_dbfs ?? null,
         lr_correlation: stereo?.lr_correlation ?? null,
         spectrum_dbfs: stereo?.spectrum_dbfs ?? null,
+      peak_frequency_hz: stereo?.peak_frequency_hz ?? null,
+      peak_dbfs: stereo?.peak_dbfs ?? null,
+      analysis_sample_rate_hz: stereo?.analysis_sample_rate_hz ?? null,
       });
     }
   }
