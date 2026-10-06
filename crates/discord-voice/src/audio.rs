@@ -526,54 +526,6 @@ pub fn debug_processing_check() {
 	assert_eq!(converted.len(), PCM_SAMPLES);
 }
 
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn capture_sanitization_preserves_every_finite_sample_bit_for_bit() {
-		let mut input = [0.0; PCM_SAMPLES];
-		for (index, sample) in input.iter_mut().enumerate() {
-			*sample = (index as f32 - 900.0) / 1_000.0;
-		}
-		let output = preserve_raw_capture(input);
-		assert_eq!(
-			output.map(f32::to_bits),
-			input.map(f32::to_bits),
-			"unity mic path must not add gain, clipping, or filtering"
-		);
-	}
-
-	#[test]
-	fn capture_sanitization_only_replaces_non_finite_samples() {
-		let mut input = [0.25; PCM_SAMPLES];
-		input[0] = f32::NAN;
-		input[1] = f32::INFINITY;
-		input[2] = f32::NEG_INFINITY;
-		let output = preserve_raw_capture(input);
-		assert_eq!(&output[..3], &[0.0, 0.0, 0.0]);
-		assert!(output[3..].iter().all(|sample| *sample == 0.25));
-	}
-
-	#[test]
-	fn synthetic_sweep_is_a_full_48khz_stereo_opus_frame_without_device_input() {
-		let mut sweep = crate::test_sweep::Sweep::new(RATE);
-		let frame = next_test_sweep_frame(&mut sweep);
-		assert_eq!(frame.len(), PCM_SAMPLES);
-		assert!(
-			frame
-				.chunks_exact(2)
-				.all(|pair| pair[0].to_bits() == pair[1].to_bits())
-		);
-		assert!(frame.iter().any(|sample| sample.abs() > 0.01));
-		assert!(
-			frame
-				.iter()
-				.all(|sample| sample.is_finite() && sample.abs() <= 0.25)
-		);
-	}
-}
-
 /// Native-rate capture: the device callback copies its first two channels into a sample
 /// ring; the audio worker converts them to 48 kHz and slices 20 ms Opus frames.
 pub(crate) struct CaptureInput {
@@ -831,4 +783,54 @@ fn open_devices(
 		Some(capture_input),
 		Some(playback_write),
 	))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn capture_sanitization_preserves_every_finite_sample_bit_for_bit() {
+		let mut input = [0.0; PCM_SAMPLES];
+		for (index, sample) in input.iter_mut().enumerate() {
+			*sample = (index as f32 - 900.0) / 1_000.0;
+		}
+		let output = preserve_raw_capture(input);
+		assert_eq!(
+			output.map(f32::to_bits),
+			input.map(f32::to_bits),
+			"unity mic path must not add gain, clipping, or filtering"
+		);
+	}
+
+	#[test]
+	fn capture_sanitization_only_replaces_non_finite_samples() {
+		let mut input = [0.25; PCM_SAMPLES];
+		input[0] = f32::NAN;
+		input[1] = f32::INFINITY;
+		input[2] = f32::NEG_INFINITY;
+		let output = preserve_raw_capture(input);
+		assert_eq!(&output[..3], &[0.0, 0.0, 0.0]);
+		assert!(output[3..].iter().all(|sample| *sample == 0.25));
+	}
+
+	#[test]
+	fn synthetic_sweep_is_a_full_48khz_stereo_opus_frame_without_device_input() {
+		let mut sweep = crate::test_sweep::Sweep::new(RATE);
+		let frame = next_test_sweep_frame(&mut sweep);
+		assert_eq!(frame.len(), PCM_SAMPLES);
+		assert!(
+			frame
+				.as_chunks::<2>()
+				.0
+				.iter()
+				.all(|pair| pair[0].to_bits() == pair[1].to_bits())
+		);
+		assert!(frame.iter().any(|sample| sample.abs() > 0.01));
+		assert!(
+			frame
+				.iter()
+				.all(|sample| sample.is_finite() && sample.abs() <= 0.25)
+		);
+	}
 }
