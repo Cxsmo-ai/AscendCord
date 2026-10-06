@@ -274,10 +274,10 @@ targets still run bindgen. To refresh a file, build once with
 `bindings.rs` from the crate's `OUT_DIR` to `bindings/<target>.rs`.
 
 Owner-run Linux verification (October 2, 2026, aarch64 Ubuntu 24.04 VM, PulseAudio virtual
-96 kHz stereo input carrying 440 Hz left / 660 Hz right at -12 dBFS): the Discord Web
-receiver decoded -15.0 dBFS on each channel, L/R correlation within ±0.03, side -18 dBFS,
-CBR 528 kb/s at 50 packets/s with a 27 ms worst send gap and no local send drops. About 1%
-packet loss appeared on that datacenter's network path after the packets left the host.
+96 kHz stereo input carrying 440 Hz left / 660 Hz right at -12 dBFS): the Discord Web receiver
+decoded -15.0 dBFS on each channel, L/R correlation within ±0.03, side -18 dBFS, and CBR
+528 kb/s at 50 packets/s, with a 27 ms worst send gap and no local send drops. About 1% packet
+loss appeared on that datacenter's network path after the packets left the host.
 
 ## macOS microphone permission
 
@@ -298,12 +298,14 @@ still requires the owner-operated check; a successful build is not that check.
 ## Microphone packet pacing
 
 The capture device and the 20 ms network tick run on separate clocks. The sender keeps a
-40 ms primed cushion and drains the capture channel every tick, so the producer never
-finds it full. When the cushion grows past 80 ms (a slightly fast device clock or a
-delayed tick) one tick sends two contiguous frames; a late callback simply holds without
-inserting silence. RTP timestamps advance per encoded frame, so held or caught-up audio
-stays contiguous for the receiver's jitter buffer; flushes, mute and new talk spurts skip
-the idle time instead. Only 200 ms without capture ends a talk spurt with Opus silence.
+60 ms primed cushion and drains the capture channel every tick, so the producer never
+finds it full. A slow buffer-level controller drives a 32-tap, windowed-sinc asynchronous
+sample-rate matcher within ±1,000 ppm. It compensates small clock differences continuously
+instead of correcting ordinary drift by dropping a 20 ms frame or sending catch-up bursts.
+At most one frame is sent per tick. Brief capture underruns hold the talk spurt open; RTP
+timestamps include the missing media-clock interval when audio resumes. Larger-than-supported
+clock errors remain bounded and mark a discontinuity. Only 200 ms without capture ends a
+talk spurt with Opus silence.
 At most eight frames (61,440 PCM bytes) are retained locally. Mute, deafen, encryption
 pauses and a transport stall of at least 80 ms still discard queued capture.
 
@@ -349,7 +351,9 @@ not establish production readiness or superiority over Discord's processing.
 
 ## Opus encoder settings
 
-The microphone encoder is stereo-forced, fullband, complexity 10, Music signal, no DTX and
+Capture callback batches are buffered, sample-rate-matched to the 48 kHz sender clock, then
+emitted at most one RTP audio packet per 20 ms tick. The microphone encoder is stereo-forced,
+fullband, complexity 10, Music signal, no DTX and
 no in-band FEC by default, at 510 kb/s. Constant bitrate is the default: every 20 ms packet
 is the 1,275-byte Opus maximum, so quality does not dip on dense passages and the wire rate
 is locked (528 kb/s with RTP, DAVE and transport overhead). **Variable bitrate** in Voice &
@@ -359,6 +363,44 @@ Opus 1.6's experimental quality extension (QEXT, "Opus HD") is not used. Its ext
 travels in the Opus extension field, which receivers built without QEXT ignore, and the
 bits it spends come out of the standard layer those receivers decode. Discord clients and
 browsers are not known to enable QEXT, so it would lower what listeners hear.
+
+The Windows unit suite measures the configured microphone Opus encoder and decoder with
+481 logarithmically spaced tones from 20 Hz to 20 kHz, retaining gain, residual, stereo
+crossfeed and packet size in a CSV. To save the data locally:
+
+```powershell
+$env:ASCENDCORD_OPUS_CSV = "$PWD\opus-response.csv"
+cargo test --locked -p discord-voice --lib transport::tests::configured_microphone_opus_path_preserves_fullband_level_and_stereo -- --exact
+Remove-Item Env:\ASCENDCORD_OPUS_CSV
+```
+
+This isolates the local Opus path; it does not measure Discord transport, network loss or
+the other endpoint's playback device. The sweep checks level and stereo separation through
+18 kHz and records the 18–20 kHz edge without flattening or hiding its codec response.
+
+The clock-matching design follows established asynchronous sample-rate conversion practice:
+buffer-fill feedback controls a fractional-delay interpolator, while a polyphase windowed-sinc
+filter retains the input spectrum. Adams and Kwan's [1992 AES paper](https://aes.org/publications/elibrary/elibrary-page/?id=6778)
+describes closed-loop polyphase phase/address tracking; their [1994 stereo ASRC paper](https://www.eecg.toronto.edu/~johns/ece1371/papers/1994_adams.pdf)
+gives a fuller design. This is intended to absorb the small independent-clock drift between the
+capture callback and fixed 20 ms packet clock without periodically dropping or repeating a whole
+audio frame. It does not repair packets lost after transmission.
+
+On receive, the older but still useful [Moon, Kurose and Towsley playout-delay study](https://an.kaist.ac.kr/~sbmoon/paper/intl-journal/1998-acm-multimedia-voip.pdf)
+evaluates adaptive playout delay against late-packet loss and measured delay traces. That is a
+different control loop from sender-side clock matching. AscendCord can report receiver jitter,
+loss and concealment, but cannot tune the official Discord client's private NetEq-style playout
+buffer. WebRTC's [NetEq model](https://webrtc.googlesource.com/src/%2B/1856b2ce71700faceb9f3dd8dfe7f24e17987e57/modules/audio_coding/neteq/g3doc/index.md)
+is a useful reference for interpreting those receiver-side metrics.
+
+At the fixed 510 kb/s Audio/Music setting, the local Opus test also checks the encoded packet's
+TOC and confirms CELT-only mode. [RFC 6716](https://datatracker.ietf.org/doc/html/rfc6716)
+describes CELT for music and high-rate operation, SILK for lower-rate speech, and hybrid mode for
+intermediate cases; the test guards the actual selected mode instead of assuming bitrate alone
+proves it. Opus remains lossy. The 48 kHz RTP clock and 960-tick 20 ms timestamp step follow
+[RFC 7587](https://www.rfc-editor.org/rfc/rfc7587.html).
+
+For clock-conversion implementation details, see the [SOF ASRC design notes](https://thesofproject.github.io/latest/developer_guides/firmware/src_asrc.html).
 
 ## Screen sharing
 

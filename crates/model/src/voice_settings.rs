@@ -204,4 +204,14 @@ mod tests {
 		saved.opus.bitrate = 32_000;
 		assert_eq!(saved.normalized(), VoiceProcessing::default());
 	}
+
+	#[test]
+	fn default_opus_rate_keeps_maximum_stereo_music_mode() {
+		let opus = OpusSettings::default();
+		assert_eq!(opus.bitrate, 510_000);
+		assert_eq!(opus.application, OpusApplication::Audio);
+		assert_eq!(opus.signal, OpusSignal::Music);
+		assert_eq!(opus.complexity, 10);
+		assert!(!opus.vbr && !opus.fec);
+	}
 }

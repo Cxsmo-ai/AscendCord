@@ -106,12 +106,12 @@ pub enum Status {
 	RemoteAudio,
 	/// The local audio RTP source assigned by the voice transport.
 	AudioSenderSsrc(u32),
-	/// One-second rolling audio wire-send rate, capture pacing stalls and drift catch-ups
-	/// (ticks that sent two frames to drain a faster capture clock).
+	/// One-second rolling audio wire-send rate, capture pacing stalls and drift catch-ups.
 	AudioSendStats {
 		bitrate_bps: u32,
 		packets_per_second: u16,
 		pacing_stalls: u16,
+		/// Always zero when fixed 20 ms packet pacing is active; retained for API compatibility.
 		catchups: u16,
 		/// Largest interval between consecutive audio packet sends in the window, in ms.
 		max_send_gap_ms: u16,
