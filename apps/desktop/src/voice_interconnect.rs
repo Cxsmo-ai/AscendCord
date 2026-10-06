@@ -21,6 +21,17 @@ const MAX_STREAMS: usize = 16;
 const REPORT_MAX_AGE: Duration = Duration::from_secs(5);
 const DIAGNOSTICS_MAX_AGE: Duration = Duration::from_secs(8);
 
+fn origin_allowed(method: &str, path: &str, origin: Option<&str>) -> bool {
+	if origin == Some(EXTENSION_ORIGIN) {
+		return true;
+	}
+
+	// Chromium may omit Origin on a simple extension-worker GET. Keep the
+	// originless exception read-only and limited to the status endpoint; every
+	// write and preflight still requires the pinned extension origin.
+	method == "GET" && path == "/v1/status" && origin.is_none()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReceiverReport {
@@ -489,7 +500,7 @@ fn serve(mut stream: TcpStream, shared: &Arc<Mutex<Shared>>) {
 			}
 		}
 	}
-	if origin.as_deref() != Some(EXTENSION_ORIGIN) {
+	if !origin_allowed(&method, &path, origin.as_deref()) {
 		respond(&mut stream, 403, "Forbidden", "{}", None);
 		return;
 	}
@@ -650,6 +661,20 @@ fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &str, origin: 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn originless_status_get_is_read_only_compatibility() {
+		assert!(origin_allowed("GET", "/v1/status", None));
+		assert!(!origin_allowed("GET", "/v1/receiver", None));
+		assert!(!origin_allowed("POST", "/v1/diagnostics", None));
+		assert!(!origin_allowed("OPTIONS", "/v1/status", None));
+		assert!(!origin_allowed(
+			"GET",
+			"/v1/status",
+			Some("chrome-extension://another-extension")
+		));
+		assert!(origin_allowed("GET", "/v1/status", Some(EXTENSION_ORIGIN)));
+	}
 
 	#[test]
 	fn receiver_limits_reject_nonfinite_and_excessive_values() {
