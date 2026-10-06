@@ -1,15 +1,59 @@
 (() => {
   "use strict";
   const marker = "tesktop-stereo-proof-v1";
+  let lastMessageWarningAt = 0;
+
+  // Support callback-only and Promise-returning extension APIs. Keep errors
+  // visible in the Discord page console instead of silently dropping them.
+  const sendRuntimeMessage = message => {
+    const warn = error => {
+      if (Date.now() - lastMessageWarningAt < 10_000) return;
+      lastMessageWarningAt = Date.now();
+      console.warn("[AscendCord Stereo Proof] Extension message failed:",
+        String(error?.message ?? error).slice(0, 180));
+    };
+    try {
+      const pending = chrome.runtime.sendMessage(message, () => {
+        const error = chrome.runtime.lastError;
+        if (error) warn(error);
+      });
+      if (pending && typeof pending.catch === "function") pending.catch(warn);
+    } catch (error) {
+      warn(error);
+    }
+  };
+
+  // This heartbeat proves the isolated content script reached the Discord tab,
+  // independently of whether the main-world WebRTC observer is working.
+  const heartbeat = () => sendRuntimeMessage({
+    kind: "tesktop-content-bridge-heartbeat",
+  });
+  heartbeat();
+  setInterval(heartbeat, 3000);
 
   window.addEventListener("message", event => {
     if (event.source !== window || event.origin !== location.origin ||
         event.data?.source !== marker) return;
 
+    if (event.data.observer && typeof event.data.observer === "object") {
+      sendRuntimeMessage({
+        kind: "tesktop-observer-status",
+        observer: event.data.observer,
+      });
+    }
+
     const report = event.data.report;
     if (!report || report.protocol !== 1 || !Array.isArray(report.streams) ||
         report.streams.length > 16) return;
 
-    chrome.runtime.sendMessage({ kind: "tesktop-receiver-report", report });
+    sendRuntimeMessage({ kind: "tesktop-receiver-report", report });
+  });
+
+  chrome.runtime.onMessage.addListener(message => {
+    if (message?.kind !== "tesktop-curve-capture") return;
+    window.postMessage({
+      source: "tesktop-stereo-proof-control",
+      captureCurve: message.active === true,
+    }, location.origin);
   });
 })();

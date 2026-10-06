@@ -152,9 +152,12 @@ impl VoiceBridge {
 		let sender = live.map(|live| {
 			let (capture_rate_hz, capture_channels, capture_format, capture_ring_drops, capture_worker_drops) = live.audio.capture_stats();
 			let opus = model::voice_settings::OpusSettings::default();
+			let test_sweep = live.audio.test_sweep_active();
 			serde_json::json!({
 				"call_connected": call.is_some_and(|call| matches!(call.phase, Phase::Connected | Phase::Waiting)),
-				"send_enabled": ui.voice_transmit_status == "Mic send is enabled.",
+				"test_sweep_active": test_sweep,
+				"audio_source": if test_sweep { "synthetic_sweep" } else { "microphone" },
+				"send_enabled": if test_sweep { ui.voice_transmit_status == "Synthetic sweep send is enabled." } else { ui.voice_transmit_status == "Mic send is enabled." },
 				"capture_rate_hz": capture_rate_hz,
 				"capture_channels": capture_channels,
 				"capture_format": capture_format,
@@ -1045,7 +1048,13 @@ impl Voice {
 			} else if call.phase == Phase::Waiting {
 				"Encrypted voice is waiting for another participant · Discord send is paused."
 			} else if !live.audio.is_ready() {
-				"Voice input device is still opening · no microphone frames are being sent yet."
+				if live.audio.test_sweep_active() {
+					"Synthetic sweep source is still opening · physical microphone bypassed."
+				} else {
+					"Voice input device is still opening · no microphone frames are being sent yet."
+				}
+			} else if live.audio.test_sweep_active() {
+				"Synthetic sweep send is enabled."
 			} else {
 				"Mic send is enabled."
 			};
@@ -1176,10 +1185,25 @@ impl Voice {
 			{
 				let now = Instant::now();
 				let db = live.audio.preview_level_db();
-				if ui.voice_transmit_status != "Mic send is enabled." {
+				let send_enabled = if live.audio.test_sweep_active() {
+					ui.voice_transmit_status == "Synthetic sweep send is enabled."
+				} else {
+					ui.voice_transmit_status == "Mic send is enabled."
+				};
+				if !send_enabled {
 					soak.status = ui.voice_transmit_status.to_owned();
 				} else if !live.audio.is_ready() {
-					soak.status = "Capture device is not ready · retrying device open".into();
+					soak.status = if live.audio.test_sweep_active() {
+						"Synthetic sweep source is not ready · retrying".into()
+					} else {
+						"Capture device is not ready · retrying device open".into()
+					};
+				} else if live.audio.test_sweep_active() {
+					soak.silent_since = None;
+					soak.status = format!(
+						"Running · synthetic sweep · physical microphone bypassed · {} reconnects",
+						soak.retries,
+					);
 				} else if db <= -90.0 {
 					let silent_since = *soak.silent_since.get_or_insert(now);
 					if now.duration_since(silent_since) >= VOICE_SOAK_SILENCE_TIMEOUT

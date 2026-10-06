@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Tesktop Stereo Proof</title>
+  <title>AscendCord Stereo Proof</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
@@ -12,18 +12,56 @@
       <span class="pulse" aria-hidden="true"></span>
       <div>
         <h1>Stereo proof</h1>
-        <p id="connection">Checking local Tesktop…</p>
+        <p id="connection">Checking local AscendCord…</p>
       </div>
       <button id="refresh" title="Refresh receiver stats" aria-label="Refresh">↻</button>
     </header>
     <section>
-      <h2>Sender · Tesktop</h2>
-      <pre id="sender">Waiting for Tesktop call status</pre>
+      <h2>Sender · AscendCord</h2>
+      <pre id="sender">Waiting for AscendCord call status</pre>
     </section>
     <section>
       <h2>Receiver · Discord Web</h2>
       <div id="receiver" class="empty">Join voice in the browser to expose receive stats.</div>
+      <div id="diagnostics" class="diagnostics" role="status">Checking extension path…</div>
       <div id="streams"></div>
+    </section>
+    <section>
+      <div class="section-heading">
+        <div>
+          <h2>Receiver test capture</h2>
+          <p class="caption">Starts and stops with the synthetic sweep. The numeric JSON report is prepared automatically in extension memory; no audio is recorded.</p>
+        </div>
+      </div>
+      <div class="toolbar">
+        <button id="start-test" class="action" title="Optional manual capture">Start capture</button>
+        <button id="stop-test" class="action" title="Optional manual stop" disabled>Stop</button>
+        <button id="reset-test" class="action secondary">Reset</button>
+        <button id="export-test" class="action secondary" disabled>Download JSON</button>
+      </div>
+      <div id="test-status" class="empty">No receiver test captured.</div>
+      <div id="test-summary" class="metrics"></div>
+      <label class="metric-select">Timeline metric
+        <select id="timeline-metric">
+          <option value="loss_percent">Packet loss (%)</option>
+          <option value="jitter_ms">Network jitter (ms)</option>
+          <option value="concealed_samples_per_second">Concealment (samples/s)</option>
+          <option value="discarded_packets_delta">Discarded packets / interval</option>
+          <option value="bitrate_bps">Receive bitrate (kb/s)</option>
+        </select>
+      </label>
+      <canvas id="timeline" width="900" height="250" aria-label="Receiver quality timeline"></canvas>
+    </section>
+    <section>
+      <div class="section-heading">
+        <div>
+          <h2>Matched audio curve · 20 Hz–20 kHz</h2>
+          <p class="caption">Received response relative to its median, measured across the matched 48-point sweep.</p>
+        </div>
+        <button id="capture-curve" class="action" disabled>Capture sweep curve</button>
+      </div>
+      <canvas id="spectrum" width="696" height="250" aria-label="Log frequency spectrum of the matched received audio"></canvas>
+      <p id="curve-note" class="caption">Enable ASCENDCORD_TEST_SWEEP=1 before launching AscendCord. The diagnostic replaces microphone audio with an equal-level stepped sweep.</p>
     </section>
     <footer>Local statistics only · no audio is captured, stored, or relayed.</footer>
   </main>

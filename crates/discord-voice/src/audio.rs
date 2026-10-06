@@ -9,7 +9,7 @@ use std::{
 		atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
 		mpsc,
 	},
-	time::Duration,
+	time::{Duration, Instant},
 };
 use tokio::sync::watch;
 
@@ -17,6 +17,15 @@ const RATE: u32 = 48_000;
 const CHANNELS: u32 = 2;
 const PERIOD: u32 = 960;
 const PCM_SAMPLES: usize = PERIOD as usize * CHANNELS as usize;
+const TEST_SWEEP_FRAME_PERIOD: Duration = Duration::from_millis(20);
+
+fn next_test_sweep_frame(sweep: &mut crate::test_sweep::Sweep) -> StereoFrame {
+	let mut frame = [0.0; PCM_SAMPLES];
+	for pair in frame.as_chunks_mut::<2>().0 {
+		pair.copy_from_slice(&sweep.next_frame());
+	}
+	frame
+}
 
 fn preserve_raw_capture(mut stereo: StereoFrame) -> StereoFrame {
 	for sample in &mut stereo {
@@ -177,6 +186,7 @@ impl Gate {
 
 pub struct Audio {
 	pub gate: Arc<Gate>,
+	test_sweep_active: bool,
 	settings: watch::Sender<Devices>,
 	thread: std::thread::Thread,
 	done: Option<mpsc::Receiver<()>>,
@@ -206,6 +216,8 @@ impl Audio {
 		preview: bool,
 	) -> Result<Self, &'static str> {
 		let gate = Arc::new(Gate::default());
+		let test_sweep_active =
+			!preview && std::env::var("ASCENDCORD_TEST_SWEEP").is_ok_and(|value| value == "1");
 		// The microphone test exists to show the level.
 		gate.meter.store(preview, Ordering::Relaxed);
 		let (settings, mut selected) = watch::channel(settings_value);
@@ -214,7 +226,7 @@ impl Audio {
 		let thread = std::thread::Builder::new()
 			.name("acheron-audio".into())
 			.spawn(move || {
-				let mut active: Option<(u64, Device, Device)> = None;
+				let mut active: Option<(u64, Option<Device>, Option<Device>)> = None;
 				let mut capture_ring: Option<CaptureInput> = None;
 				let mut playback_ring: Option<rtrb::Producer<StereoFrame>> = None;
 				let mut last_selection = Devices::default();
@@ -222,6 +234,8 @@ impl Audio {
 				// 660 Hz right at -12 dBFS while keeping the device's real callback timing.
 				let test_tone =
 					std::env::var("ASCENDCORD_TEST_TONE").is_ok_and(|value| value == "1");
+				let mut test_sweep = test_sweep_active.then(|| crate::test_sweep::Sweep::new(RATE));
+				let mut next_sweep_frame = Instant::now();
 				let mut tone_phase = 0u64;
 				loop {
 					if worker_gate.stopped.load(Ordering::Acquire) {
@@ -240,11 +254,11 @@ impl Audio {
 						last_selection = selection.clone();
 					}
 					if active.is_none() && worker_gate.ready.load(Ordering::Acquire) {
-						match open_devices(&selection, &worker_gate) {
+						match open_devices(&selection, &worker_gate, test_sweep_active) {
 							Ok((capture_device, playback_device, capture_read, playback_write)) => {
 								active = Some((revision, capture_device, playback_device));
-								capture_ring = Some(capture_read);
-								playback_ring = Some(playback_write);
+								capture_ring = capture_read;
+								playback_ring = playback_write;
 								worker_gate.acknowledged.store(revision, Ordering::Release);
 								worker_gate.failed.store(false, Ordering::Release);
 								emit(Ok(()));
@@ -286,6 +300,25 @@ impl Audio {
 							}
 						}
 					}
+					// Device-independent test source: generate one canonical 20 ms, 48 kHz
+					// stereo frame on its own clock and feed it into the normal encoder queue.
+					if let Some(sweep) = &mut test_sweep {
+						let now = Instant::now();
+						if now >= next_sweep_frame {
+							// Advance from the prior deadline so worker wake-up jitter does not
+							// accumulate into a slower-than-50-fps synthetic source.
+							next_sweep_frame += TEST_SWEEP_FRAME_PERIOD;
+							if worker_gate.capture() {
+								let frame = next_test_sweep_frame(sweep);
+								if capture_send.try_send(CaptureFrame::Stereo(frame)).is_err() {
+									worker_gate
+										.capture_worker_drops
+										.fetch_add(1, Ordering::Relaxed);
+								}
+								work = true;
+							}
+						}
+					}
 					if let Some(output) = &mut playback_ring {
 						for _ in 0..8 {
 							let Ok(frame) = playback_receive.try_recv() else {
@@ -310,6 +343,7 @@ impl Audio {
 			.map_err(|_| "Could not start native audio worker")?;
 		Ok(Self {
 			gate,
+			test_sweep_active,
 			settings,
 			thread: thread.thread().clone(),
 			done: Some(done),
@@ -319,6 +353,13 @@ impl Audio {
 		f32::from(self.gate.preview_level.load(Ordering::Relaxed)) - 100.0
 	}
 	pub fn capture_diagnostic(&self) -> String {
+		if self.test_sweep_active {
+			return if self.is_ready() {
+				"Synthetic sweep active · physical microphone bypassed".into()
+			} else {
+				"Synthetic sweep source is opening · physical microphone bypassed".into()
+			};
+		}
 		let callbacks = self.gate.capture_callbacks.load(Ordering::Relaxed);
 		let frames = self.gate.capture_frames.load(Ordering::Relaxed);
 		let channels = self.gate.capture_channels.load(Ordering::Relaxed);
@@ -370,6 +411,9 @@ impl Audio {
 	}
 	pub fn is_stopped(&self) -> bool {
 		self.gate.stopped.load(Ordering::Acquire)
+	}
+	pub fn test_sweep_active(&self) -> bool {
+		self.test_sweep_active
 	}
 	/// Playback frames dropped because the native output callback fell behind its bounded queue.
 	pub fn playback_ring_drops(&self) -> u64 {
@@ -510,6 +554,24 @@ mod tests {
 		assert_eq!(&output[..3], &[0.0, 0.0, 0.0]);
 		assert!(output[3..].iter().all(|sample| *sample == 0.25));
 	}
+
+	#[test]
+	fn synthetic_sweep_is_a_full_48khz_stereo_opus_frame_without_device_input() {
+		let mut sweep = crate::test_sweep::Sweep::new(RATE);
+		let frame = next_test_sweep_frame(&mut sweep);
+		assert_eq!(frame.len(), PCM_SAMPLES);
+		assert!(
+			frame
+				.chunks_exact(2)
+				.all(|pair| pair[0].to_bits() == pair[1].to_bits())
+		);
+		assert!(frame.iter().any(|sample| sample.abs() > 0.01));
+		assert!(
+			frame
+				.iter()
+				.all(|sample| sample.is_finite() && sample.abs() <= 0.25)
+		);
+	}
 }
 
 /// Native-rate capture: the device callback copies its first two channels into a sample
@@ -560,7 +622,12 @@ impl CaptureInput {
 }
 
 /// Capture and playback devices with the ring/converter and ring their callbacks use.
-type OpenedDevices = (Device, Device, CaptureInput, rtrb::Producer<StereoFrame>);
+type OpenedDevices = (
+	Option<Device>,
+	Option<Device>,
+	Option<CaptureInput>,
+	Option<rtrb::Producer<StereoFrame>>,
+);
 
 fn capture_config(input_id: Option<&miniaudio::DeviceId>, rate: u32) -> DeviceConfig {
 	let mut config = DeviceConfig::new(DeviceType::Capture);
@@ -580,7 +647,14 @@ fn capture_config(input_id: Option<&miniaudio::DeviceId>, rate: u32) -> DeviceCo
 	config
 }
 
-fn open_devices(selection: &Devices, gate: &Arc<Gate>) -> Result<OpenedDevices, &'static str> {
+fn open_devices(
+	selection: &Devices,
+	gate: &Arc<Gate>,
+	synthetic_source: bool,
+) -> Result<OpenedDevices, &'static str> {
+	if synthetic_source {
+		return Ok((None, None, None, None));
+	}
 	let context = context()?;
 	// The endpoint selected in Audio settings, else the system default microphone. Windows
 	// may reorder virtual capture devices between enumerations, so the stable name wins.
@@ -752,9 +826,9 @@ fn open_devices(selection: &Devices, gate: &Arc<Gate>) -> Result<OpenedDevices, 
 		.start()
 		.map_err(|_| "Could not start speaker device; check system sound settings")?;
 	Ok((
-		capture_device,
-		playback_device,
-		capture_input,
-		playback_write,
+		Some(capture_device),
+		Some(playback_device),
+		Some(capture_input),
+		Some(playback_write),
 	))
 }

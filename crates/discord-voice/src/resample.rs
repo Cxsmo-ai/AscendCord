@@ -277,6 +277,53 @@ mod tests {
 	}
 
 	#[test]
+	fn measured_equal_level_tone_sweep_is_flat_on_both_channels() {
+		const FREQUENCY_POINTS: usize = 480;
+		let frequencies_hz = (0..=FREQUENCY_POINTS)
+			.map(|point| 20.0 * 1_000.0f64.powf(point as f64 / FREQUENCY_POINTS as f64))
+			.collect::<Vec<_>>();
+		let mut csv = String::from(
+			"input_rate_hz,output_rate_hz,frequency_hz,channel,gain_db,residual_dbfs,residual_dbc\n",
+		);
+
+		for rate in [44_100, 48_000, 96_000] {
+			let passband_hz = (f64::from(rate.min(OUTPUT_RATE)) * 0.45).min(20_000.0);
+			for &frequency in frequencies_hz
+				.iter()
+				.filter(|&&frequency| frequency <= passband_hz)
+			{
+				let input = stereo_sine(rate, frequency, 0.25, 0.5);
+				let output = convert(rate, &input);
+				let steady = &output[output.len() / 4..];
+				for channel in 0..2 {
+					let (amplitude, residual) = fit(steady, channel, 48_000.0, frequency);
+					let gain_db = 20.0 * (amplitude / 0.5).log10();
+					let residual_dbfs = 20.0 * residual.max(1e-15).log10();
+					let residual_dbc = 20.0 * (residual / amplitude).max(1e-15).log10();
+					assert!(
+						gain_db.abs() < 0.05,
+						"{frequency} Hz at {rate} Hz, channel {channel}: {gain_db:.5} dB"
+					);
+					assert!(
+						residual_dbc < -75.0,
+						"{frequency} Hz at {rate} Hz, channel {channel}: {residual_dbc:.1} dBc residual"
+					);
+					use std::fmt::Write as _;
+					writeln!(
+						csv,
+						"{rate},{OUTPUT_RATE},{frequency:.6},{channel},{gain_db:.9},{residual_dbfs:.3},{residual_dbc:.3}"
+					)
+					.expect("writing to a string cannot fail");
+				}
+			}
+		}
+
+		if let Some(path) = std::env::var_os("ASCENDCORD_EQ_CSV") {
+			std::fs::write(path, csv).expect("write measured resampler response CSV");
+		}
+	}
+
+	#[test]
 	fn ultrasonic_content_does_not_alias_into_the_audio_band() {
 		// 30 kHz at 96 kHz would fold to 18 kHz at 48 kHz without filtering.
 		let input = sine(96_000, 30_000.0, 0.5, 0.9);

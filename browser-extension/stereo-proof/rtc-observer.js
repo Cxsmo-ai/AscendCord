@@ -2,8 +2,11 @@
   "use strict";
 
   const marker = "tesktop-stereo-proof-v1";
-  const NativePeerConnection = window.RTCPeerConnection;
-  if (typeof NativePeerConnection !== "function") return;
+  const SPECTRUM_POINTS = 48;
+  const SPECTRUM_LOW_HZ = 20;
+  const SPECTRUM_HIGH_HZ = 20_000;
+  let NativePeerConnection = null;
+  let InstalledPeerConnection = null;
 
   const peers = new Set();
   const meters = new Map();
@@ -73,13 +76,17 @@
       const splitter = ctx.createChannelSplitter(2);
       const left = ctx.createAnalyser();
       const right = ctx.createAnalyser();
-      left.fftSize = right.fftSize = 4096;
+      left.fftSize = right.fftSize = 16384;
+      left.minDecibels = right.minDecibels = -120;
+      left.maxDecibels = right.maxDecibels = 12;
       source.connect(splitter);
       splitter.connect(left, 0);
       splitter.connect(right, 1);
       entry = {
         source, splitter, left, right,
-        l: new Float32Array(4096), r: new Float32Array(4096),
+        l: new Float32Array(16384), r: new Float32Array(16384),
+        leftSpectrum: new Float32Array(left.frequencyBinCount),
+        rightSpectrum: new Float32Array(right.frequencyBinCount),
         channels: source.channelCount,
       };
       meters.set(track.id, entry);
@@ -98,6 +105,8 @@
     if (!entry || audioContext?.state !== "running") return null;
     entry.left.getFloatTimeDomainData(entry.l);
     entry.right.getFloatTimeDomainData(entry.r);
+    entry.left.getFloatFrequencyData(entry.leftSpectrum);
+    entry.right.getFloatFrequencyData(entry.rightSpectrum);
     let ll = 0, rr = 0, lr = 0, diff = 0;
     for (let i = 0; i < entry.l.length; i++) {
       const a = entry.l[i], b = entry.r[i];
@@ -106,38 +115,93 @@
     const n = entry.l.length;
     const db = power => power > 0 ? Math.max(-120, 10 * Math.log10(power / n)) : -120;
     const correlation = ll > 0 && rr > 0 ? lr / Math.sqrt(ll * rr) : null;
+    const spectrumDbfs = [];
+    for (let point = 0; point < SPECTRUM_POINTS; point++) {
+      const fraction = point / (SPECTRUM_POINTS - 1);
+      const frequency = SPECTRUM_LOW_HZ * (SPECTRUM_HIGH_HZ / SPECTRUM_LOW_HZ) ** fraction;
+      const bin = Math.max(1, Math.min(entry.leftSpectrum.length - 1,
+        Math.round(frequency * entry.leftSpectrum.length * 2 / audioContext.sampleRate)));
+      // Average L/R power. AudioBuffer analyser values are in dBFS; averaging in
+      // linear power avoids a channel from dominating the display by a few dB.
+      const leftDb = entry.leftSpectrum[bin];
+      const rightDb = entry.rightSpectrum[bin];
+      const power = (10 ** (leftDb / 10) + 10 ** (rightDb / 10)) / 2;
+      spectrumDbfs.push(Math.max(-120, Math.min(12, 10 * Math.log10(power))));
+    }
     return {
       left_dbfs: db(ll),
       right_dbfs: db(rr),
       side_dbfs: db(diff / 4),
       lr_correlation: correlation === null ? null : Math.max(-1, Math.min(1, correlation)),
+      spectrum_dbfs: spectrumDbfs,
     };
   }
   const previous = new Map();
   const peerIds = new WeakMap();
   let nextPeerId = 1;
   let running = false;
+  let curveCapture = false;
+  let sampleTimer;
+  let lastInstallError = "";
+  let lastReportedObserverState = "";
+
+  function reportObserverState(state, error = "") {
+    const identity = `${state}:${error}`;
+    if (identity === lastReportedObserverState) return;
+    lastReportedObserverState = identity;
+    window.postMessage({
+      source: marker,
+      observer: {
+        state,
+        peer_api: typeof window.RTCPeerConnection === "function",
+        error: String(error).slice(0, 180),
+        at_ms: Date.now(),
+      },
+    }, location.origin);
+  }
 
   function installPeerConnection() {
-    const Wrapped = function (...args) {
-      const peer = new NativePeerConnection(...args);
-      peerIds.set(peer, nextPeerId++);
-      peers.add(peer);
-      peer.addEventListener("connectionstatechange", () => {
-        if (peer.connectionState === "closed") peers.delete(peer);
+    const current = window.RTCPeerConnection;
+    if (typeof current !== "function") {
+      reportObserverState("waiting-for-peer-api", lastInstallError);
+      return false;
+    }
+    if (InstalledPeerConnection === current) return true;
+    try {
+      NativePeerConnection = current;
+      wrapDescription("setLocalDescription");
+      wrapDescription("setRemoteDescription");
+      wrapCreate("createOffer");
+      wrapCreate("createAnswer");
+
+      const Wrapped = function (...args) {
+        const peer = new NativePeerConnection(...args);
+        peerIds.set(peer, nextPeerId++);
+        peers.add(peer);
+        peer.addEventListener("connectionstatechange", () => {
+          if (peer.connectionState === "closed") peers.delete(peer);
+        });
+        peer.addEventListener("signalingstatechange", () => {
+          if (peer.signalingState === "closed") peers.delete(peer);
+        });
+        return peer;
+      };
+      Wrapped.prototype = NativePeerConnection.prototype;
+      Object.setPrototypeOf(Wrapped, NativePeerConnection);
+      Object.defineProperty(window, "RTCPeerConnection", {
+        configurable: true,
+        writable: true,
+        value: Wrapped,
       });
-      peer.addEventListener("signalingstatechange", () => {
-        if (peer.signalingState === "closed") peers.delete(peer);
-      });
-      return peer;
-    };
-    Wrapped.prototype = NativePeerConnection.prototype;
-    Object.setPrototypeOf(Wrapped, NativePeerConnection);
-    Object.defineProperty(window, "RTCPeerConnection", {
-      configurable: true,
-      writable: true,
-      value: Wrapped,
-    });
+      InstalledPeerConnection = Wrapped;
+      lastInstallError = "";
+      reportObserverState("hook-installed");
+      return true;
+    } catch (error) {
+      lastInstallError = String(error?.message ?? error);
+      reportObserverState("hook-install-failed", lastInstallError);
+      return false;
+    }
   }
 
   function numeric(value, fallback = 0) {
@@ -228,6 +292,7 @@
         right_dbfs: stereo?.right_dbfs ?? null,
         side_dbfs: stereo?.side_dbfs ?? null,
         lr_correlation: stereo?.lr_correlation ?? null,
+        spectrum_dbfs: stereo?.spectrum_dbfs ?? null,
       });
     }
   }
@@ -244,6 +309,12 @@
       }
       window.postMessage({
         source: marker,
+        observer: {
+          state: InstalledPeerConnection ? "sampling" : "hook-not-installed",
+          peer_api: typeof window.RTCPeerConnection === "function",
+          error: lastInstallError,
+          at_ms: Date.now(),
+        },
         report: {
           protocol: 1,
           sampled_at_ms: Date.now(),
@@ -256,14 +327,27 @@
     }
   }
 
-  wrapDescription("setLocalDescription");
-  wrapDescription("setRemoteDescription");
-  wrapCreate("createOffer");
-  wrapCreate("createAnswer");
+  // At document_start some Chromium builds expose WebRTC a little later. Keep
+  // trying instead of permanently disabling the observer on its first tick.
+  let installAttempts = 0;
+  const installTimer = setInterval(() => {
+    installAttempts++;
+    if (installPeerConnection() || installAttempts >= 200) clearInterval(installTimer);
+  }, 50);
   installPeerConnection();
+  window.addEventListener("message", event => {
+    if (event.source !== window || event.origin !== location.origin ||
+        event.data?.source !== "tesktop-stereo-proof-control") return;
+    const next = event.data.captureCurve === true;
+    if (curveCapture === next) return;
+    curveCapture = next;
+    clearInterval(sampleTimer);
+    sampleTimer = setInterval(sample, curveCapture ? 250 : 2000);
+    sample();
+  });
   for (const kind of ["pointerdown", "keydown"]) {
     window.addEventListener(kind, () => context(), { capture: true, passive: true });
   }
-  setInterval(sample, 2000);
+  sampleTimer = setInterval(sample, 2000);
   setTimeout(sample, 750);
 })();

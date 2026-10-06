@@ -10,6 +10,7 @@ mod mixer;
 pub mod resample;
 pub mod screen;
 mod stream_playout;
+mod test_sweep;
 mod timer;
 mod transport;
 mod video;

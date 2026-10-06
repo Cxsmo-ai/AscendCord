@@ -19,6 +19,7 @@ const MAX_HEADER_BYTES: usize = 4 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const MAX_STREAMS: usize = 16;
 const REPORT_MAX_AGE: Duration = Duration::from_secs(5);
+const DIAGNOSTICS_MAX_AGE: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +28,101 @@ pub(crate) struct ReceiverReport {
 	pub sampled_at_ms: u64,
 	pub peer_connections: u8,
 	pub streams: Vec<InboundAudio>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExtensionDiagnostics {
+	pub protocol: u8,
+	pub sampled_at_ms: u64,
+	pub content_bridge: bool,
+	pub observer_state: String,
+	pub observer_api: bool,
+	pub observer_error: String,
+	pub peer_connections: u8,
+	pub inbound_streams: u8,
+	pub report_count: u32,
+	pub forward_error: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub sweep_test: Option<SweepTestDiagnostics>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub sweep_curve: Option<SweepCurveDiagnostics>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SweepTestDiagnostics {
+	pub running: bool,
+	pub automatic: bool,
+	pub capture_active: bool,
+	pub export_ready: bool,
+	pub sender_ssrc: Option<u32>,
+	pub sample_count: u16,
+	pub matched_samples: u16,
+	pub average_loss_percent: Option<f32>,
+	pub peak_loss_percent: Option<f32>,
+	pub average_jitter_ms: Option<f32>,
+	pub peak_jitter_ms: Option<f32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SweepCurveDiagnostics {
+	pub ssrc: u32,
+	pub spectrum_dbfs: Vec<f32>,
+}
+
+impl ExtensionDiagnostics {
+	fn validate(&self) -> bool {
+		self.protocol == 1
+			&& self.observer_state.len() <= 48
+			&& self
+				.observer_state
+				.bytes()
+				.all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+			&& self.observer_error.len() <= 180
+			&& self.forward_error.len() <= 180
+			&& self.peer_connections <= 32
+			&& self.inbound_streams <= 16
+			&& self
+				.sweep_test
+				.as_ref()
+				.is_none_or(SweepTestDiagnostics::validate)
+			&& self
+				.sweep_curve
+				.as_ref()
+				.is_none_or(SweepCurveDiagnostics::validate)
+			&& self
+				.sweep_test
+				.as_ref()
+				.zip(self.sweep_curve.as_ref())
+				.is_none_or(|(test, curve)| test.sender_ssrc.is_none_or(|ssrc| ssrc == curve.ssrc))
+	}
+}
+
+impl SweepTestDiagnostics {
+	fn validate(&self) -> bool {
+		self.sample_count <= 1800
+			&& self.matched_samples <= self.sample_count
+			&& [self.average_loss_percent, self.peak_loss_percent]
+				.into_iter()
+				.flatten()
+				.all(|value| value.is_finite() && (0.0..=100.0).contains(&value))
+			&& [self.average_jitter_ms, self.peak_jitter_ms]
+				.into_iter()
+				.flatten()
+				.all(|value| value.is_finite() && (0.0..=60_000.0).contains(&value))
+	}
+}
+
+impl SweepCurveDiagnostics {
+	fn validate(&self) -> bool {
+		self.spectrum_dbfs.len() == 48
+			&& self
+				.spectrum_dbfs
+				.iter()
+				.all(|value| value.is_finite() && (-120.0..=12.0).contains(value))
+	}
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -153,6 +249,8 @@ struct Shared {
 	sender: Value,
 	receiver: Option<ReceiverReport>,
 	receiver_at: Option<Instant>,
+	extension_diagnostics: Option<ExtensionDiagnostics>,
+	extension_diagnostics_at: Option<Instant>,
 }
 
 pub(crate) struct Interconnect {
@@ -210,12 +308,17 @@ impl Interconnect {
 		let fresh = shared
 			.receiver_at
 			.is_some_and(|at| at.elapsed() <= REPORT_MAX_AGE);
+		let diagnostics_fresh = shared
+			.extension_diagnostics_at
+			.is_some_and(|at| at.elapsed() <= DIAGNOSTICS_MAX_AGE);
 		json!({
 			"enabled": self.listening,
 			"port": if self.listening { Some(PORT) } else { None::<u16> },
 			"sender": shared.sender,
 			"receiver_connected": fresh,
 			"receiver": if fresh { shared.receiver.clone() } else { None },
+			"extension_diagnostics_connected": diagnostics_fresh,
+			"extension_diagnostics": if diagnostics_fresh { shared.extension_diagnostics.clone() } else { None },
 		})
 	}
 
@@ -419,17 +522,60 @@ fn serve(mut stream: TcpStream, shared: &Arc<Mutex<Shared>>) {
 					let fresh = shared
 						.receiver_at
 						.is_some_and(|at| at.elapsed() <= REPORT_MAX_AGE);
+					let diagnostics_fresh = shared
+						.extension_diagnostics_at
+						.is_some_and(|at| at.elapsed() <= DIAGNOSTICS_MAX_AGE);
 					json!({
 						"protocol": 1,
 						"sender": shared.sender,
 						"receiver_connected": fresh,
 						"receiver": if fresh { shared.receiver.clone() } else { None },
+						"extension_diagnostics_connected": diagnostics_fresh,
+						"extension_diagnostics": if diagnostics_fresh { shared.extension_diagnostics.clone() } else { None },
 					})
 				})
 				.unwrap_or_else(
-					|_| json!({"protocol": 1, "sender": null, "receiver_connected": false}),
+					|_| json!({"protocol": 1, "sender": null, "receiver_connected": false, "extension_diagnostics_connected": false}),
 				);
 			respond(&mut stream, 200, "OK", &body.to_string(), origin.as_deref());
+		}
+		("POST", "/v1/diagnostics") => {
+			let mut body = vec![0u8; content_length];
+			if reader.read_exact(&mut body).is_err() {
+				respond(
+					&mut stream,
+					400,
+					"Incomplete Request Body",
+					"{}",
+					origin.as_deref(),
+				);
+				return;
+			}
+			let Ok(diagnostics) = serde_json::from_slice::<ExtensionDiagnostics>(&body) else {
+				respond(
+					&mut stream,
+					400,
+					"Invalid Extension Diagnostics",
+					"{}",
+					origin.as_deref(),
+				);
+				return;
+			};
+			if !diagnostics.validate() {
+				respond(
+					&mut stream,
+					400,
+					"Extension Diagnostics Outside Limits",
+					"{}",
+					origin.as_deref(),
+				);
+				return;
+			}
+			if let Ok(mut shared) = shared.lock() {
+				shared.extension_diagnostics = Some(diagnostics);
+				shared.extension_diagnostics_at = Some(Instant::now());
+			}
+			respond(&mut stream, 204, "No Content", "{}", origin.as_deref());
 		}
 		("POST", "/v1/receiver") => {
 			let mut body = vec![0u8; content_length];
@@ -561,6 +707,76 @@ mod tests {
 			report.streams[0].stereo_verdict(),
 			StereoVerdict::Unmeasured
 		);
+	}
+
+	#[test]
+	fn extension_diagnostics_are_bounded_and_privacy_limited() {
+		let valid = ExtensionDiagnostics {
+			protocol: 1,
+			sampled_at_ms: 1,
+			content_bridge: true,
+			observer_state: "hook-installed".into(),
+			observer_api: true,
+			observer_error: String::new(),
+			peer_connections: 2,
+			inbound_streams: 1,
+			report_count: 15,
+			forward_error: String::new(),
+			sweep_test: None,
+			sweep_curve: None,
+		};
+		assert!(valid.validate());
+		let value = serde_json::to_value(&valid).unwrap();
+		assert!(value.get("audio_data").is_none());
+		assert!(value.get("token").is_none());
+		assert!(value.get("account").is_none());
+		let mut invalid = valid;
+		invalid.observer_error = "x".repeat(181);
+		assert!(!invalid.validate());
+	}
+
+	#[test]
+	fn sweep_curve_is_bounded_and_keeps_only_the_matched_sender() {
+		let mut diagnostics = ExtensionDiagnostics {
+			protocol: 1,
+			sampled_at_ms: 1,
+			content_bridge: true,
+			observer_state: "sampling".into(),
+			observer_api: true,
+			observer_error: String::new(),
+			peer_connections: 1,
+			inbound_streams: 1,
+			report_count: 1,
+			forward_error: String::new(),
+			sweep_test: Some(SweepTestDiagnostics {
+				running: false,
+				automatic: true,
+				capture_active: false,
+				export_ready: true,
+				sender_ssrc: Some(42),
+				sample_count: 20,
+				matched_samples: 20,
+				average_loss_percent: Some(0.0),
+				peak_loss_percent: Some(0.0),
+				average_jitter_ms: Some(1.0),
+				peak_jitter_ms: Some(2.0),
+			}),
+			sweep_curve: Some(SweepCurveDiagnostics {
+				ssrc: 42,
+				spectrum_dbfs: vec![-18.0; 48],
+			}),
+		};
+		assert!(diagnostics.validate());
+		diagnostics
+			.sweep_curve
+			.as_mut()
+			.unwrap()
+			.spectrum_dbfs
+			.pop();
+		assert!(!diagnostics.validate());
+		diagnostics.sweep_curve.as_mut().unwrap().spectrum_dbfs = vec![-18.0; 48];
+		diagnostics.sweep_curve.as_mut().unwrap().ssrc = 43;
+		assert!(!diagnostics.validate());
 	}
 
 	#[test]
