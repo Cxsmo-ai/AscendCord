@@ -1,43 +1,149 @@
 //! Pace callback batches into 20 ms packets without discarding normal speech.
 //!
-//! The capture device and the 20 ms network tick run on different clocks. Taking exactly
-//! one frame per tick lets the queue creep to its cap (adding ~160 ms of latency) and then
-//! drop frames, while a single late callback empties it and used to inject silence. This
-//! pacer keeps a small primed cushion, sends a second frame in a tick when the cushion has
-//! grown, and simply holds (no silence, no timestamp gap) through a brief underrun.
+//! The capture device and the 20 ms network tick run on different clocks. This pacer keeps a
+//! small primed cushion, slowly matches the input sample rate to buffer occupancy, and sends
+//! at most one frame per tick. Fractional windowed-sinc resampling avoids whole-frame slips;
+//! a bounded queue discards old audio only for clock errors beyond the correction range.
 use crate::CaptureFrame;
-use std::{collections::VecDeque, sync::mpsc::Receiver};
+use std::{
+	collections::VecDeque,
+	sync::{OnceLock, mpsc::Receiver},
+};
 
-/// Frames buffered before sending starts or resumes after an underrun (40 ms).
-const PRIME: usize = 2;
-/// Above this many buffered frames a tick sends two frames to drain drift (80 ms).
-const HIGH: usize = 4;
+/// Frames buffered before sending starts or resumes after an underrun (60 ms).
+const PRIME: usize = 3;
 /// Hard bound on locally retained frames; the oldest is discarded beyond this.
 const MAX: usize = 8;
+const SAMPLES_PER_FRAME: usize = 960;
+const ASRC_TAPS: usize = 32;
+const ASRC_PHASES: usize = 2_048;
+const ASRC_BETA: f64 = 10.06;
+const TARGET_BUFFER_FRAMES: f64 = 3.0;
+const DRIFT_FILTER_ALPHA: f64 = 0.05;
+const DRIFT_GAIN: f64 = 0.0015;
+const MAX_DRIFT_CORRECTION: f64 = 0.001;
 
-#[derive(Default)]
+type StereoSample = [f64; 2];
+
+fn i0(x: f64) -> f64 {
+	let mut sum = 1.0;
+	let mut term = 1.0;
+	let half = x / 2.0;
+	for k in 1..64 {
+		term *= half / k as f64;
+		let squared = term * term;
+		sum += squared;
+		if squared < sum * 1e-17 {
+			break;
+		}
+	}
+	sum
+}
+
+fn asrc_coefficients() -> &'static [[f64; ASRC_TAPS]] {
+	static COEFFICIENTS: OnceLock<Vec<[f64; ASRC_TAPS]>> = OnceLock::new();
+	COEFFICIENTS.get_or_init(|| {
+		let normalization = i0(ASRC_BETA);
+		(0..=ASRC_PHASES)
+			.map(|phase| {
+				let fraction = phase as f64 / ASRC_PHASES as f64;
+				let mut coefficients = [0.0; ASRC_TAPS];
+				let mut sum = 0.0;
+				for (tap, coefficient) in coefficients.iter_mut().enumerate() {
+					let offset = tap as isize - (ASRC_TAPS as isize - 1);
+					// Causal polyphase interpolation: the filter's fixed group delay is
+					// constant, so it needs no future packet lookahead.
+					let distance = offset as f64 + (ASRC_TAPS as f64 - 1.0) / 2.0 - fraction;
+					let sinc = if distance.abs() < 1e-12 {
+						1.0
+					} else {
+						let x = std::f64::consts::PI * distance;
+						x.sin() / x
+					};
+					let normalized = (distance / ((ASRC_TAPS as f64 - 1.0) / 2.0)).clamp(-1.0, 1.0);
+					let window =
+						i0(ASRC_BETA * (1.0 - normalized * normalized).sqrt()) / normalization;
+					*coefficient = sinc * window;
+					sum += *coefficient;
+				}
+				for coefficient in &mut coefficients {
+					*coefficient /= sum;
+				}
+				coefficients
+			})
+			.collect()
+	})
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CaptureClockMatcher {
+	filtered_buffer_frames: f64,
+	input_samples_per_output: f64,
+}
+
+impl Default for CaptureClockMatcher {
+	fn default() -> Self {
+		Self {
+			filtered_buffer_frames: TARGET_BUFFER_FRAMES,
+			input_samples_per_output: 1.0,
+		}
+	}
+}
+
+impl CaptureClockMatcher {
+	fn update(&mut self, buffered_frames: f64) -> f64 {
+		self.filtered_buffer_frames +=
+			DRIFT_FILTER_ALPHA * (buffered_frames - self.filtered_buffer_frames);
+		let correction = ((self.filtered_buffer_frames - TARGET_BUFFER_FRAMES) * DRIFT_GAIN)
+			.clamp(-MAX_DRIFT_CORRECTION, MAX_DRIFT_CORRECTION);
+		self.input_samples_per_output = 1.0 + correction;
+		self.input_samples_per_output
+	}
+
+	fn reset(&mut self) {
+		*self = Self::default();
+	}
+}
+
 pub(crate) struct CapturePacer {
 	buffered: VecDeque<CaptureFrame>,
 	primed: bool,
+	/// Fractional source-sample position relative to the oldest buffered frame.
+	input_phase: f64,
+	clock_matcher: CaptureClockMatcher,
+	history: VecDeque<StereoSample>,
 	/// Set when buffered audio was flushed, so the next frame is not contiguous.
 	discontinuity: bool,
 }
 
-/// Up to two contiguous frames to encode in one tick.
+impl Default for CapturePacer {
+	fn default() -> Self {
+		Self {
+			buffered: VecDeque::new(),
+			primed: false,
+			input_phase: 0.0,
+			clock_matcher: CaptureClockMatcher::default(),
+			history: VecDeque::with_capacity(ASRC_TAPS),
+			discontinuity: false,
+		}
+	}
+}
+
+/// At most one frame to encode in one 20 ms tick.
 #[derive(Default)]
 pub(crate) struct Batch {
-	frames: [Option<CaptureFrame>; 2],
+	frame: Option<CaptureFrame>,
 }
 
 impl Batch {
 	pub fn is_empty(&self) -> bool {
-		self.frames[0].is_none()
+		self.frame.is_none()
 	}
 	pub fn last(&self) -> Option<&CaptureFrame> {
-		self.frames.iter().rev().find_map(Option::as_ref)
+		self.frame.as_ref()
 	}
 	pub fn into_frames(self) -> impl Iterator<Item = CaptureFrame> {
-		self.frames.into_iter().flatten()
+		self.frame.into_iter()
 	}
 }
 
@@ -61,6 +167,85 @@ impl CapturePacer {
 		}
 		self.buffered.clear();
 		self.primed = false;
+		self.input_phase = 0.0;
+		self.clock_matcher.reset();
+		self.history.clear();
+	}
+
+	fn sample_at(&self, index: isize) -> StereoSample {
+		if index < 0 {
+			return self
+				.history
+				.get((self.history.len() as isize + index).max(0) as usize)
+				.copied()
+				.unwrap_or([0.0; 2]);
+		}
+		let index = index as usize;
+		let Some(frame) = self.buffered.get(index / SAMPLES_PER_FRAME) else {
+			return [0.0; 2];
+		};
+		let CaptureFrame::Stereo(samples) = frame;
+		let offset = (index % SAMPLES_PER_FRAME) * 2;
+		[f64::from(samples[offset]), f64::from(samples[offset + 1])]
+	}
+
+	fn remember_frame(&mut self, frame: CaptureFrame) {
+		let CaptureFrame::Stereo(samples) = frame;
+		for pair in samples
+			.as_chunks::<2>()
+			.0
+			.iter()
+			.rev()
+			.take(ASRC_TAPS)
+			.rev()
+		{
+			if self.history.len() == ASRC_TAPS {
+				self.history.pop_front();
+			}
+			self.history
+				.push_back([f64::from(pair[0]), f64::from(pair[1])]);
+		}
+	}
+
+	fn resample_packet(&mut self, output: &mut [f32; 1_920], step: f64) -> bool {
+		let available_samples = self.buffered.len() * SAMPLES_PER_FRAME;
+		let coefficients = asrc_coefficients();
+		let maximum_step =
+			(available_samples as f64 - 1.0 - self.input_phase) / (SAMPLES_PER_FRAME - 1) as f64;
+		if maximum_step < 0.999 {
+			return false;
+		}
+		let step = step.min(maximum_step);
+		for output_index in 0..SAMPLES_PER_FRAME {
+			let source_position = self.input_phase + output_index as f64 * step;
+			let base = source_position.floor() as isize;
+			let fraction = source_position - base as f64;
+			let coefficient_position = fraction * ASRC_PHASES as f64;
+			let phase = (coefficient_position.floor() as usize).min(ASRC_PHASES - 1);
+			let blend = coefficient_position - phase as f64;
+			let mut left = 0.0;
+			let mut right = 0.0;
+			for tap in 0..ASRC_TAPS {
+				let coefficient =
+					coefficients[phase][tap] * (1.0 - blend) + coefficients[phase + 1][tap] * blend;
+				let offset = tap as isize - (ASRC_TAPS as isize - 1);
+				let sample = self.sample_at(base + offset);
+				left += coefficient * sample[0];
+				right += coefficient * sample[1];
+			}
+			output[output_index * 2] = left as f32;
+			output[output_index * 2 + 1] = right as f32;
+		}
+
+		self.input_phase += SAMPLES_PER_FRAME as f64 * step;
+		let frames_to_pop = (self.input_phase / SAMPLES_PER_FRAME as f64).floor() as usize;
+		self.input_phase -= frames_to_pop as f64 * SAMPLES_PER_FRAME as f64;
+		for _ in 0..frames_to_pop {
+			if let Some(frame) = self.buffered.pop_front() {
+				self.remember_frame(frame);
+			}
+		}
+		true
 	}
 
 	pub fn next(&mut self, input: &Receiver<CaptureFrame>, enabled: bool, stalled: bool) -> Batch {
@@ -79,7 +264,13 @@ impl CapturePacer {
 				break;
 			};
 			if self.buffered.len() == MAX {
-				self.buffered.pop_front();
+				if let Some(frame) = self.buffered.pop_front() {
+					self.remember_frame(frame);
+				}
+				self.input_phase = 0.0;
+				self.clock_matcher.reset();
+				self.history.clear();
+				self.primed = false;
 				self.discontinuity = true;
 			}
 			self.buffered.push_back(frame);
@@ -89,18 +280,26 @@ impl CapturePacer {
 				return Batch::default();
 			}
 			self.primed = true;
+			let CaptureFrame::Stereo(first) = self.buffered[0];
+			for _ in 0..ASRC_TAPS {
+				self.history
+					.push_back([f64::from(first[0]), f64::from(first[1])]);
+			}
+			self.clock_matcher.filtered_buffer_frames =
+				(self.buffered.len() as f64 - self.input_phase / SAMPLES_PER_FRAME as f64).max(0.0);
 		}
-		let mut batch = Batch::default();
-		batch.frames[0] = self.buffered.pop_front();
-		if batch.frames[0].is_none() {
+		let buffered_frames =
+			self.buffered.len() as f64 - self.input_phase / SAMPLES_PER_FRAME as f64;
+		let step = self.clock_matcher.update(buffered_frames);
+		let mut output = [0.0; 1_920];
+		if !self.resample_packet(&mut output, step) {
 			// Underrun: re-prime; the next frames are still contiguous audio.
 			self.primed = false;
-			return batch;
+			return Batch::default();
 		}
-		if self.buffered.len() >= HIGH {
-			batch.frames[1] = self.buffered.pop_front();
+		Batch {
+			frame: Some(CaptureFrame::Stereo(output)),
 		}
-		batch
 	}
 
 	/// Returns and clears whether audio was flushed or discarded since the last call.
@@ -118,10 +317,16 @@ mod tests {
 		CaptureFrame::Stereo([value; 1_920])
 	}
 	fn first(batch: &Batch) -> f32 {
-		let Some(CaptureFrame::Stereo(samples)) = batch.frames[0] else {
+		let Some(CaptureFrame::Stereo(samples)) = batch.frame else {
 			panic!("empty batch");
 		};
 		samples[0]
+	}
+	fn last(batch: &Batch) -> f32 {
+		let Some(CaptureFrame::Stereo(samples)) = batch.frame else {
+			panic!("empty batch");
+		};
+		samples[1_918]
 	}
 
 	#[test]
@@ -131,43 +336,91 @@ mod tests {
 		send.send(frame(1.0)).unwrap();
 		assert!(pacer.next(&receive, true, false).is_empty());
 		send.send(frame(2.0)).unwrap();
+		assert!(pacer.next(&receive, true, false).is_empty());
+		send.send(frame(3.0)).unwrap();
 		let batch = pacer.next(&receive, true, false);
-		assert_eq!(
-			(batch.frames.iter().flatten().count(), first(&batch)),
-			(1, 1.0)
-		);
+		assert_eq!(first(&batch), 1.0);
+		send.send(frame(4.0)).unwrap();
 		let batch = pacer.next(&receive, true, false);
-		assert_eq!(
-			(batch.frames.iter().flatten().count(), first(&batch)),
-			(1, 2.0)
-		);
+		assert!(first(&batch) > 0.99 && first(&batch) < 1.01);
+		assert!(last(&batch) > 1.99, "the new frame arrives in order");
 	}
 
 	#[test]
-	fn faster_capture_clock_never_overflows_the_channel() {
-		// 2% fast device clock plus an extra frame every 10 ticks for 30 s.
+	fn capture_clock_drift_never_bursts_or_blocks_capture() {
+		// A deliberately 12% fast producer must never cause packet bursts or block capture.
 		let (send, receive) = sync_channel(8);
 		let mut pacer = CapturePacer::default();
 		let mut overflows = 0;
 		let mut sent = 0;
 		let mut produced = 0;
 		for tick in 0..1_500 {
-			let count = if tick % 10 == 0 { 2 } else { 1 } + usize::from(tick % 50 == 0);
+			let count = (if tick % 10 == 0 { 2 } else { 1 }) + usize::from(tick % 50 == 0);
 			for _ in 0..count {
 				produced += 1;
 				if send.try_send(frame(0.1)).is_err() {
 					overflows += 1;
 				}
 			}
-			sent += pacer.next(&receive, true, false).into_frames().count();
-			assert!(
-				pacer.buffered.len() <= HIGH + 1,
-				"latency must stay bounded"
-			);
+			let batch = pacer.next(&receive, true, false);
+			let count = batch.into_frames().count();
+			assert!(count <= 1, "packet pacing never bursts frames");
+			sent += count;
+			assert!(pacer.buffered.len() <= MAX, "latency must stay bounded");
 		}
 		assert_eq!(overflows, 0);
-		assert!(!pacer.take_discontinuity());
-		assert!(produced - sent <= HIGH + 1);
+		assert!(
+			pacer.take_discontinuity(),
+			"persistent clock mismatch is visible"
+		);
+		assert!(sent <= 1_500);
+		assert!(produced > sent);
+	}
+
+	#[test]
+	fn sample_rate_matcher_tracks_both_clock_drift_directions_without_slips() {
+		for drift in [-0.001, 0.001] {
+			let mut matcher = CaptureClockMatcher::default();
+			let mut buffered_frames = TARGET_BUFFER_FRAMES;
+			let (mut minimum, mut maximum) = (buffered_frames, buffered_frames);
+			let mut last_step = 1.0;
+			for _ in 0..30_000 {
+				buffered_frames += 1.0 + drift;
+				last_step = matcher.update(buffered_frames);
+				buffered_frames -= last_step;
+				minimum = minimum.min(buffered_frames);
+				maximum = maximum.max(buffered_frames);
+			}
+			assert!(minimum > 0.5, "buffer underflowed at drift {drift}");
+			assert!(maximum < 3.5, "buffer grew at drift {drift}");
+			if drift > 0.0 {
+				assert!(last_step > 1.0, "fast input must be consumed faster");
+			} else {
+				assert!(last_step < 1.0, "slow input must be consumed slower");
+			}
+			assert!((last_step - 1.0).abs() <= MAX_DRIFT_CORRECTION);
+		}
+	}
+
+	#[test]
+	fn asynchronous_interpolator_stays_flat_through_20khz() {
+		let coefficients = asrc_coefficients();
+		let omega = std::f64::consts::TAU * 20_000.0 / 48_000.0;
+		let mut worst_gain_db: f64 = 0.0;
+		for phase in coefficients.iter().step_by(32) {
+			let (mut real, mut imaginary) = (0.0, 0.0);
+			for (tap, coefficient) in phase.iter().enumerate() {
+				let offset = tap as isize - (ASRC_TAPS as isize - 1);
+				real += coefficient * (omega * offset as f64).cos();
+				imaginary -= coefficient * (omega * offset as f64).sin();
+			}
+			let gain_db = 20.0 * real.hypot(imaginary).log10();
+			worst_gain_db = worst_gain_db.max(gain_db.abs());
+		}
+		assert!(
+			worst_gain_db < 0.05,
+			"20 kHz ASRC ripple {worst_gain_db:.4} dB"
+		);
 	}
 
 	#[test]

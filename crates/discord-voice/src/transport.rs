@@ -173,6 +173,14 @@ fn configure_microphone_encoder(
 		.map_err(|_| "Opus DTX configuration failed")?;
 	Ok(())
 }
+
+fn account_capture_clock_gap(timestamp: &mut u32, idle_ticks: &mut u32, timestamp_gap: &mut bool) {
+	if *timestamp_gap {
+		*timestamp = timestamp.wrapping_add(960u32.wrapping_mul(*idle_ticks));
+		*timestamp_gap = false;
+	}
+	*idle_ticks = 0;
+}
 #[derive(Default)]
 struct UdpFailures(Option<Instant>);
 impl UdpFailures {
@@ -633,8 +641,7 @@ async fn run_inner(
 						} else if sent_frames==0 {silence-=1;davey::OPUS_SILENCE_PACKET.to_vec()} else {break};
 						// RTP time follows the audio, not the tick: contiguous frames advance by
 						// exactly one frame, while a flush or new talk spurt skips the idle time.
-						if timestamp_gap {timestamp=timestamp.wrapping_add(960u32.wrapping_mul(idle_ticks));timestamp_gap=false;}
-						idle_ticks=0;
+						account_capture_clock_gap(&mut timestamp, &mut idle_ticks, &mut timestamp_gap);
 						let mut header=[0;12];header[0]=0x80;header[1]=120;header[2..4].copy_from_slice(&sequence.to_be_bytes());header[4..8].copy_from_slice(&timestamp.to_be_bytes());header[8..12].copy_from_slice(&ssrc.to_be_bytes());
 						let wire=encryption.as_mut().ok_or("Missing voice transport key")?.seal(&header,&data)?;
 						if let Some(socket)=&udp {udp_failures.send(socket,&wire,"Voice UDP send failed").await?;}
@@ -652,7 +659,9 @@ async fn run_inner(
 				}
 				if sent_frames==0 {idle_ticks=idle_ticks.saturating_add(1);}
 				if sent_frames>1 {send_stats_catchups=send_stats_catchups.saturating_add(1);}
-				if !active && !speaking {timestamp_gap=true;}
+				// A short capture underrun sends no RTP packet while the talk spurt remains
+				// open. Preserve that missing 20 ms on the media clock when audio resumes.
+				if sent_frames==0 {timestamp_gap=true;}
 				if now.duration_since(send_stats_at) >= Duration::from_secs(1) {
 					let elapsed_ms = now.duration_since(send_stats_at).as_millis().max(1) as u64;
 					let _ = emit(Status::AudioSendStats {
@@ -1589,6 +1598,175 @@ mod tests {
 	use crate::diagnostics::Signal;
 	use crate::video_receive::Receivers;
 	use opus2::Decoder;
+
+	#[test]
+	fn capture_underruns_advance_rtp_on_the_48khz_sample_clock() {
+		let mut timestamp = u32::MAX - 1_000;
+		let mut idle_ticks = 3;
+		let mut timestamp_gap = true;
+		account_capture_clock_gap(&mut timestamp, &mut idle_ticks, &mut timestamp_gap);
+		assert_eq!(timestamp, (u32::MAX - 1_000).wrapping_add(2_880));
+		assert_eq!(idle_ticks, 0);
+		assert!(!timestamp_gap);
+
+		// Ordinary catch-up bookkeeping without an actual capture gap cannot
+		// introduce a discontinuity in otherwise contiguous 960-sample packets.
+		idle_ticks = 2;
+		account_capture_clock_gap(&mut timestamp, &mut idle_ticks, &mut timestamp_gap);
+		assert_eq!(timestamp, (u32::MAX - 1_000).wrapping_add(2_880));
+		assert_eq!(idle_ticks, 0);
+	}
+
+	fn fit_tone(samples: &[(f64, f64)], sample_rate: f64, frequency: f64) -> (f64, f64) {
+		let (mut ss, mut cc, mut sc, mut ys, mut yc) = (0.0, 0.0, 0.0, 0.0, 0.0);
+		let mut sine_samples = Vec::with_capacity(samples.len());
+		for &(time, sample) in samples {
+			let phase = std::f64::consts::TAU * frequency * time / sample_rate;
+			let (sine, cosine) = phase.sin_cos();
+			sine_samples.push((sample, sine, cosine));
+			ss += sine * sine;
+			cc += cosine * cosine;
+			sc += sine * cosine;
+			ys += sample * sine;
+			yc += sample * cosine;
+		}
+		let determinant = ss * cc - sc * sc;
+		let sine_amplitude = (ys * cc - yc * sc) / determinant;
+		let cosine_amplitude = (yc * ss - ys * sc) / determinant;
+		let amplitude = sine_amplitude.hypot(cosine_amplitude);
+		let residual_rms = (sine_samples
+			.iter()
+			.map(|&(sample, sine, cosine)| {
+				let error = sample - sine_amplitude * sine - cosine_amplitude * cosine;
+				error * error
+			})
+			.sum::<f64>()
+			/ samples.len() as f64)
+			.sqrt();
+		(amplitude, residual_rms)
+	}
+
+	#[test]
+	fn configured_microphone_opus_path_preserves_fullband_level_and_stereo() {
+		const RATE: f64 = 48_000.0;
+		const FREQUENCY_POINTS: usize = 480;
+		const FRAMES: usize = 40;
+		const SKIP_FRAMES: usize = 8;
+		let settings = model::voice_settings::OpusSettings::default();
+		assert_eq!(settings.bitrate, 510_000);
+		let mut csv = String::from(
+			"frequency_hz,bitrate_bps,max_packet_bytes,left_gain_db,right_gain_db,left_residual_dbc,right_residual_dbc,left_crossfeed_dbc,right_crossfeed_dbc\n",
+		);
+		let mut response_failures = Vec::new();
+
+		for point in 0..=FREQUENCY_POINTS {
+			let frequency = 20.0 * 1_000.0f64.powf(point as f64 / FREQUENCY_POINTS as f64);
+			// Keep the stereo probes apart and below Opus's 20 kHz audio passband.
+			let right_frequency = if frequency <= 17_000.0 {
+				frequency + 1_000.0
+			} else {
+				frequency - 1_000.0
+			};
+			let mut encoder = microphone_encoder(settings).unwrap();
+			let mut decoder = Decoder::new(48_000, Channels::Stereo).unwrap();
+			let mut encoded = [0_u8; MIC_OPUS_MAX_BYTES];
+			let mut decoded = [0.0_f32; 1_920];
+			let mut left = Vec::with_capacity((FRAMES - SKIP_FRAMES) * 960);
+			let mut right = Vec::with_capacity((FRAMES - SKIP_FRAMES) * 960);
+			let mut max_packet_bytes = 0;
+
+			for frame in 0..FRAMES {
+				let mut input = [0.0_f32; 1_920];
+				for sample in 0..960 {
+					let index = frame * 960 + sample;
+					input[sample * 2] = (std::f64::consts::TAU * frequency * index as f64 / RATE)
+						.sin() as f32 * 0.25;
+					input[sample * 2 + 1] = (std::f64::consts::TAU * right_frequency * index as f64
+						/ RATE)
+						.sin() as f32 * 0.125;
+				}
+				let length = encoder.encode_float(&input, &mut encoded).unwrap();
+				if frame == 0 {
+					let toc_config = encoded[0] >> 3;
+					assert!(
+						toc_config >= 16,
+						"510 kb/s Audio/Music path should select CELT-only mode; TOC config was {toc_config}"
+					);
+				}
+				assert!(
+					length <= MIC_OPUS_MAX_BYTES,
+					"{frequency} Hz Opus packet exceeded the UDP payload budget: {length} bytes"
+				);
+				let samples = decoder
+					.decode_float(&encoded[..length], &mut decoded, false)
+					.unwrap();
+				assert_eq!(samples, 960);
+				max_packet_bytes = max_packet_bytes.max(length);
+				if frame >= SKIP_FRAMES {
+					left.extend((0..samples).map(|i| f64::from(decoded[i * 2])));
+					right.extend((0..samples).map(|i| f64::from(decoded[i * 2 + 1])));
+				}
+			}
+
+			let left_samples = left
+				.iter()
+				.enumerate()
+				.map(|(i, &v)| (i as f64, v))
+				.collect::<Vec<_>>();
+			let right_samples = right
+				.iter()
+				.enumerate()
+				.map(|(i, &v)| (i as f64, v))
+				.collect::<Vec<_>>();
+			let (left_amplitude, left_residual) = fit_tone(&left_samples, RATE, frequency);
+			let (right_amplitude, right_residual) = fit_tone(&right_samples, RATE, right_frequency);
+			let left_gain_db = 20.0 * (left_amplitude / 0.25).log10();
+			let right_gain_db = 20.0 * (right_amplitude / 0.125).log10();
+			let within_flat_band = frequency <= 18_000.0 && right_frequency <= 18_000.0;
+			if within_flat_band && left_gain_db.abs() >= 1.5 {
+				response_failures.push(format!(
+					"{frequency} Hz left-channel Opus gain {left_gain_db:.3} dB"
+				));
+			}
+			if within_flat_band && right_gain_db.abs() >= 1.5 {
+				response_failures.push(format!(
+					"{right_frequency} Hz right-channel Opus gain {right_gain_db:.3} dB"
+				));
+			}
+			let (left_bleed, _) = fit_tone(&left_samples, RATE, right_frequency);
+			let (right_bleed, _) = fit_tone(&right_samples, RATE, frequency);
+			let left_bleed_db = 20.0 * (left_bleed / left_amplitude).max(1e-12).log10();
+			let right_bleed_db = 20.0 * (right_bleed / right_amplitude).max(1e-12).log10();
+			if within_flat_band && left_bleed_db >= -35.0 {
+				response_failures.push(format!(
+					"{right_frequency} Hz leaked into left channel at {left_bleed_db:.1} dB"
+				));
+			}
+			if within_flat_band && right_bleed_db >= -35.0 {
+				response_failures.push(format!(
+					"{frequency} Hz leaked into right channel at {right_bleed_db:.1} dB"
+				));
+			}
+			use std::fmt::Write as _;
+			writeln!(
+				csv,
+				"{frequency:.6},{},{max_packet_bytes},{left_gain_db:.9},{right_gain_db:.9},{:.3},{:.3},{left_bleed_db:.3},{right_bleed_db:.3}",
+				settings.bitrate,
+				20.0 * (left_residual / left_amplitude).max(1e-12).log10(),
+				20.0 * (right_residual / right_amplitude).max(1e-12).log10(),
+			)
+			.expect("writing to a string cannot fail");
+		}
+		if let Some(path) = std::env::var_os("ASCENDCORD_OPUS_CSV") {
+			std::fs::write(path, csv)
+				.expect("write measured configured microphone Opus response CSV");
+		}
+		assert!(
+			response_failures.is_empty(),
+			"configured microphone Opus response failed:\n{}",
+			response_failures.join("\n")
+		);
+	}
 
 	#[test]
 	fn decoder_cleanup_announcement_preserves_streams_and_partial_updates() {
