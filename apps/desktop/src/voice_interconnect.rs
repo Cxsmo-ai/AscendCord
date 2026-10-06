@@ -26,10 +26,10 @@ fn origin_allowed(method: &str, path: &str, origin: Option<&str>) -> bool {
 		return true;
 	}
 
-	// Chromium may omit Origin on a simple extension-worker GET. Keep the
-	// originless exception read-only and limited to the status endpoint; every
-	// write and preflight still requires the pinned extension origin.
-	method == "GET" && path == "/v1/status" && origin.is_none()
+	// Chromium may omit Origin or serialize it as "null" on a simple
+	// extension-worker GET. Keep the exception read-only and limited to status;
+	// every write and preflight still requires the pinned extension origin.
+	method == "GET" && path == "/v1/status" && origin.is_none_or(|value| value == "null")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -665,9 +665,12 @@ mod tests {
 	#[test]
 	fn originless_status_get_is_read_only_compatibility() {
 		assert!(origin_allowed("GET", "/v1/status", None));
+		assert!(origin_allowed("GET", "/v1/status", Some("null")));
 		assert!(!origin_allowed("GET", "/v1/receiver", None));
 		assert!(!origin_allowed("POST", "/v1/diagnostics", None));
+		assert!(!origin_allowed("POST", "/v1/diagnostics", Some("null")));
 		assert!(!origin_allowed("OPTIONS", "/v1/status", None));
+		assert!(!origin_allowed("OPTIONS", "/v1/status", Some("null")));
 		assert!(!origin_allowed(
 			"GET",
 			"/v1/status",
