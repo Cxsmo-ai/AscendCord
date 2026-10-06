@@ -225,9 +225,12 @@ impl CapturePacer {
 			let blend = coefficient_position - phase as f64;
 			let mut left = 0.0;
 			let mut right = 0.0;
-			for tap in 0..ASRC_TAPS {
-				let coefficient =
-					coefficients[phase][tap] * (1.0 - blend) + coefficients[phase + 1][tap] * blend;
+			for (tap, (&coefficient_start, &coefficient_end)) in coefficients[phase]
+				.iter()
+				.zip(coefficients[phase + 1].iter())
+				.enumerate()
+			{
+				let coefficient = coefficient_start * (1.0 - blend) + coefficient_end * blend;
 				let offset = tap as isize - (ASRC_TAPS as isize - 1);
 				let sample = self.sample_at(base + offset);
 				left += coefficient * sample[0];
