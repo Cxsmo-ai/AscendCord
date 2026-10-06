@@ -105,7 +105,7 @@ function render(status, localSpectrum, diagnostics, bridgeError = "") {
         : "Exact sender SSRC matched · ready to capture the log-frequency response."
       : sender?.test_sweep_active
         ? "Sweep is active, but no exact receiver SSRC match is available yet."
-        : "Set ASCENDCORD_TEST_SWEEP=1 before launch; the diagnostic replaces microphone audio with an equal-level stepped sweep.";
+        : "Launch AscendCord with --test-sweep-channel=<voice-channel-id> to enable the equal-level stepped sweep. Without the argument, audio runs normally.";
 
   text(byId("receiver"), receiverConnected
     ? match

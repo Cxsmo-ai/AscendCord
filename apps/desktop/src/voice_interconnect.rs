@@ -312,6 +312,20 @@ impl Interconnect {
 		}
 	}
 
+	/// A completed response belongs to the current sender only when the receiver
+	/// reports its exact SSRC while diagnostics are fresh.
+	pub fn sweep_test_state(&self, sender_ssrc: u32) -> Option<(bool, bool)> {
+		let shared = self.shared.lock().ok()?;
+		if shared
+			.extension_diagnostics_at
+			.is_none_or(|at| at.elapsed() > DIAGNOSTICS_MAX_AGE)
+		{
+			return None;
+		}
+		let test = shared.extension_diagnostics.as_ref()?.sweep_test.as_ref()?;
+		(test.sender_ssrc == Some(sender_ssrc)).then_some((test.running, test.export_ready))
+	}
+
 	pub fn snapshot(&self) -> Value {
 		let Ok(shared) = self.shared.lock() else {
 			return json!({"enabled": false});

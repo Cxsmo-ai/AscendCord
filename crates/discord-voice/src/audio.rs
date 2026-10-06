@@ -5,7 +5,7 @@ use miniaudio::{Context, Device, DeviceConfig, DeviceType, Format};
 use model::voice_settings::VoiceProcessing;
 use std::{
 	sync::{
-		Arc,
+		Arc, OnceLock,
 		atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
 		mpsc,
 	},
@@ -18,6 +18,31 @@ const CHANNELS: u32 = 2;
 const PERIOD: u32 = 960;
 const PCM_SAMPLES: usize = PERIOD as usize * CHANNELS as usize;
 const TEST_SWEEP_FRAME_PERIOD: Duration = Duration::from_millis(20);
+
+fn parse_test_sweep_channel_args(
+	args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<u64> {
+	let mut args = args.into_iter();
+	while let Some(arg) = args.next() {
+		let Some(arg) = arg.to_str() else {
+			continue;
+		};
+		let value = match arg.strip_prefix("--test-sweep-channel=") {
+			Some(value) => value.to_owned(),
+			None if arg == "--test-sweep-channel" => args.next()?.into_string().ok()?,
+			None => continue,
+		};
+		let channel = value.parse::<u64>().ok()?;
+		return (channel != 0).then_some(channel);
+	}
+	None
+}
+
+/// Explicit diagnostic channel. Without this argument, calls use the normal audio path.
+pub fn test_sweep_channel() -> Option<u64> {
+	static CHANNEL: OnceLock<Option<u64>> = OnceLock::new();
+	*CHANNEL.get_or_init(|| parse_test_sweep_channel_args(std::env::args_os().skip(1)))
+}
 
 fn next_test_sweep_frame(sweep: &mut crate::test_sweep::Sweep) -> StereoFrame {
 	let mut frame = [0.0; PCM_SAMPLES];
@@ -216,8 +241,7 @@ impl Audio {
 		preview: bool,
 	) -> Result<Self, &'static str> {
 		let gate = Arc::new(Gate::default());
-		let test_sweep_active =
-			!preview && std::env::var("ASCENDCORD_TEST_SWEEP").is_ok_and(|value| value == "1");
+		let test_sweep_active = !preview && test_sweep_channel().is_some();
 		// The microphone test exists to show the level.
 		gate.meter.store(preview, Ordering::Relaxed);
 		let (settings, mut selected) = watch::channel(settings_value);
@@ -788,6 +812,36 @@ fn open_devices(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn synthetic_sweep_requires_explicit_valid_launch_argument() {
+		use std::ffi::OsString;
+
+		assert_eq!(parse_test_sweep_channel_args([]), None);
+		assert_eq!(
+			parse_test_sweep_channel_args([OsString::from("--unrelated"), OsString::from("x")]),
+			None
+		);
+		assert_eq!(
+			parse_test_sweep_channel_args([OsString::from("--test-sweep-channel=0")]),
+			None
+		);
+		assert_eq!(
+			parse_test_sweep_channel_args([OsString::from("--test-sweep-channel=bad")]),
+			None
+		);
+		assert_eq!(
+			parse_test_sweep_channel_args([
+				OsString::from("--test-sweep-channel"),
+				OsString::from("123")
+			]),
+			Some(123)
+		);
+		assert_eq!(
+			parse_test_sweep_channel_args([OsString::from("--test-sweep-channel=123")]),
+			Some(123)
+		);
+	}
 
 	#[test]
 	fn capture_sanitization_preserves_every_finite_sample_bit_for_bit() {

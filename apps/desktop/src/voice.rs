@@ -27,6 +27,10 @@ fn permission_mutes_microphone(
 			&& !(push_to_talk && ptt_active))
 }
 
+fn configured_test_sweep_target() -> Option<Id> {
+	discord_voice::audio::test_sweep_channel().map(Id)
+}
+
 const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 const VOICE_SOAK_SILENCE_TIMEOUT: Duration = Duration::from_secs(8);
 const VOICE_SOAK_CAPTURE_REOPEN_DELAY: Duration = Duration::from_secs(20);
@@ -475,6 +479,8 @@ pub struct Voice {
 	camera_scan: Option<mpsc::Receiver<Result<discord_voice::camera::DeviceList, &'static str>>>,
 	soak: Option<VoiceSoak>,
 	soak_leave_pending: bool,
+	test_sweep_auto_join_disabled: bool,
+	test_sweep_capture_seen: bool,
 	bridge: VoiceBridge,
 }
 impl Voice {
@@ -849,6 +855,7 @@ impl Voice {
 					}
 				}
 				BridgeCommand::Stop => {
+					self.test_sweep_auto_join_disabled = configured_test_sweep_target().is_some();
 					self.stop();
 					ui.voice_soak_requested = false;
 					ui.voice_soak_status = "Stopped from the local control bridge.".into();
@@ -900,6 +907,60 @@ impl Voice {
 					}
 				}
 			}
+		}
+		let sweep_status = self
+			.live
+			.as_ref()
+			.filter(|live| live.audio.test_sweep_active())
+			.and_then(|live| {
+				live.audio_ssrc
+					.and_then(|ssrc| self.bridge.interconnect.sweep_test_state(ssrc))
+			});
+		if let Some((running, export_ready)) = sweep_status {
+			self.test_sweep_capture_seen |= running;
+			if self.test_sweep_capture_seen && !running && export_ready {
+				self.test_sweep_auto_join_disabled = true;
+				self.test_sweep_capture_seen = false;
+				self.stop();
+				ui.voice_soak_requested = false;
+				ui.voice_soak_status =
+					"Synthetic receiver test finished; report saved in the extension. Leaving the test call.".into();
+				if let Some(command) = state.leave_call() {
+					self.bridge.write_status(state, None, ui, None);
+					return Some(command);
+				}
+			}
+		}
+		// In synthetic sweep mode, a configured channel is an explicit test target.
+		// Seed the existing same-channel soak once so the test joins automatically
+		// after login and resumes after app restarts. Never guess a channel or
+		// interrupt a different active call.
+		if self.soak.is_none()
+			&& !self.test_sweep_auto_join_disabled
+			&& self.bridge.target().is_none()
+			&& let Some(channel) = configured_test_sweep_target()
+			&& state.auth == client_core::auth::AuthState::Authenticated
+			&& state.gateway_connected
+			&& let Some(user) = state.user.as_ref().map(|user| user.id)
+			&& state
+				.voice
+				.active
+				.as_ref()
+				.is_none_or(|call| call.channel == channel)
+		{
+			let now = Instant::now();
+			self.bridge.save_target(channel, user);
+			ui.voice_soak_requested = true;
+			self.soak = Some(VoiceSoak {
+				channel,
+				user,
+				retries: 0,
+				retry_at: state.voice.active.is_none().then_some(now),
+				silent_since: None,
+				capture_reopens: 0,
+				next_capture_reopen: now + VOICE_SOAK_SILENCE_TIMEOUT,
+				status: "Auto-joining the configured synthetic audio test channel".into(),
+			});
 		}
 		if self.soak.is_none()
 			&& let Some(target) = self.bridge.target()
