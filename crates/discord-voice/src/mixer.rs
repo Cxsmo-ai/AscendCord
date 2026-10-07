@@ -127,6 +127,11 @@ impl Mixer {
 					};
 					speaker.offset = 0;
 					speaker.length = length;
+					crate::lab::returns::feed(
+						speaker.ssrc,
+						&speaker.pcm[..length * 2],
+						opus.is_empty(),
+					);
 					heard |= !opus.is_empty() && opus != davey::OPUS_SILENCE_PACKET;
 				}
 				let count = (output.len() / 2 - filled).min(speaker.length - speaker.offset);

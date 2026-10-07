@@ -50,6 +50,13 @@
   });
 
   chrome.runtime.onMessage.addListener(message => {
+    if (message?.kind === "tesktop-return-path") {
+      window.postMessage({
+        source: "tesktop-stereo-proof-control",
+        returnPath: message.active === true,
+      }, location.origin);
+      return;
+    }
     if (message?.kind !== "tesktop-curve-capture") return;
     window.postMessage({
       source: "tesktop-stereo-proof-control",

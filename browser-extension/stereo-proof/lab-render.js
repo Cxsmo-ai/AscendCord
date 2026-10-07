@@ -137,10 +137,10 @@
   const fmt = (value, digits = 1, suffix = "") =>
     Number.isFinite(value) ? `${value.toFixed(digits)}${suffix}` : "—";
 
-  function header(ctx, report, settings, baseline) {
+  function header(ctx, report, settings, baseline, title) {
     ctx.fillStyle = COLORS.text; ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
     ctx.font = `600 52px ${FONT}`;
-    ctx.fillText("AscendCord audio lab · AscendCord to Discord to the browser", 60, 86);
+    ctx.fillText(title, 60, 86);
     ctx.font = `26px ${FONT}`; ctx.fillStyle = COLORS.muted;
     const s = report.summary;
     const rows = [
@@ -168,15 +168,19 @@
   }
 
   /** Renders the report; returns the canvas height it needed. */
-  function render(canvas, report, { settings = null, baseline = null, samples = [] } = {}) {
-    const panels = 6 + (baseline ? 1 : 0);
-    const top = 470 + (baseline ? 40 : 0);
+  function render(canvas, report, {
+    settings = null, baseline = null, samples = [],
+    title = "AscendCord audio lab · AscendCord to Discord to the browser",
+    baselineKey = "measurement_lab",
+  } = {}) {
+    const panels = 5 + (samples.length ? 1 : 0) + (baseline?.[baselineKey] ? 1 : 0);
+    const top = 470 + (baseline?.[baselineKey] ? 40 : 0);
     canvas.width = WIDTH;
     canvas.height = top + panels * PANEL_HEIGHT + 40;
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = COLORS.background; ctx.fillRect(0, 0, canvas.width, canvas.height);
-    header(ctx, report, settings, baseline);
-    const base = baseline?.measurement_lab;
+    header(ctx, report, settings, baseline, title);
+    const base = baseline?.[baselineKey];
     let y = top;
     const dashed = [14, 10];
 
@@ -237,6 +241,7 @@
     y += PANEL_HEIGHT;
 
     // 6. Network timeline during the capture.
+    if (samples.length) {
     const matched = samples.filter(sample => sample.sender_match === true);
     const times = matched.map(sample => sample.at_ms);
     const t0 = times[0] ?? 0, t1 = times[times.length - 1] ?? 1;
@@ -257,6 +262,7 @@
     line(ctx, map, times, loss.values, COLORS.fourth, { width: 3, points: false });
     legend(ctx, map, [["Bitrate", COLORS.left], ["Jitter", COLORS.right], ["Jitter buffer", COLORS.third], ["Loss", COLORS.fourth]]);
     y += PANEL_HEIGHT;
+    }
 
     // 7. Difference from the baseline run.
     if (base) {

@@ -106,6 +106,7 @@ function beginTest(automatic = false, tabId = null) {
     tab_id: Number.isInteger(tabId) ? tabId : null,
     automatic,
     program: latestSender?.test_program === 2 && Lab ? 2 : 1,
+    return_path: latestSender?.test_program === 2 && Lab && latestSender?.return_lab_supported === true,
     lab: latestSender?.test_program === 2 && Lab ? Lab.createLab() : null,
     analysis_sample_rate_hz: null,
     samples: [],
@@ -170,13 +171,14 @@ function finishTest() {
       } : null,
       pipeline_validation: validateCompletedPipeline(completedTest, curve, curveSummary),
       measurement_lab: measurementLab,
+      return_lab: measurementLab ? returnLab() : null,
       sender_settings: senderSettings,
       test_samples: completedTest.samples.slice(-300),
     },
     test: { ...completedTest, lab: undefined, samples: [...completedTest.samples] },
   };
   persistCompletedExport();
-  if (measurementLab) saveLabHistory(completedTest, measurementLab, senderSettings);
+  if (measurementLab) saveLabHistory(completedTest, measurementLab, senderSettings, returnLab());
 }
 
 /** The settings a run was made with, so two runs can be told apart and compared. */
@@ -220,13 +222,14 @@ function curveFromLab(report, test) {
   };
 }
 
-function saveLabHistory(test, report, settings) {
+function saveLabHistory(test, report, settings, returned = null) {
   if (!chrome.storage?.local?.get || !chrome.storage?.local?.set) return;
   const entry = {
     id: test.id,
     finished_at_ms: test.ended_at_ms,
     sender_settings: settings,
     measurement_lab: report,
+    return_lab: returned,
   };
   chrome.storage.local.get(LAB_HISTORY_KEY).then(saved => {
     const history = Array.isArray(saved?.[LAB_HISTORY_KEY]) ? saved[LAB_HISTORY_KEY] : [];
@@ -362,7 +365,22 @@ function setCurveCapture(active, tabId = latestSpectrum?.tabId) {
     chrome.tabs.sendMessage(tabId, {
       kind: "tesktop-curve-capture", active,
     }).catch(() => {});
+    // Program 2 also plays back from the browser so AscendCord measures what it receives.
+    const returnPath = active && activeTest?.program === 2 &&
+      latestSender?.return_lab_supported === true;
+    if (returnPath || !active) {
+      chrome.tabs.sendMessage(tabId, {
+        kind: "tesktop-return-path", active: returnPath,
+      }).catch(() => {});
+    }
   }
+}
+
+/** AscendCord's measurement of the program the browser sent back, bounded before keeping. */
+function returnLab() {
+  const report = latestSender?.return_lab;
+  if (!report || typeof report !== "object" || report.version !== 2) return null;
+  return JSON.stringify(report).length <= 65_536 ? report : null;
 }
 
 function updateSenderStatus(status) {
@@ -486,8 +504,9 @@ function collectTestSamples(report, tabId) {
     activeTest.samples.splice(0, activeTest.samples.length - MAX_TEST_SAMPLES);
   }
   const elapsed = Date.now() - autoCaptureStartedAt;
+  const returnDone = activeTest?.return_path !== true || (returnLab()?.passes ?? 0) >= LAB_PASSES;
   const labDone = activeTest?.lab
-    ? activeTest.lab.passes >= LAB_PASSES || elapsed >= LAB_MAX_CAPTURE_MS : null;
+    ? (activeTest.lab.passes >= LAB_PASSES && returnDone) || elapsed >= LAB_MAX_CAPTURE_MS : null;
   if (autoSweepRunStarted && activeTest && autoCaptureStartedAt > 0 &&
       (labDone ?? elapsed >= AUTO_CAPTURE_DURATION_MS)) {
     finishTest();
@@ -609,6 +628,8 @@ function handleMessage(message, sender, sendResponse) {
     diagnostics.observerState = message.observer.state.slice(0, 48);
     diagnostics.observerApi = message.observer.peer_api === true;
     diagnostics.observerError = String(message.observer.error ?? "").slice(0, 180);
+    diagnostics.returnPathState = typeof message.observer.return_path === "string"
+      ? message.observer.return_path.slice(0, 32) : "off";
     diagnostics.observerAt = Date.now();
     publishDiagnostics();
     sendResponse({ ok: true });
@@ -756,9 +777,12 @@ function handleMessage(message, sender, sendResponse) {
       pipeline_validation: completedExport?.diagnostics?.pipeline_validation ?? null,
       sweep_curve: completedExport?.diagnostics?.sweep_curve ?? null,
       measurement_lab: completedExport?.diagnostics?.measurement_lab ?? null,
+      return_lab: completedExport?.diagnostics?.return_lab ?? null,
+      return_path_state: diagnostics.returnPathState ?? "off",
       sender_settings: completedExport?.diagnostics?.sender_settings ?? null,
       lab_progress: activeTest?.lab ? {
         passes: activeTest.lab.passes,
+        return_passes: activeTest.return_path ? returnLab()?.passes ?? 0 : null,
         passes_needed: LAB_PASSES,
         section: activeTest.lab.section,
         windows: { ...activeTest.lab.windows },

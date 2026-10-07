@@ -507,8 +507,44 @@
     };
   }
 
+  /**
+   * One pass of the program as AscendCord's test_sweep.rs renders it: per-segment phase from
+   * zero, a linear 50 ms fade at both ends, left and right in float32.
+   */
+  function renderPass(rate = 48_000) {
+    const segments = [{ kind: "silence", ms: PROGRAM.silence_ms }];
+    for (const hz of PROGRAM.sweep_hz) segments.push({ kind: "mono", hz, peak: 0.25, ms: PROGRAM.step_ms });
+    for (const kind of ["left", "right", "antiphase"]) {
+      for (const hz of PROGRAM.channel_hz) segments.push({ kind, hz, peak: 0.25, ms: PROGRAM.step_ms });
+    }
+    PROGRAM.ladder_dbfs.forEach((dbfs, index) => segments.push({
+      kind: "mono", hz: PROGRAM.ladder_hz[index], peak: 10 ** (dbfs / 20), ms: PROGRAM.ladder_step_ms,
+    }));
+    const frames = segments.reduce((sum, s) => sum + Math.floor(rate * s.ms / 1000), 0);
+    const left = new Float32Array(frames), right = new Float32Array(frames);
+    const fade = Math.floor(rate * 50 / 1000);
+    let at = 0;
+    for (const segment of segments) {
+      const length = Math.floor(rate * segment.ms / 1000);
+      let phase = 0;
+      const step = 2 * Math.PI * (segment.hz ?? 0) / rate;
+      for (let i = 0; i < length; i++, at++) {
+        if (segment.kind === "silence") continue;
+        const ramp = Math.min(1, Math.min(i, length - i) / fade);
+        const value = Math.fround(Math.sin(phase) * segment.peak * ramp);
+        phase += step;
+        if (phase >= 2 * Math.PI) phase %= 2 * Math.PI;
+        if (segment.kind === "left") left[at] = value;
+        else if (segment.kind === "right") right[at] = value;
+        else if (segment.kind === "antiphase") { left[at] = value; right[at] = -value; }
+        else { left[at] = value; right[at] = value; }
+      }
+    }
+    return { left, right, frames };
+  }
+
   root.AscendCordLab = Object.freeze({
-    PROGRAM, rms, fitTone, distortion, nearestTone, analyzeWindow,
+    PROGRAM, renderPass, rms, fitTone, distortion, nearestTone, analyzeWindow,
     createLab, addWindow, finalizeLab, compare, linearFit, finite, db20,
   });
 })(globalThis);

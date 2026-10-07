@@ -442,6 +442,9 @@ async function renderLab(diagnostics) {
   if (progress) {
     const w = progress.windows;
     text(status, `CAPTURING · pass ${Math.min(progress.passes + 1, progress.passes_needed)} of ${progress.passes_needed} · ${progress.section ?? "waiting for the program's silence"} · ${w.accepted} measured · ${w.transitional} transitional · ${w.contaminated} with concealment · ${w.unknown} unidentified`);
+    text(byId("lab-return-status"), progress.return_passes === null
+      ? "Return path not offered by this AscendCord build."
+      : `RETURN PATH · browser ${diagnostics.return_path_state} · AscendCord measured ${progress.return_passes} of ${progress.passes_needed} passes`);
   }
   const history = await safeSend({ kind: "tesktop-read-lab-history" });
   labHistory = history?.ok && Array.isArray(history.history) ? history.history : [];
@@ -475,6 +478,15 @@ async function renderLab(diagnostics) {
     baseline,
     samples: diagnostics.test_samples ?? [],
   });
+  const returned = diagnostics.return_lab;
+  if (returned) {
+    text(byId("lab-return-status"), `Browser to AscendCord · ${returned.passes} passes · ${returned.summary.measured_response_bands}/48 bands · ${returned.summary.stereo_preserved ? "stereo preserved" : "stereo NOT preserved (Discord Web usually sends mono)"}`);
+    AscendCordLabRender.render(byId("lab-return"), returned, {
+      baseline,
+      baselineKey: "return_lab",
+      title: "AscendCord audio lab · the browser to Discord to AscendCord",
+    });
+  }
 }
 
 async function refresh() {

@@ -6,6 +6,7 @@ mod capture;
 mod crypto;
 mod diagnostics;
 mod jitter;
+pub mod lab;
 mod mixer;
 pub mod resample;
 pub mod screen;

@@ -376,6 +376,68 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
     }
   }
 
+  // Return path: while a program 2 test runs, Discord Web's outgoing microphone track is
+  // swapped for the same program so AscendCord can measure what arrives on its side. The
+  // original track is always put back when the test ends.
+  let returnPath = null;
+  let returnPathState = "off";
+
+  async function startReturnPath() {
+    if (returnPath || !globalThis.AscendCordLab) return;
+    const ctx = context();
+    if (!ctx || ctx.state !== "running") {
+      returnPathState = "audio-suspended";
+      return;
+    }
+    const senders = [];
+    for (const peer of peers) {
+      for (const sender of peer.getSenders?.() ?? []) {
+        if (sender.track?.kind === "audio") senders.push(sender);
+      }
+    }
+    if (!senders.length) {
+      returnPathState = "no-microphone-sender";
+      return;
+    }
+    const { left, right, frames } = globalThis.AscendCordLab.renderPass(ctx.sampleRate);
+    const buffer = ctx.createBuffer(2, frames, ctx.sampleRate);
+    buffer.copyToChannel(left, 0);
+    buffer.copyToChannel(right, 1);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.loop = true;
+    const destination = ctx.createMediaStreamDestination();
+    destination.channelCount = 2;
+    source.connect(destination);
+    source.start();
+    const track = destination.stream.getAudioTracks()[0];
+    const replaced = [];
+    for (const sender of senders) {
+      const original = sender.track;
+      try {
+        await sender.replaceTrack(track);
+        replaced.push({ sender, original });
+      } catch {}
+    }
+    returnPath = { source, track, replaced };
+    returnPathState = replaced.length ? "playing" : "replace-failed";
+  }
+
+  async function stopReturnPath() {
+    if (!returnPath) {
+      returnPathState = "off";
+      return;
+    }
+    const { source, track, replaced } = returnPath;
+    returnPath = null;
+    for (const { sender, original } of replaced) {
+      try { await sender.replaceTrack(original); } catch {}
+    }
+    try { source.stop(); } catch {}
+    track.stop();
+    returnPathState = "off";
+  }
+
   async function sample() {
     if (running) return;
     running = true;
@@ -393,6 +455,7 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
           peer_api: typeof window.RTCPeerConnection === "function",
           error: lastInstallError,
           at_ms: Date.now(),
+          return_path: returnPathState,
         },
         report: {
           protocol: 1,
@@ -417,6 +480,12 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
   window.addEventListener("message", event => {
     if (event.source !== window || event.origin !== location.origin ||
         event.data?.source !== "tesktop-stereo-proof-control") return;
+    if (typeof event.data.returnPath === "boolean") {
+      (event.data.returnPath ? startReturnPath() : stopReturnPath()).catch(() => {
+        returnPathState = "error";
+      });
+      return;
+    }
     const next = event.data.captureCurve === true;
     if (curveCapture === next) return;
     curveCapture = next;

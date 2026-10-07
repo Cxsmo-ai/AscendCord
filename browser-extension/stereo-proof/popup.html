@@ -79,7 +79,9 @@
         <button id="export-lab" class="action secondary" disabled>Download lab JSON</button>
       </div>
       <div id="lab-status" class="empty">Launch AscendCord with --test-sweep-channel=&lt;voice-channel-id&gt;. The lab report appears here after two passes.</div>
-      <canvas id="lab" class="lab-canvas" width="2400" height="10" aria-label="Audio lab report"></canvas>
+      <canvas id="lab" class="lab-canvas" width="2400" height="10" aria-label="Audio lab report, AscendCord to the browser"></canvas>
+      <div id="lab-return-status" class="empty">The browser plays the same program back during the test; AscendCord's measurement of it appears here.</div>
+      <canvas id="lab-return" class="lab-canvas" width="2400" height="10" aria-label="Audio lab report, the browser to AscendCord"></canvas>
     </section>
     <footer>Local statistics only · no audio is captured, stored, or relayed.</footer>
   </main>

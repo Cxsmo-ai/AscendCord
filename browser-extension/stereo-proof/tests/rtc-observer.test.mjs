@@ -51,3 +51,65 @@ test("installs the WebRTC observer when RTCPeerConnection appears after document
   assert.equal(window.RTCPeerConnection, wrapped, "installation should be idempotent");
   assert.equal(installTimer.cleared, true);
 });
+
+test("the return path swaps the outgoing microphone for the program and puts it back", async () => {
+  const labSource = await readFile(new URL("../lab.js", import.meta.url), "utf8");
+  const source = await readFile(new URL("../rtc-observer.js", import.meta.url), "utf8");
+  const listeners = [];
+  const posted = [];
+  const window = {
+    addEventListener(kind, listener) { if (kind === "message") listeners.push(listener); },
+    postMessage(message) { posted.push(message); },
+  };
+  const microphone = { kind: "audio", id: "mic" };
+  const replaced = [];
+  const sender = {
+    track: microphone,
+    async replaceTrack(track) { replaced.push(track); this.track = track; },
+  };
+  class Peer {
+    addEventListener() {}
+    getSenders() { return [sender, { track: { kind: "video" }, replaceTrack() { throw new Error("video"); } }]; }
+  }
+  const programTrack = { kind: "audio", id: "program", stopped: false, stop() { this.stopped = true; } };
+  let started = 0, stopped = 0, copied = 0;
+  class AudioContext {
+    constructor() { this.state = "running"; this.sampleRate = 48_000; }
+    resume() { return Promise.resolve(); }
+    createBuffer(channels, frames) {
+      return { channels, frames, copyToChannel(data) { copied += data.length; } };
+    }
+    createBufferSource() {
+      return { connect() {}, start() { started++; }, stop() { stopped++; } };
+    }
+    createMediaStreamDestination() {
+      return { stream: { getAudioTracks: () => [programTrack] } };
+    }
+  }
+  const context = vm.createContext({
+    window, AudioContext, MediaStream: class {},
+    location: { origin: "https://discord.com" },
+    setInterval: () => ({}), clearInterval() {}, setTimeout() {},
+  });
+  window.RTCPeerConnection = Peer;
+  vm.runInContext(labSource, context);
+  vm.runInContext(source, context);
+  new window.RTCPeerConnection();
+  const control = returnPath => listeners.forEach(listener => listener({
+    source: window, origin: "https://discord.com",
+    data: { source: "tesktop-stereo-proof-control", returnPath },
+  }));
+
+  control(true);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(sender.track, programTrack);
+  assert.equal(started, 1);
+  assert.equal(copied, 2 * context.AscendCordLab.renderPass(48_000).frames);
+
+  control(false);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(sender.track, microphone, "the microphone track is restored");
+  assert.equal(stopped, 1);
+  assert.equal(programTrack.stopped, true);
+  assert.deepEqual(replaced.map(track => track.id), ["program", "mic"]);
+});

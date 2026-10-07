@@ -437,3 +437,75 @@ test("program 2 captures until two full passes and keeps a comparable lab report
   assert.equal(history.history.length, 1);
   assert.equal(history.history[0].measurement_lab.passes, 2);
 });
+
+test("program 2 also plays back from the browser and waits for AscendCord's measurement", async () => {
+  const labSource = await readFile(new URL("../lab.js", import.meta.url), "utf8");
+  const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
+  let onMessage;
+  let now = 80_000;
+  let returnPasses = 0;
+  const controls = [];
+  const storage = {};
+  const chrome = {
+    runtime: { onMessage: { addListener(listener) { onMessage = listener; } } },
+    tabs: { onRemoved: { addListener() {} }, sendMessage: async (_tab, message) => { controls.push(message); return {}; } },
+    storage: { local: {
+      get: async key => ({ [key]: storage[key] }),
+      set: async values => Object.assign(storage, values),
+      remove: async key => { delete storage[key]; },
+    } },
+  };
+  const context = vm.createContext({
+    chrome, URL, AbortController, setTimeout, clearTimeout,
+    Date: class extends Date { static now() { return now; } },
+    fetch: async url => {
+      if (url.endsWith("/v1/status")) {
+        return { ok: true, status: 200, json: async () => ({ sender: {
+          audio_ssrc: 93, test_sweep_active: true, send_enabled: true, test_program: 2,
+          return_lab_supported: true,
+          return_lab: { version: 2, passes: returnPasses, ssrc: 5, summary: { measured_response_bands: 48 } },
+        } }) };
+      }
+      return { ok: true, status: 204 };
+    },
+  });
+  vm.runInContext(labSource, context);
+  vm.runInContext(source, context);
+  const { PROGRAM } = context.AscendCordLab;
+  const sender = { tab: { id: 9, url: "https://discord.com/channels/1/2" } };
+  const send = message => new Promise(resolve => {
+    const result = onMessage(message, sender, resolve);
+    if (result !== true) resolve(undefined);
+  });
+  const tone = (grid, index) => ({ kind: "tone", steady: true, grid, index,
+    left: { peak_dbfs: -12.04 }, right: { peak_dbfs: -12.04 }, correlation: 1 });
+  const silence = { kind: "silence", loudest_dbfs: -120, left_rms_dbfs: -120, right_rms_dbfs: -120 };
+  const pass = () => [silence, silence, silence,
+    ...PROGRAM.sweep_hz.map((_, i) => tone("sweep", i)),
+    ...[0, 1, 2].flatMap(() => Array.from({ length: 12 }, (_, i) => tone("sweep", i * 4))),
+    ...PROGRAM.ladder_dbfs.map((_, i) => tone("ladder", i))];
+  const deliver = async windows => {
+    for (const window of windows) {
+      now += 120;
+      await send({ kind: "tesktop-receiver-report", report: { protocol: 1, sampled_at_ms: now,
+        peer_connections: 1, streams: [{ ssrc: 93, codec: "audio/opus", channels: 2, track_channels: 2,
+          sdp_fmtp_stereo: true, active: true, spectrum_dbfs: Array(48).fill(-30), peak_frequency_hz: 1_000,
+          peak_dbfs: -12, analysis_sample_rate_hz: 48_000, lab_window: window }] } });
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+  };
+  await deliver([{ kind: "unknown" }, ...pass(), ...pass(), silence, silence, silence]);
+  assert.ok(controls.some(message => message.kind === "tesktop-return-path" && message.active === true),
+    "the browser is asked to play the program back");
+  let diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.equal(diagnostics.test.running, true, "the capture waits for AscendCord's two return passes");
+  returnPasses = 2;
+  now += 2_000;
+  await send({ kind: "tesktop-read-status" });
+  await deliver([silence]);
+  diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.equal(diagnostics.test.running, false);
+  assert.equal(diagnostics.return_lab.passes, 2);
+  assert.ok(controls.some(message => message.kind === "tesktop-return-path" && message.active === false),
+    "the browser microphone is restored when the test ends");
+});
