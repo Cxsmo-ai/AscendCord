@@ -348,3 +348,92 @@ test("automatically persists a completed proof so an MV3 worker restart keeps th
   assert.equal(diagnostics.auto_export_saved, true);
   assert.equal(diagnostics.pipeline_validation.passed, true);
 });
+
+test("program 2 captures until two full passes and keeps a comparable lab report", async () => {
+  const labSource = await readFile(new URL("../lab.js", import.meta.url), "utf8");
+  const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
+  let onMessage;
+  let now = 50_000;
+  let forwarded;
+  let senderSweep = true;
+  const storage = {};
+  const chrome = {
+    runtime: { onMessage: { addListener(listener) { onMessage = listener; } } },
+    tabs: { onRemoved: { addListener() {} }, sendMessage: async () => ({}) },
+    storage: { local: {
+      get: async key => ({ [key]: storage[key] }),
+      set: async values => Object.assign(storage, values),
+      remove: async key => { delete storage[key]; },
+    } },
+  };
+  const context = vm.createContext({
+    chrome, URL, AbortController, setTimeout, clearTimeout,
+    Date: class extends Date { static now() { return now; } },
+    fetch: async (url, options) => {
+      if (url.endsWith("/v1/status")) {
+        return { ok: true, status: 200, json: async () => ({ sender: {
+          audio_ssrc: 91, test_sweep_active: senderSweep, send_enabled: true, test_program: 2,
+          opus_bitrate_target_bps: 510_000, opus_application: "Audio", force_stereo: true,
+          audio_ssrc_secret: "not kept",
+        } }) };
+      }
+      if (!url.endsWith("/v1/diagnostics")) forwarded = JSON.parse(options.body);
+      return { ok: true, status: 204 };
+    },
+  });
+  vm.runInContext(labSource, context);
+  vm.runInContext(source, context);
+  const { PROGRAM } = context.AscendCordLab;
+  const sender = { tab: { id: 8, url: "https://discord.com/channels/1/2" } };
+  const send = message => new Promise(resolve => {
+    const result = onMessage(message, sender, resolve);
+    if (result !== true) resolve(undefined);
+  });
+  const tone = (grid, index, left, right, correlation) => ({
+    kind: "tone", steady: true, grid, index,
+    left: { peak_dbfs: left, thd_db: -70, thdn_db: -60 },
+    right: { peak_dbfs: right, thd_db: -70, thdn_db: -60 },
+    correlation,
+  });
+  const silence = { kind: "silence", loudest_dbfs: -120, left_rms_dbfs: -110, right_rms_dbfs: -111 };
+  const pass = () => [
+    silence, silence, silence,
+    ...PROGRAM.sweep_hz.map((_, i) => tone("sweep", i, -12.04, -13.04, 1)),
+    ...Array.from({ length: 12 }, (_, i) => tone("sweep", i * 4, -12.04, -62.04, 0)),
+    ...Array.from({ length: 12 }, (_, i) => tone("sweep", i * 4, -62.04, -12.04, 0)),
+    ...Array.from({ length: 12 }, (_, i) => tone("sweep", i * 4, -12.04, -12.04, -1)),
+    ...PROGRAM.ladder_dbfs.map((dbfs, i) => tone("ladder", i, dbfs - 0.5, dbfs - 0.5, 1)),
+  ];
+  const windows = [{ kind: "unknown" }, ...pass(), ...pass(), silence, silence, silence];
+  for (const window of windows) {
+    now += 120;
+    await send({ kind: "tesktop-receiver-report", report: {
+      protocol: 1, sampled_at_ms: now, peer_connections: 1,
+      streams: [{ ssrc: 91, codec: "audio/opus", channels: 2, track_channels: 2,
+        sdp_fmtp_stereo: true, active: true, spectrum_dbfs: Array(48).fill(-30),
+        peak_frequency_hz: 1_000, peak_dbfs: -12, analysis_sample_rate_hz: 48_000,
+        concealment_events_delta: 0, discarded_packets_delta: 0, lab_window: window }],
+    } });
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+  const diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.equal(diagnostics.test.running, false, "two passes complete the capture by themselves");
+  const lab = diagnostics.measurement_lab;
+  assert.equal(lab.version, 2);
+  assert.equal(lab.passes, 2);
+  assert.equal(lab.summary.measured_response_bands, 48);
+  assert.ok(Math.abs(lab.response.left_gain_db[10]) < 0.01);
+  assert.ok(Math.abs(lab.response.right_gain_db[10] + 1) < 0.01);
+  assert.ok(Math.abs(lab.summary.median_separation_db - 50) < 0.01);
+  assert.equal(lab.summary.stereo_preserved, true);
+  assert.ok(Math.abs(lab.linearity.fit.slope - 1) < 0.001);
+  assert.ok(Math.abs(lab.summary.noise_floor_dbfs + 110) < 0.01);
+  assert.equal(diagnostics.sender_settings.opus_bitrate_target_bps, 510_000);
+  assert.equal("audio_ssrc_secret" in diagnostics.sender_settings, false);
+  assert.equal(diagnostics.pipeline_validation.checks.all_48_sweep_bands_measured, true);
+  assert.equal("lab_window" in forwarded.streams[0], false, "the desktop report keeps its schema");
+  await new Promise(resolve => setTimeout(resolve, 5));
+  const history = await send({ kind: "tesktop-read-lab-history" });
+  assert.equal(history.history.length, 1);
+  assert.equal(history.history[0].measurement_lab.passes, 2);
+});

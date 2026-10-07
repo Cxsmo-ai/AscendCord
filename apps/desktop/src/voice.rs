@@ -160,6 +160,8 @@ impl VoiceBridge {
 			serde_json::json!({
 				"call_connected": call.is_some_and(|call| matches!(call.phase, Phase::Connected | Phase::Waiting)),
 				"test_sweep_active": test_sweep,
+				// The receiver analyses measurement program 2 (see test_sweep.rs and lab.js).
+				"test_program": if test_sweep { 2 } else { 0 },
 				"audio_source": if test_sweep { "synthetic_sweep" } else { "microphone" },
 				"send_enabled": if test_sweep { ui.voice_transmit_status == "Synthetic sweep send is enabled." } else { ui.voice_transmit_status == "Mic send is enabled." },
 				"capture_rate_hz": capture_rate_hz,

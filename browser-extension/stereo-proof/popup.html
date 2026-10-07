@@ -64,8 +64,27 @@
         <button id="save-graph" class="action" disabled>Save high-resolution graph (PNG)</button>
       <p id="curve-note" class="caption">Launch AscendCord with --test-sweep-channel=&lt;voice-channel-id&gt; to enable the equal-level stepped sweep. Without the argument, audio runs normally.</p>
     </section>
+    <section>
+      <div class="section-heading">
+        <div>
+          <h2>Audio lab · both channels, stereo, level and distortion</h2>
+          <p class="caption">Measurement program 2: frequency response per channel, distortion per band, stereo separation and opposite-phase behaviour, level linearity, decoded silence and the network during the run. Pick an earlier run to overlay it and see the change.</p>
+        </div>
+      </div>
+      <div class="toolbar">
+        <label class="metric-select">Compare with
+          <select id="lab-baseline"><option value="">No baseline</option></select>
+        </label>
+        <button id="save-lab" class="action" disabled>Save lab report (PNG)</button>
+        <button id="export-lab" class="action secondary" disabled>Download lab JSON</button>
+      </div>
+      <div id="lab-status" class="empty">Launch AscendCord with --test-sweep-channel=&lt;voice-channel-id&gt;. The lab report appears here after two passes.</div>
+      <canvas id="lab" class="lab-canvas" width="2400" height="10" aria-label="Audio lab report"></canvas>
+    </section>
     <footer>Local statistics only · no audio is captured, stored, or relayed.</footer>
   </main>
+  <script src="lab.js"></script>
+  <script src="lab-render.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

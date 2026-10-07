@@ -126,15 +126,16 @@
       residual[i] = samples[i] - fundamental.mean -
         fundamental.a * Math.cos(step * i) - fundamental.b * Math.sin(step * i);
     }
-    let harmonicPower = 0;
+    let harmonicPower = 0, harmonics = 0;
     for (let k = 2; k <= MAX_HARMONIC; k++) {
       const hz = k * frequencyHz;
       if (hz >= sampleRate * 0.49) break;
       const fit = fitTone(residual, hz, sampleRate, 0);
-      if (fit) harmonicPower += fit.signal_power;
+      if (fit) { harmonicPower += fit.signal_power; harmonics++; }
     }
     return {
-      thd_db: db20(Math.sqrt(harmonicPower / fundamentalPower), -160),
+      // Above a quarter of the sample rate no harmonic fits below Nyquist: no THD reading.
+      thd_db: harmonics ? db20(Math.sqrt(harmonicPower / fundamentalPower), -160) : null,
       thdn_db: db20(Math.sqrt(residualPower / fundamentalPower), -160),
     };
   }

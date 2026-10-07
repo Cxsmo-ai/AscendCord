@@ -193,7 +193,12 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
       leftFit.explained >= 0.8 && rightFit.explained >= 0.8;
     const tonePower = fitValid
       ? (leftFit.amplitude ** 2 + rightFit.amplitude ** 2) / 2 : 0;
+    // Program 2 analysis only while a capture runs: it fits harmonics on every window.
+    const labWindow = curveCapture && globalThis.AscendCordLab
+      ? globalThis.AscendCordLab.analyzeWindow(entry.l, entry.r, audioContext.sampleRate, peakFrequencyHz)
+      : null;
     return {
+      lab_window: labWindow,
       left_dbfs: db(ll),
       right_dbfs: db(rr),
       side_dbfs: db(diff / 4),
@@ -366,6 +371,7 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
       peak_frequency_hz: stereo?.peak_frequency_hz ?? null,
       peak_dbfs: stereo?.peak_dbfs ?? null,
       analysis_sample_rate_hz: stereo?.analysis_sample_rate_hz ?? null,
+      lab_window: stereo?.lab_window ?? null,
       });
     }
   }
@@ -415,7 +421,9 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
     if (curveCapture === next) return;
     curveCapture = next;
     clearInterval(sampleTimer);
-    sampleTimer = setInterval(sample, curveCapture ? 250 : 2000);
+    // Program 2 tones hold steady for about 0.6 s; a window every 100 ms catches each
+    // of them two or three times without a fade in it.
+    sampleTimer = setInterval(sample, curveCapture ? 100 : 2000);
     sample();
   });
   for (const kind of ["pointerdown", "keydown"]) {
