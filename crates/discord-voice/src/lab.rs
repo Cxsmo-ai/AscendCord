@@ -357,7 +357,7 @@ enum Section {
 	Ladder,
 }
 
-#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Windows {
 	pub accepted: u32,
 	pub unknown: u32,
@@ -567,7 +567,14 @@ impl Lab {
 		serde_json::json!({
 			"version": 2,
 			"passes": self.passes,
-			"windows": self.windows,
+			"windows": {
+				"accepted": self.windows.accepted,
+				"unknown": self.windows.unknown,
+				"contaminated": self.windows.contaminated,
+				"transitional": self.windows.transitional,
+				"silence": self.windows.silence,
+				"out_of_order": self.windows.out_of_order,
+			},
 			"response": {
 				"frequency_hz": frequencies,
 				"left_gain_db": self.mono.iter().map(|cell| gain(&cell.left)).collect::<Vec<_>>(),
