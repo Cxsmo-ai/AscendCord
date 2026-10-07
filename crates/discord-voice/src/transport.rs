@@ -9,7 +9,7 @@ use crate::{
 };
 use client_core::voice::VoiceConnection;
 use futures_util::{SinkExt, StreamExt};
-use opus2::{Application, Bitrate, Channels, Encoder};
+use opus2::{Application, Bitrate, Channels, Encoder, SoftClip};
 use serde_json::{Value, json};
 use std::{
 	net::{IpAddr, SocketAddr},
@@ -142,6 +142,9 @@ fn configure_microphone_encoder(
 	encoder
 		.set_vbr(settings.vbr)
 		.map_err(|_| "Opus VBR configuration failed")?;
+	encoder
+		.set_vbr_constraint(settings.vbr && settings.vbr_constraint)
+		.map_err(|_| "Opus VBR constraint configuration failed")?;
 	// Capture is 32-bit float; tell the encoder the source carries at least 24 bits.
 	encoder
 		.set_lsb_depth(24)
@@ -477,6 +480,7 @@ async fn run_inner(
 	let mut packet = [0u8; MAX_PACKET + 1];
 	let mut encoded = [0u8; MIC_OPUS_MAX_BYTES];
 	let mut stereo = [0.0f32; 1_920];
+	let mut soft_clip = SoftClip::new(Channels::Stereo);
 	let mut tick = tokio::time::interval(Duration::from_millis(20));
 	tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 	let mut signal_window = Instant::now();
@@ -633,9 +637,11 @@ async fn run_inner(
 					loop {
 						let data=if active {
 							let Some(crate::CaptureFrame::Stereo(samples)) = frames.next() else {break};
+							if timestamp_gap { soft_clip = SoftClip::new(Channels::Stereo); }
 							for (sample, out) in samples.iter().zip(stereo.iter_mut()) {
-								*out = if sample.is_finite() { sample.clamp(-1.0, 1.0) } else { 0.0 };
+								*out = if sample.is_finite() { *sample } else { 0.0 };
 							}
+							soft_clip.apply(&mut stereo);
 							let length=encoder.encode_float(&stereo,&mut encoded).map_err(|_|"Opus encoding failed")?;
 							dave.session.encrypt_opus(&encoded[..length]).map_err(|_|"DAVE audio encryption failed")?.into_owned()
 						} else if sent_frames==0 {silence-=1;davey::OPUS_SILENCE_PACKET.to_vec()} else {break};
@@ -1598,6 +1604,48 @@ mod tests {
 	use crate::diagnostics::Signal;
 	use crate::video_receive::Receivers;
 	use opus2::Decoder;
+
+	#[test]
+	fn linked_codec_is_pinned_opus_1_6_1() {
+		assert!(
+			opus2::version().contains("1.6.1"),
+			"linked codec: {}",
+			opus2::version()
+		);
+	}
+
+	#[test]
+	fn opus_soft_clip_preserves_clean_pcm_and_limits_overloads() {
+		let clean: Vec<f32> = (0..1_920)
+			.map(|i| ((i as f32) * 0.037).sin() * 0.82)
+			.collect();
+		let mut passthrough = clean.clone();
+		SoftClip::new(Channels::Stereo).apply(&mut passthrough);
+		assert_eq!(passthrough, clean, "in-range PCM must remain untouched");
+
+		let mut overloaded: Vec<f32> = (0..1_920)
+			.map(|i| ((i as f32) * 0.037).sin() * 1.8)
+			.collect();
+		SoftClip::new(Channels::Stereo).apply(&mut overloaded);
+		assert!(
+			overloaded
+				.iter()
+				.all(|sample| sample.is_finite() && sample.abs() <= 1.0)
+		);
+	}
+
+	#[test]
+	fn all_opus_bitrate_modes_match_the_selected_controls() {
+		for (vbr, constraint) in [(false, true), (true, true), (true, false)] {
+			let mut settings = model::voice_settings::OpusSettings::default();
+			settings.vbr = vbr;
+			settings.vbr_constraint = constraint;
+			let mut encoder = Encoder::new(48_000, Channels::Stereo, Application::Audio).unwrap();
+			configure_microphone_encoder(&mut encoder, settings).unwrap();
+			assert_eq!(encoder.get_vbr().unwrap(), vbr);
+			assert_eq!(encoder.get_vbr_constraint().unwrap(), vbr && constraint);
+		}
+	}
 
 	#[test]
 	fn capture_underruns_advance_rtp_on_the_48khz_sample_clock() {

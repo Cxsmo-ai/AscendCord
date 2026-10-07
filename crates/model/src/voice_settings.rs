@@ -45,9 +45,15 @@ pub struct OpusSettings {
 	pub fec: bool,
 	/// Expected packet loss percentage (0–100).
 	pub packet_loss_percent: u8,
-	/// Variable bitrate. Off (the default) locks every 20 ms packet to the target bitrate;
-	/// at 510 kb/s that is the 1,275-byte Opus maximum, so quality never dips on hard passages.
+	/// Variable bitrate, disabled for the default constant-bitrate profile.
 	pub vbr: bool,
+	/// Constrain VBR packet sizes when VBR is enabled (CVBR); false selects unconstrained VBR.
+	#[serde(default = "default_vbr_constraint")]
+	pub vbr_constraint: bool,
+}
+
+const fn default_vbr_constraint() -> bool {
+	true
 }
 
 impl Default for OpusSettings {
@@ -60,6 +66,7 @@ impl Default for OpusSettings {
 			fec: false,
 			packet_loss_percent: 0,
 			vbr: false,
+			vbr_constraint: true,
 		}
 	}
 }
@@ -70,6 +77,20 @@ impl OpusSettings {
 		self.complexity = self.complexity.min(10);
 		self.packet_loss_percent = self.packet_loss_percent.min(100);
 		self
+	}
+}
+
+#[cfg(test)]
+mod opus_settings_tests {
+	use super::OpusSettings;
+
+	#[test]
+	fn legacy_serialized_settings_default_to_constrained_vbr() {
+		let settings: OpusSettings = serde_json::from_str(
+			 r#"{"application":"Audio","bitrate":510000,"complexity":10,"signal":"Music","fec":false,"packet_loss_percent":0,"vbr":false}"#,
+		).unwrap();
+		assert!(!settings.vbr);
+		assert!(settings.vbr_constraint);
 	}
 }
 

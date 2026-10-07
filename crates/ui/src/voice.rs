@@ -2261,6 +2261,14 @@ impl MessagingUi {
 			&mut self.voice_push_to_talk,
 		)
 		.on_hover_text("Mute and deafen always take priority.");
+		ui.label(RichText::new("Opus sender").strong());
+		let opus = &mut self.voice_processing.opus;
+		ui.checkbox(&mut opus.vbr, "Variable bitrate")
+			.on_hover_text("Off keeps the current constant bitrate default. On enables VBR.");
+		if opus.vbr {
+			ui.checkbox(&mut opus.vbr_constraint, "Constrain variable bitrate")
+				.on_hover_text("On selects constrained VBR; off selects unconstrained VBR.");
+		}
 	}
 
 	/// Whether the local mute/deafen controls may emit commands for the active call.

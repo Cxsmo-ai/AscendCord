@@ -4,7 +4,7 @@ default-members = ["apps/desktop"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT OR Apache-2.0"
@@ -180,6 +180,8 @@ miniaudio = { path = "vendor/miniaudio" }
 ep-miniaudio-sys = { path = "vendor/ep-miniaudio-sys" }
 # Native DAVE does not need OpenMLS browser timers; see vendor/davey/SEREIN-PATCH.md.
 davey = { path = "vendor/davey" }
+# Pin the bundled encoder to Xiph libopus 1.6.1 for deterministic releases.
+libopus_sys = { path = "vendor/libopus-sys-ascend" }
 
 # Linux login uses GTK4/WebKit6; exclude obsolete GTK3 declarations from the lockfile.
 wry = { path = "vendor/wry" }
