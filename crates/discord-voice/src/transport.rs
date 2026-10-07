@@ -1637,9 +1637,11 @@ mod tests {
 	#[test]
 	fn all_opus_bitrate_modes_match_the_selected_controls() {
 		for (vbr, constraint) in [(false, true), (true, true), (true, false)] {
-			let mut settings = model::voice_settings::OpusSettings::default();
-			settings.vbr = vbr;
-			settings.vbr_constraint = constraint;
+			let settings = model::voice_settings::OpusSettings {
+				vbr,
+				vbr_constraint: constraint,
+				..Default::default()
+			};
 			let mut encoder = Encoder::new(48_000, Channels::Stereo, Application::Audio).unwrap();
 			configure_microphone_encoder(&mut encoder, settings).unwrap();
 			assert_eq!(encoder.get_vbr().unwrap(), vbr);
