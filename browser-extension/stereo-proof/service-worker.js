@@ -53,6 +53,7 @@ let completedExport = null;
 let completedExportPersisted = false;
 let exportPersistPromise = Promise.resolve();
 let autoSweepActive = false;
+let autoSweepSsrc = null;
 let autoSweepRunStarted = false;
 let autoCaptureStartedAt = 0;
 let senderStatusRequest = null;
@@ -391,8 +392,17 @@ function updateSenderStatus(status) {
     activeTest.sender_ssrc = latestSenderSsrc;
   }
   const sweepNow = latestSender?.test_sweep_active === true && latestSender?.send_enabled === true;
+  // AscendCord closed mid-sweep never reports the sweep ending; its next session has a new
+  // sender SSRC. Close what was left of the old run and arm for the new one.
+  if (sweepNow && autoSweepActive && latestSenderSsrc != null && autoSweepSsrc != null &&
+      latestSenderSsrc !== autoSweepSsrc) {
+    if (autoSweepRunStarted && activeTest) finishTest();
+    if (curveCaptureActive) setCurveCapture(false);
+    autoSweepActive = false;
+  }
   if (sweepNow && !autoSweepActive) {
     autoSweepActive = true;
+    autoSweepSsrc = latestSenderSsrc;
     autoSweepRunStarted = false;
     autoCaptureStartedAt = 0;
     completedTest = null;

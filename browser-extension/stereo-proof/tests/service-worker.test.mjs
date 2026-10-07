@@ -509,3 +509,42 @@ test("program 2 also plays back from the browser and waits for AscendCord's meas
   assert.ok(controls.some(message => message.kind === "tesktop-return-path" && message.active === false),
     "the browser microphone is restored when the test ends");
 });
+
+test("a new AscendCord session after a crash starts a new capture", async () => {
+  const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
+  let onMessage;
+  let now = 120_000;
+  let ssrc = 300;
+  const controls = [];
+  const chrome = {
+    runtime: { onMessage: { addListener(listener) { onMessage = listener; } } },
+    tabs: { onRemoved: { addListener() {} }, sendMessage: async (_t, message) => { controls.push(message); return {}; } },
+  };
+  vm.runInNewContext(source, {
+    chrome, URL, AbortController, setTimeout, clearTimeout,
+    Date: class extends Date { static now() { return now; } },
+    fetch: async url => url.endsWith("/v1/status")
+      ? { ok: true, status: 200, json: async () => ({ sender: { audio_ssrc: ssrc, test_sweep_active: true, send_enabled: true } }) }
+      : { ok: true, status: 204 },
+  });
+  const sender = { tab: { id: 4, url: "https://discord.com/channels/1/2" } };
+  const send = message => new Promise(resolve => {
+    const result = onMessage(message, sender, resolve);
+    if (result !== true) resolve(undefined);
+  });
+  const report = () => ({ protocol: 1, sampled_at_ms: now, peer_connections: 1,
+    streams: [{ ssrc, codec: "audio/opus", channels: 2, track_channels: 2, active: true }] });
+  await send({ kind: "tesktop-receiver-report", report: report() });
+  await new Promise(resolve => setTimeout(resolve, 5));
+  let diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.equal(diagnostics.test.sender_ssrc, 300);
+  // AscendCord is killed mid-sweep and started again: same sweep flag, new SSRC.
+  ssrc = 301;
+  now += 2_000;
+  await send({ kind: "tesktop-read-status" });
+  await send({ kind: "tesktop-receiver-report", report: report() });
+  await new Promise(resolve => setTimeout(resolve, 5));
+  diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.equal(diagnostics.test.running, true);
+  assert.equal(diagnostics.test.sender_ssrc, 301, "the new session gets its own capture");
+});
