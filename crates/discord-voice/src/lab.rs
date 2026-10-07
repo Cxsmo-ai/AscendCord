@@ -777,7 +777,7 @@ pub mod returns {
 							concealed: 0,
 							lab: Lab::default(),
 						});
-						for pair in stereo.chunks_exact(2) {
+						for pair in stereo.as_chunks::<2>().0 {
 							source.left.push(pair[0]);
 							source.right.push(pair[1]);
 						}
