@@ -12,6 +12,9 @@ struct Speaker {
 	length: usize,
 	activity: u8,
 }
+/// Bound on the mixed sum before the playback limiter (+18 dB).
+pub(crate) const MIX_HEADROOM: f32 = 8.0;
+
 #[derive(Default)]
 pub(crate) struct Mixer {
 	speakers: Vec<Speaker>,
@@ -57,6 +60,9 @@ impl Mixer {
 			.iter()
 			.find(|s| s.ssrc == ssrc)
 			.map(|s| s.user)
+	}
+	pub fn has_user(&self, user: u64) -> bool {
+		self.speakers.iter().any(|s| s.user == user)
 	}
 	pub fn push(&mut self, ssrc: u32, sequence: u16, opus: Vec<u8>) {
 		if let Some(speaker) = self.speakers.iter_mut().find(|s| s.ssrc == ssrc) {
@@ -127,6 +133,11 @@ impl Mixer {
 					};
 					speaker.offset = 0;
 					speaker.length = length;
+					crate::lab::returns::feed(
+						speaker.ssrc,
+						&speaker.pcm[..length * 2],
+						opus.is_empty(),
+					);
 					heard |= !opus.is_empty() && opus != davey::OPUS_SILENCE_PACKET;
 				}
 				let count = (output.len() / 2 - filled).min(speaker.length - speaker.offset);
@@ -145,12 +156,16 @@ impl Mixer {
 				filled += count;
 				active |= count != 0;
 			}
+			// Silence sent with DTX arrives as almost no packets; keep the lab's timeline whole.
+			crate::lab::returns::feed_gap(speaker.ssrc, output.len() / 2 - filled);
 			speaker.activity = crate::activity::hold(energy, speaker.activity);
 		}
-		// ponytail: hard limiting bounds simultaneous speakers; add a soft limiter if clipping is audible.
+		// Speakers can add up past full scale; the playback limiter brings that down smoothly.
+		// Clipping here at 0 dBFS would distort before the limiter ever saw the peak, so this
+		// only bounds the sum.
 		output
 			.iter_mut()
-			.for_each(|sample| *sample = sample.clamp(-1.0, 1.0));
+			.for_each(|sample| *sample = sample.clamp(-MIX_HEADROOM, MIX_HEADROOM));
 		(active.then_some(output), heard)
 	}
 }
@@ -197,13 +212,15 @@ mod tests {
 			speaker.pcm.fill(0.8);
 			speaker.offset = 0;
 		}
+		// Loud speakers add up past full scale; the sum reaches the playback limiter intact
+		// instead of being clipped here.
 		assert!(
 			mixer
 				.pop_with_volumes(&[(1, 200)])
 				.0
 				.unwrap()
 				.iter()
-				.all(|s| *s == 1.0)
+				.all(|s| (*s - 2.4).abs() < 0.0001)
 		);
 	}
 
@@ -233,7 +250,7 @@ mod tests {
 		assert!(a.iter().any(|s| s.abs() > 0.01));
 		assert!(b.iter().any(|s| s.abs() > 0.01));
 		for i in 0..1_920 {
-			assert!((mixed[i] - (a[i] + b[i]).clamp(-1.0, 1.0)).abs() < 0.0001);
+			assert!((mixed[i] - (a[i] + b[i])).abs() < 0.0001);
 		}
 		together.remove(1);
 		assert_eq!(together.user(11), None);

@@ -871,6 +871,12 @@ mod tests {
 	#[test]
 	fn synthetic_sweep_is_a_full_48khz_stereo_opus_frame_without_device_input() {
 		let mut sweep = crate::test_sweep::Sweep::new(RATE);
+		// The program opens with 1.2 s of silence, then the identical-channel sweep.
+		let silence = next_test_sweep_frame(&mut sweep);
+		assert!(silence.iter().all(|sample| *sample == 0.0));
+		for _ in 1..60 {
+			next_test_sweep_frame(&mut sweep);
+		}
 		let frame = next_test_sweep_frame(&mut sweep);
 		assert_eq!(frame.len(), PCM_SAMPLES);
 		assert!(

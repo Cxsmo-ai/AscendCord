@@ -39,3 +39,5 @@ footer { margin-top: 12px; border-top: 1px solid #34363c; padding-top: 9px; colo
 select { color: #e6e7eb; background: #24262b; border: 1px solid #41434a; border-radius: 5px; padding: 4px; }
 #timeline { width: 100%; height: 132px; display: block; background: #202226; border: 1px solid #33363d; border-radius: 7px; }
 .test-meta { color: #a9adb6; font: 10px/1.5 "Cascadia Code", Consolas, monospace; margin-top: 5px; }
+
+.lab-canvas { width: 100%; height: auto; display: block; margin-top: 10px; border-radius: 8px; }

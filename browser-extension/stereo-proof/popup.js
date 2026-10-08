@@ -431,6 +431,64 @@ function stereoVerdict(stream) {
   return mono ? ["warn", `MONO decoded · ${detail}`] : ["good", `TRUE STEREO decoded · ${detail}`];
 }
 
+let labHistory = [];
+let labRendered = "";
+
+/** Lab section: progress while capturing, then the report with an optional baseline overlay. */
+async function renderLab(diagnostics) {
+  const progress = diagnostics?.lab_progress;
+  const report = diagnostics?.measurement_lab;
+  const status = byId("lab-status");
+  if (progress) {
+    const w = progress.windows;
+    text(status, `CAPTURING · pass ${Math.min(progress.passes + 1, progress.passes_needed)} of ${progress.passes_needed} · ${progress.section ?? "waiting for the program's silence"} · ${w.accepted} measured · ${w.transitional} transitional · ${w.contaminated} disturbed by the network · ${w.glitched ?? 0} glitched · ${w.unknown} unidentified`);
+    text(byId("lab-return-status"), progress.return_passes === null
+      ? "Return path not offered by this AscendCord build."
+      : `RETURN PATH · browser ${diagnostics.return_path_state} · AscendCord measured ${progress.return_passes} of ${progress.passes_needed} passes`);
+  }
+  const history = await safeSend({ kind: "tesktop-read-lab-history" });
+  labHistory = history?.ok && Array.isArray(history.history) ? history.history : [];
+  const select = byId("lab-baseline");
+  const chosen = select.value;
+  const currentId = diagnostics?.test?.id;
+  const options = labHistory.filter(entry => entry.id !== currentId);
+  const signature = options.map(entry => entry.id).join(",");
+  if (select.dataset.signature !== signature) {
+    select.replaceChildren(new Option("No baseline", ""));
+    for (const entry of options) {
+      const label = `${new Date(entry.finished_at_ms).toLocaleString()} · ${AscendCordLabRender.settingsLine(entry.sender_settings)}`;
+      select.append(new Option(label, entry.id));
+    }
+    select.value = options.some(entry => entry.id === chosen) ? chosen : "";
+    select.dataset.signature = signature;
+  }
+  byId("save-lab").disabled = !report;
+  byId("export-lab").disabled = !report;
+  if (!report) return;
+  if (!progress) {
+    const s = report.summary;
+    text(status, `COMPLETE · ${report.passes} passes · ${s.measured_response_bands}/48 bands · ${s.stereo_preserved ? "stereo preserved" : "stereo NOT preserved"} · ripple ${Number.isFinite(s.ripple_100_16k_db) ? s.ripple_100_16k_db.toFixed(2) : "—"} dB · THD+N ${Number.isFinite(s.median_thdn_db) ? s.median_thdn_db.toFixed(1) : "—"} dB`);
+  }
+  const baseline = options.find(entry => entry.id === select.value) ?? null;
+  const key = `${currentId}:${baseline?.id ?? ""}:${(diagnostics.test_samples ?? []).length}`;
+  if (key === labRendered) return;
+  labRendered = key;
+  AscendCordLabRender.render(byId("lab"), report, {
+    settings: diagnostics.sender_settings,
+    baseline,
+    samples: diagnostics.test_samples ?? [],
+  });
+  const returned = diagnostics.return_lab;
+  if (returned) {
+    text(byId("lab-return-status"), `Browser to AscendCord · ${returned.passes} passes · ${returned.summary.measured_response_bands}/48 bands · ${returned.summary.stereo_preserved ? "stereo preserved" : "stereo NOT preserved (Discord Web usually sends mono)"}`);
+    AscendCordLabRender.render(byId("lab-return"), returned, {
+      baseline,
+      baselineKey: "return_lab",
+      title: "AscendCord audio lab · the browser to Discord to AscendCord",
+    });
+  }
+}
+
 async function refresh() {
   const [statusResult, localSpectrum, diagnostics] = await Promise.all([
     safeSend({ kind: "tesktop-read-status" }),
@@ -439,7 +497,39 @@ async function refresh() {
   ]);
   render(statusResult?.status ?? null, localSpectrum, diagnostics,
     statusResult?.ok ? "" : statusResult?.error ?? "Local AscendCord bridge unavailable");
+  renderLab(diagnostics).catch(showPopupError);
 }
+
+byId("lab-baseline").addEventListener("change", () => { labRendered = ""; refresh(); });
+byId("save-lab").addEventListener("click", () => {
+  byId("lab").toBlob(blob => {
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `ascendcord-audio-lab-${Date.now()}.png`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, "image/png");
+});
+byId("export-lab").addEventListener("click", async () => {
+  const diagnostics = await safeSend({ kind: "tesktop-read-diagnostics" });
+  if (!diagnostics?.measurement_lab) return;
+  const payload = {
+    format: "AscendCord audio lab report v2",
+    exported_at: new Date().toISOString(),
+    privacy: "Numeric measurements only; no audio samples, credentials, or messages.",
+    run: diagnostics.test,
+    sender_settings: diagnostics.sender_settings,
+    measurement_lab: diagnostics.measurement_lab,
+    receiver_samples: diagnostics.test_samples,
+  };
+  const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
+  const link = document.createElement("a");
+  link.href = url; link.download = `ascendcord-audio-lab-${Date.now()}.json`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
 
 byId("refresh").addEventListener("click", refresh);
 byId("timeline-metric").addEventListener("change", refresh);

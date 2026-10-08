@@ -5,17 +5,26 @@
 
   // Support callback-only and Promise-returning extension APIs. Keep errors
   // visible in the Discord page console instead of silently dropping them.
-  const sendRuntimeMessage = message => {
+  const sendRuntimeMessage = (message, onResponse = null) => {
     const warn = error => {
+      // A reloaded extension leaves this script behind and every message fails.
+      if (/context invalidated/i.test(String(error?.message ?? error))) reloadForLab();
       if (Date.now() - lastMessageWarningAt < 10_000) return;
       lastMessageWarningAt = Date.now();
       console.warn("[AscendCord Stereo Proof] Extension message failed:",
         String(error?.message ?? error).slice(0, 180));
     };
+    // A reloaded extension leaves this script behind; during a lab test the page reloads so
+    // the new scripts run.
+    if (!chrome.runtime?.id) {
+      reloadForLab();
+      return;
+    }
     try {
-      const pending = chrome.runtime.sendMessage(message, () => {
+      const pending = chrome.runtime.sendMessage(message, response => {
         const error = chrome.runtime.lastError;
         if (error) warn(error);
+        else onResponse?.(response);
       });
       if (pending && typeof pending.catch === "function") pending.catch(warn);
     } catch (error) {
@@ -25,8 +34,69 @@
 
   // This heartbeat proves the isolated content script reached the Discord tab,
   // independently of whether the main-world WebRTC observer is working.
+  // The reply says whether AscendCord is running a lab test, which the page needs before
+  // Discord opens the microphone.
+  // Unattended lab runs: while AscendCord runs a sweep test, a tab open on its test channel
+  // joins the voice channel by itself (and closes Discord's after-call survey), and when the
+  // extension is reloaded the tab reloads so the new scripts take over.
+  // Remembered in this tab, so a reload of the extension between tests still reloads the tab.
+  const LAB_CHANNEL_KEY = "ascendcord-lab-channel";
+  let labChannel = null;
+  let reloadScheduled = false;
+  function reloadForLab() {
+    let channel = labChannel;
+    try { channel ??= sessionStorage.getItem(LAB_CHANNEL_KEY); } catch {}
+    if (reloadScheduled || !channel || !location.pathname.endsWith(`/${channel}`)) return;
+    // The extension may be switched off for a moment while it reloads; a page loaded in
+    // that moment gets no scripts at all.
+    reloadScheduled = true;
+    setTimeout(() => location.reload(), 5_000);
+  }
+  let lastJoinAt = 0;
+  let lastLeaveAt = 0;
+  let inVoiceSince = 0;
+  let labMicrophone = null;
+  const inVoice = () => [...document.querySelectorAll("button[aria-label]")]
+    .some(button => /^disconnect$/i.test(button.getAttribute("aria-label") ?? ""));
+  const autoJoin = () => {
+    if (!labChannel || !location.pathname.endsWith(`/${labChannel}`)) return;
+    for (const dialog of document.querySelectorAll("[role='dialog']")) {
+      if (/how'?d the call go/i.test(dialog.textContent ?? "")) {
+        dialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }));
+      }
+    }
+    if (inVoice()) {
+      inVoiceSince ||= Date.now();
+      // Joined before the test was armed: Discord holds the real (silent) microphone, so the
+      // return path would not be heard. Leave once; joining again opens the lab microphone.
+      if (labMicrophone === false && Date.now() - inVoiceSince > 15_000 && Date.now() - lastLeaveAt > 30_000) {
+        const leave = [...document.querySelectorAll("button[aria-label]")]
+          .find(button => /^disconnect$/i.test(button.getAttribute("aria-label") ?? ""));
+        lastLeaveAt = Date.now();
+        leave?.click();
+      }
+      return;
+    }
+    inVoiceSince = 0;
+    if (Date.now() - lastJoinAt < 10_000) return;
+    const join = [...document.querySelectorAll("button")].find(button => /^\s*join voice\s*$/i.test(button.textContent ?? ""));
+    if (!join) return;
+    lastJoinAt = Date.now();
+    join.click();
+  };
   const heartbeat = () => sendRuntimeMessage({
     kind: "tesktop-content-bridge-heartbeat",
+  }, response => {
+    if (typeof response?.lab_armed !== "boolean") return;
+    window.postMessage({
+      source: "tesktop-stereo-proof-control",
+      labArmed: response.lab_armed,
+    }, location.origin);
+    labChannel = typeof response.lab_channel === "string" ? response.lab_channel : null;
+    if (labChannel) {
+      try { sessionStorage.setItem(LAB_CHANNEL_KEY, labChannel); } catch {}
+    }
+    autoJoin();
   });
   heartbeat();
   setInterval(heartbeat, 3000);
@@ -35,6 +105,9 @@
     if (event.source !== window || event.origin !== location.origin ||
         event.data?.source !== marker) return;
 
+    if (typeof event.data.observer?.lab_microphone === "boolean") {
+      labMicrophone = event.data.observer.lab_microphone;
+    }
     if (event.data.observer && typeof event.data.observer === "object") {
       sendRuntimeMessage({
         kind: "tesktop-observer-status",
@@ -49,7 +122,38 @@
     sendRuntimeMessage({ kind: "tesktop-receiver-report", report });
   });
 
+  // Developer requests from the page: { source: "tesktop-stereo-proof-dev", id, request }.
+  // The reply comes back as { source: "tesktop-stereo-proof-dev-reply", id, response }.
+  window.addEventListener("message", event => {
+    if (event.source !== window || event.origin !== location.origin ||
+        event.data?.source !== "tesktop-stereo-proof-dev" ||
+        typeof event.data.request !== "string") return;
+    const { id, request } = event.data;
+    const reply = response => window.postMessage({
+      source: "tesktop-stereo-proof-dev-reply", id, response,
+    }, location.origin);
+    try {
+      chrome.runtime.sendMessage({ kind: "tesktop-dev", request: request.slice(0, 32) }, response => {
+        const error = chrome.runtime.lastError;
+        reply(error ? { ok: false, error: String(error.message ?? error) } : response);
+      });
+    } catch (error) {
+      reply({ ok: false, error: String(error?.message ?? error) });
+    }
+  });
+
   chrome.runtime.onMessage.addListener(message => {
+    if (message?.kind === "tesktop-lab-songs" && message.songs) {
+      window.postMessage({ source: "tesktop-stereo-proof-control", songs: message.songs }, location.origin);
+      return;
+    }
+    if (message?.kind === "tesktop-return-path") {
+      window.postMessage({
+        source: "tesktop-stereo-proof-control",
+        returnPath: message.active === true,
+      }, location.origin);
+      return;
+    }
     if (message?.kind !== "tesktop-curve-capture") return;
     window.postMessage({
       source: "tesktop-stereo-proof-control",

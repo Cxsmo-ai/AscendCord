@@ -160,6 +160,14 @@ impl VoiceBridge {
 			serde_json::json!({
 				"call_connected": call.is_some_and(|call| matches!(call.phase, Phase::Connected | Phase::Waiting)),
 				"test_sweep_active": test_sweep,
+				// The receiver analyses measurement program 2 (see test_sweep.rs and lab.js).
+				"test_program": if test_sweep { discord_voice::test_sweep::PROGRAM_VERSION } else { 0 },
+				"test_channel_id": if test_sweep { discord_voice::audio::test_sweep_channel().map(|id| id.to_string()) } else { None },
+				"lab_songs": if test_sweep { discord_voice::test_sweep::songs().map(|songs| songs.manifest()) } else { None },
+				// What arrives from a browser that plays the program back (browser to AscendCord).
+				"return_lab_supported": test_sweep,
+				"return_lab": if test_sweep { discord_voice::lab::returns::report() } else { None },
+				"return_receive": if test_sweep { Some(discord_voice::lab::returns::receive_counts()) } else { None },
 				"audio_source": if test_sweep { "synthetic_sweep" } else { "microphone" },
 				"send_enabled": if test_sweep { ui.voice_transmit_status == "Synthetic sweep send is enabled." } else { ui.voice_transmit_status == "Mic send is enabled." },
 				"capture_rate_hz": capture_rate_hz,
@@ -1907,6 +1915,10 @@ impl Voice {
 				wake.request_repaint();
 			},
 		)?;
+		if audio.test_sweep_active() {
+			// The browser plays the same program back; measure what arrives here too.
+			discord_voice::lab::returns::enable();
+		}
 		let negotiated_camera_codec = ui.camera_quality.codec;
 		let (controls, control_receive) = watch::channel(Controls {
 			activity_threshold_db: -70,

@@ -17,6 +17,8 @@ const PORT: u16 = 43_721;
 const EXTENSION_ORIGIN: &str = "chrome-extension://jbchdifpgimmmmlnimidbfockpbigfni";
 const MAX_HEADER_BYTES: usize = 4 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024;
+/// A finished audio lab report: numbers only, but every band and pass of both directions.
+const LAB_REPORT_MAX_BYTES: usize = 512 * 1024;
 const MAX_STREAMS: usize = 16;
 const REPORT_MAX_AGE: Duration = Duration::from_secs(5);
 const DIAGNOSTICS_MAX_AGE: Duration = Duration::from_secs(8);
@@ -522,7 +524,12 @@ fn serve(mut stream: TcpStream, shared: &Arc<Mutex<Shared>>) {
 		respond(&mut stream, 204, "No Content", "{}", origin.as_deref());
 		return;
 	}
-	if content_length > MAX_BODY_BYTES {
+	let limit = if path == "/v1/lab/report" {
+		LAB_REPORT_MAX_BYTES
+	} else {
+		MAX_BODY_BYTES
+	};
+	if content_length > limit {
 		respond(
 			&mut stream,
 			413,
@@ -563,6 +570,36 @@ fn serve(mut stream: TcpStream, shared: &Arc<Mutex<Shared>>) {
 					|_| json!({"protocol": 1, "sender": null, "receiver_connected": false, "extension_diagnostics_connected": false}),
 				);
 			respond(&mut stream, 200, "OK", &body.to_string(), origin.as_deref());
+		}
+		// The song clips of a lab test, for the extension to subtract from what arrives. A POST,
+		// because Chromium sends an extension worker's Origin on POST but not reliably on GET;
+		// only the pinned extension origin reaches this (see `origin_allowed`).
+		("POST", "/v1/lab/songs") => match discord_voice::test_sweep::songs() {
+			Some(songs) if discord_voice::audio::test_sweep_channel().is_some() => {
+				respond_bytes(&mut stream, songs.pcm(), origin.as_deref());
+			}
+			_ => respond(&mut stream, 404, "No Lab Songs", "{}", origin.as_deref()),
+		},
+		// A finished lab run, kept beside the bridge status as `lab-report.json` so a script can
+		// run tests without a browser of its own. Only during a sweep test, only from the
+		// pinned extension (see `origin_allowed`), and only a JSON object.
+		("POST", "/v1/lab/report") if discord_voice::audio::test_sweep_channel().is_some() => {
+			let mut body = vec![0u8; content_length];
+			let saved = reader.read_exact(&mut body).is_ok()
+				&& serde_json::from_slice::<serde_json::Value>(&body)
+					.is_ok_and(|value| value.is_object())
+				&& save_lab_report(&body).is_ok();
+			if saved {
+				respond(&mut stream, 204, "No Content", "{}", origin.as_deref());
+			} else {
+				respond(
+					&mut stream,
+					400,
+					"Invalid Lab Report",
+					"{}",
+					origin.as_deref(),
+				);
+			}
 		}
 		("POST", "/v1/diagnostics") => {
 			let mut body = vec![0u8; content_length];
@@ -661,6 +698,28 @@ fn read_line_bounded<R: BufRead>(
 	Ok(())
 }
 
+fn save_lab_report(body: &[u8]) -> std::io::Result<()> {
+	let dir = local_store::LocalStore::data_root()
+		.map(|root| root.join("voice-bridge"))
+		.ok_or_else(|| std::io::Error::other("no data directory"))?;
+	std::fs::create_dir_all(&dir)?;
+	let temporary = dir.join("lab-report.json.tmp");
+	std::fs::write(&temporary, body)?;
+	std::fs::rename(temporary, dir.join("lab-report.json"))
+}
+
+fn respond_bytes(stream: &mut TcpStream, body: &[u8], origin: Option<&str>) {
+	let cors = origin.map_or_else(String::new, |origin| {
+		format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n")
+	});
+	let head = format!(
+		"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n{cors}\r\n",
+		body.len()
+	);
+	let _ = stream.write_all(head.as_bytes());
+	let _ = stream.write_all(body);
+}
+
 fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &str, origin: Option<&str>) {
 	let cors = origin.map_or_else(String::new, |origin| {
 		format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n")
@@ -691,6 +750,16 @@ mod tests {
 			Some("chrome-extension://another-extension")
 		));
 		assert!(origin_allowed("GET", "/v1/status", Some(EXTENSION_ORIGIN)));
+		// Song clips are the user's audio: only the pinned extension may read them.
+		assert!(!origin_allowed("POST", "/v1/lab/report", None));
+		assert!(!origin_allowed("POST", "/v1/lab/report", Some("null")));
+		assert!(!origin_allowed("POST", "/v1/lab/songs", None));
+		assert!(!origin_allowed("POST", "/v1/lab/songs", Some("null")));
+		assert!(origin_allowed(
+			"POST",
+			"/v1/lab/songs",
+			Some(EXTENSION_ORIGIN)
+		));
 	}
 
 	#[test]

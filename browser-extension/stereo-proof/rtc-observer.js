@@ -130,6 +130,126 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
     }
   }
 
+  // Null test: while a capture runs, keep the last 45 s of each analysed track exactly as
+  // decoded, and after each pass measure the program's content against the known signal.
+  // The audio stays in this page; only the resulting numbers are reported.
+  const RECORD_SECONDS = 45;
+  const LOUD_LADDER_INDEX = 8;
+  const recorders = new Map();
+
+  function pushFrames(recorder, left, right) {
+    const size = recorder.left.length;
+    for (let i = 0; i < left.length; i++) {
+      recorder.left[recorder.write] = left[i];
+      recorder.right[recorder.write] = right[i];
+      recorder.write = (recorder.write + 1) % size;
+    }
+    recorder.filled = Math.min(size, recorder.filled + left.length);
+  }
+
+  function takeAudio(recorder, data) {
+    const frames = data.numberOfFrames, rate = data.sampleRate;
+    if (recorder.rate !== rate) {
+      recorder.rate = rate;
+      recorder.left = new Float32Array(rate * RECORD_SECONDS);
+      recorder.right = new Float32Array(rate * RECORD_SECONDS);
+      recorder.write = 0;
+      recorder.filled = 0;
+      recorder.nextTimestamp = null;
+    }
+    // Frame timestamps wobble by a few milliseconds; only a missing stretch of 20 ms or more
+    // is a real gap, kept as silence so time stays true.
+    if (recorder.nextTimestamp !== null) {
+      const gap = Math.round((data.timestamp - recorder.nextTimestamp) * rate / 1e6);
+      if (gap >= rate / 50 && gap < rate) {
+        recorder.gaps++;
+        pushFrames(recorder, new Float32Array(gap), new Float32Array(gap));
+      }
+    }
+    const left = new Float32Array(frames), right = new Float32Array(frames);
+    data.copyTo(left, { planeIndex: 0, format: "f32-planar" });
+    if (data.numberOfChannels > 1) data.copyTo(right, { planeIndex: 1, format: "f32-planar" });
+    else right.set(left);
+    pushFrames(recorder, left, right);
+    recorder.nextTimestamp = data.timestamp + frames * 1e6 / rate;
+  }
+
+  function startRecorder(track) {
+    if (recorders.has(track.id) || typeof MediaStreamTrackProcessor !== "function" ||
+        !globalThis.AscendCordLab) return;
+    let reader;
+    try {
+      reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+    } catch {
+      return;
+    }
+    const recorder = {
+      reader, rate: 0, left: null, right: null, write: 0, filled: 0, nextTimestamp: null, gaps: 0,
+      loudAt: 0, silent: 0, busy: false, report: null,
+    };
+    recorders.set(track.id, recorder);
+    (async () => {
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          try { takeAudio(recorder, value); } finally { value.close(); }
+        }
+      } catch {}
+    })();
+  }
+
+  function stopRecorders() {
+    for (const recorder of recorders.values()) recorder.reader.cancel().catch(() => {});
+    recorders.clear();
+  }
+
+  function snapshot(recorder, frames) {
+    const size = recorder.left.length;
+    const count = Math.min(frames, recorder.filled);
+    const left = new Float32Array(count), right = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      const at = (recorder.write - count + i + size) % size;
+      left[i] = recorder.left[at];
+      right[i] = recorder.right[at];
+    }
+    return { left, right };
+  }
+
+  /** Follows the program on one track: the loud end of the ladder, the content, then silence. */
+  function noteLabWindow(track, labWindow) {
+    const recorder = recorders.get(track.id);
+    if (!recorder || recorder.busy || !recorder.rate) return;
+    if (labWindow.kind === "tone" && labWindow.grid === "ladder" && labWindow.index >= LOUD_LADDER_INDEX) {
+      recorder.loudAt = Date.now();
+      recorder.silent = 0;
+      return;
+    }
+    if (!recorder.loudAt) return;
+    recorder.silent = labWindow.kind === "silence" ? recorder.silent + 1 : 0;
+    const content = globalThis.AscendCordLab.renderContent(recorder.rate);
+    const contentMs = content.frames * 1000 / recorder.rate;
+    // Silence counts only once the whole content can have passed; a quiet passage inside a
+    // song does not end it.
+    if (recorder.silent < 3 || Date.now() - recorder.loudAt < contentMs - 500) return;
+    recorder.loudAt = 0;
+    recorder.silent = 0;
+    recorder.busy = true;
+    const { left, right } = snapshot(recorder, Math.round(recorder.rate * (contentMs / 1000 + 8)));
+    globalThis.AscendCordLab.analyzeContentInSlices(left, right, recorder.rate)
+      .then(report => { recorder.report = report ?? { error: "content not found" }; })
+      .catch(error => { recorder.report = { error: String(error?.message ?? error).slice(0, 120) }; })
+      .finally(() => { recorder.busy = false; });
+  }
+
+  function takeContentReport(track) {
+    const recorder = track ? recorders.get(track.id) : null;
+    if (!recorder?.report) return null;
+    const report = { ...recorder.report, gaps: recorder.gaps };
+    recorder.report = null;
+    return report;
+  }
+
   function measure(track) {
     const entry = track ? meter(track) : null;
     if (!entry || audioContext?.state !== "running") return null;
@@ -193,7 +313,16 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
       leftFit.explained >= 0.8 && rightFit.explained >= 0.8;
     const tonePower = fitValid
       ? (leftFit.amplitude ** 2 + rightFit.amplitude ** 2) / 2 : 0;
+    // Program 2 analysis only while a capture runs: it fits harmonics on every window.
+    const labWindow = curveCapture && globalThis.AscendCordLab
+      ? globalThis.AscendCordLab.analyzeWindow(entry.l, entry.r, audioContext.sampleRate, peakFrequencyHz)
+      : null;
+    if (labWindow) {
+      startRecorder(track);
+      noteLabWindow(track, labWindow);
+    }
     return {
+      lab_window: labWindow,
       left_dbfs: db(ll),
       right_dbfs: db(rr),
       side_dbfs: db(diff / 4),
@@ -319,6 +448,9 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
       const discardedDelta = old ? Math.max(0, numeric(stat.packetsDiscarded) - old.discarded) : 0;
       const jitterBufferDelayDelta = old ? Math.max(0, numeric(stat.jitterBufferDelay) - old.jitterBufferDelay) : 0;
       const jitterBufferEmittedDelta = old ? Math.max(0, numeric(stat.jitterBufferEmittedCount) - old.jitterBufferEmitted) : 0;
+      // Samples the jitter buffer removed or inserted to speed playout up or slow it down.
+      const stretched = numeric(stat.removedSamplesForAcceleration) + numeric(stat.insertedSamplesForDeceleration);
+      const stretchedDelta = old ? Math.max(0, stretched - old.stretched) : 0;
 
       previous.set(key, {
         timestamp: numeric(stat.timestamp),
@@ -331,6 +463,7 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
         discarded: numeric(stat.packetsDiscarded),
         jitterBufferDelay: numeric(stat.jitterBufferDelay),
         jitterBufferEmitted: numeric(stat.jitterBufferEmittedCount),
+        stretched,
       });
 
       const stereo = measure(track);
@@ -355,6 +488,7 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
         concealed_samples_per_second: elapsedMs > 0 ? Math.min(384000, concealmentDelta * 1000 / elapsedMs) : 0,
         concealment_events_delta: Math.floor(concealmentEventsDelta),
         discarded_packets_delta: Math.floor(discardedDelta),
+        stretched_samples_delta: Math.min(1_000_000, Math.floor(stretchedDelta)),
         jitter_buffer_delay_ms: jitterBufferEmittedDelta > 0
           ? Math.min(60000, jitterBufferDelayDelta * 1000 / jitterBufferEmittedDelta) : 0,
         sdp_fmtp_stereo: typeof codec?.sdpFmtpLine === "string" ? /(^|;)\s*stereo=1/.test(codec.sdpFmtpLine) : null,
@@ -366,14 +500,201 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
       peak_frequency_hz: stereo?.peak_frequency_hz ?? null,
       peak_dbfs: stereo?.peak_dbfs ?? null,
       analysis_sample_rate_hz: stereo?.analysis_sample_rate_hz ?? null,
+      lab_window: stereo?.lab_window ?? null,
+        lab_content: takeContentReport(track),
       });
     }
+  }
+
+  // Return path: while a program 2 test runs, Discord Web's outgoing microphone track is
+  // swapped for the same program so AscendCord can measure what arrives on its side. Discord
+  // may join before its microphone track exists, or replace the track later (unmute, device
+  // change), so the swap is checked again on every sample until the test ends. The latest
+  // track Discord set is always put back.
+  let returnPath = null;
+  let returnPathWanted = false;
+  let returnPathBusy = false;
+  let returnPathState = "off";
+
+  // Discord replaces its sender's track on its own (speaking changes, device changes). While
+  // the return path plays, such a call on a swapped sender is kept as the track to restore
+  // instead of being applied; the observer's own swaps use the native method.
+  let nativeReplaceTrack = null;
+
+  function swapTrack(sender, track) {
+    return nativeReplaceTrack && sender instanceof globalThis.RTCRtpSender
+      ? nativeReplaceTrack.call(sender, track)
+      : sender.replaceTrack(track);
+  }
+
+  function hookReplaceTrack() {
+    const prototype = globalThis.RTCRtpSender?.prototype;
+    if (nativeReplaceTrack || typeof prototype?.replaceTrack !== "function") return;
+    const native = prototype.replaceTrack;
+    nativeReplaceTrack = native;
+    prototype.replaceTrack = function (track) {
+      if (!returnPath?.replaced.has(this)) return native.call(this, track);
+      returnPath.replaced.set(this, track ?? null);
+      return Promise.resolve();
+    };
+  }
+
+  function audioSenders() {
+    const senders = new Set();
+    for (const peer of peers) {
+      for (const sender of peer.getSenders?.() ?? []) {
+        if (sender.track?.kind === "audio") senders.add(sender);
+      }
+      // An audio transceiver that sends but has no track yet is the microphone slot.
+      for (const transceiver of peer.getTransceivers?.() ?? []) {
+        const direction = transceiver.currentDirection ?? transceiver.direction ?? "";
+        if (transceiver.stopped || !/send/.test(direction) || !transceiver.sender) continue;
+        if (!transceiver.sender.track && transceiver.receiver?.track?.kind === "audio") {
+          senders.add(transceiver.sender);
+        }
+      }
+    }
+    return [...senders];
+  }
+
+  async function ensureReturnPath() {
+    if (!returnPathWanted || returnPathBusy || !globalThis.AscendCordLab) return;
+    returnPathBusy = true;
+    try {
+      const ctx = context();
+      if (!ctx || ctx.state !== "running") {
+        returnPathState = "audio-suspended";
+        return;
+      }
+      const senders = audioSenders();
+      if (!senders.length) {
+        returnPathState = "no-microphone-sender";
+        return;
+      }
+      if (!returnPath) {
+        const { left, right, frames } = globalThis.AscendCordLab.renderPass(ctx.sampleRate);
+        const buffer = ctx.createBuffer(2, frames, ctx.sampleRate);
+        buffer.copyToChannel(left, 0);
+        buffer.copyToChannel(right, 1);
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.loop = true;
+        const destination = ctx.createMediaStreamDestination();
+        destination.channelCount = 2;
+        source.connect(destination);
+        source.start();
+        returnPath = { source, track: destination.stream.getAudioTracks()[0], replaced: new Map() };
+        hookReplaceTrack();
+      }
+      const path = returnPath;
+      for (const sender of senders) {
+        if (sender.track === path.track) continue;
+        const original = sender.track;
+        try {
+          await swapTrack(sender, path.track);
+        } catch {
+          continue;
+        }
+        if (returnPath !== path) {
+          // The test ended while this swap was in flight.
+          try { await swapTrack(sender, original); } catch {}
+          return;
+        }
+        path.replaced.set(sender, original ?? path.replaced.get(sender) ?? null);
+      }
+      returnPathState = [...path.replaced.keys()].some(sender => sender.track === path.track)
+        ? "playing" : "replace-failed";
+    } finally {
+      returnPathBusy = false;
+    }
+  }
+
+  async function startReturnPath() {
+    returnPathWanted = true;
+    await ensureReturnPath();
+  }
+
+  async function stopReturnPath() {
+    returnPathWanted = false;
+    if (!returnPath) {
+      returnPathState = "off";
+      return;
+    }
+    const { source, track, replaced } = returnPath;
+    returnPath = null;
+    for (const [sender, original] of replaced) {
+      // Leave a track Discord set after the swap in place.
+      if (sender.track !== track) continue;
+      try { await swapTrack(sender, original); } catch {}
+    }
+    try { source.stop(); } catch {}
+    track.stop();
+    returnPathState = "off";
+  }
+
+  // Discord counts a member as speaking from the microphone stream it opened, and the voice
+  // server forwards a member's audio only while it speaks. While AscendCord runs a lab test
+  // the microphone Discord opens is a steady quiet tone, so Discord keeps speaking; what
+  // the return path sends is still the swapped program track. Outside a lab test, or when
+  // the page cannot play audio, Discord gets its real microphone unchanged.
+  let labArmed = false;
+  // Whether the microphone Discord holds now is the lab tone (it opened it during a test).
+  let labMicrophoneLive = false;
+
+  async function labMicrophone(stream) {
+    const original = stream.getAudioTracks()[0];
+    const ctx = context();
+    if (!original || !ctx) return stream;
+    if (ctx.state !== "running") {
+      try { await ctx.resume(); } catch {}
+    }
+    if (ctx.state !== "running") return stream;
+    const tone = ctx.createOscillator();
+    tone.frequency.value = 1_000;
+    const gain = ctx.createGain();
+    gain.gain.value = 0.03;
+    const destination = ctx.createMediaStreamDestination();
+    tone.connect(gain).connect(destination);
+    tone.start();
+    const track = destination.stream.getAudioTracks()[0];
+    const stop = track.stop.bind(track);
+    track.stop = () => {
+      stop();
+      original.stop();
+      try { tone.stop(); } catch {}
+      labMicrophoneLive = false;
+    };
+    labMicrophoneLive = true;
+    // Discord matches the opened device by these; answer for the real microphone.
+    track.getSettings = () => original.getSettings();
+    track.getConstraints = () => original.getConstraints();
+    track.applyConstraints = constraints => original.applyConstraints(constraints);
+    try { Object.defineProperty(track, "label", { get: () => original.label }); } catch {}
+    return new MediaStream([track, ...stream.getVideoTracks()]);
+  }
+
+  function installMicrophoneHook() {
+    const media = navigator?.mediaDevices;
+    if (!media?.getUserMedia || media.getUserMedia.ascendcordLab) return;
+    const open = media.getUserMedia.bind(media);
+    const hooked = async constraints => {
+      const stream = await open(constraints);
+      if (!labArmed || !constraints?.audio) return stream;
+      try {
+        return await labMicrophone(stream);
+      } catch {
+        return stream;
+      }
+    };
+    hooked.ascendcordLab = true;
+    media.getUserMedia = hooked;
   }
 
   async function sample() {
     if (running) return;
     running = true;
     try {
+      await ensureReturnPath().catch(() => { returnPathState = "error"; });
       const activePeers = [...peers].slice(0, 32);
       const streams = [];
       for (const peer of activePeers) {
@@ -387,6 +708,8 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
           peer_api: typeof window.RTCPeerConnection === "function",
           error: lastInstallError,
           at_ms: Date.now(),
+          return_path: returnPathState,
+          lab_microphone: labMicrophoneLive,
         },
         report: {
           protocol: 1,
@@ -408,14 +731,42 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
     if (installPeerConnection() || installAttempts >= 200) clearInterval(installTimer);
   }, 50);
   installPeerConnection();
+  try { installMicrophoneHook(); } catch {}
   window.addEventListener("message", event => {
     if (event.source !== window || event.origin !== location.origin ||
         event.data?.source !== "tesktop-stereo-proof-control") return;
+    if (typeof event.data.labArmed === "boolean") {
+      labArmed = event.data.labArmed;
+      return;
+    }
+    if (event.data.songs && typeof event.data.songs.pcm === "string") {
+      try {
+        const binary = atob(event.data.songs.pcm);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        globalThis.AscendCordLab?.setSongs({
+          names: event.data.songs.names, frames: event.data.songs.frames,
+          pcm: new Int16Array(bytes.buffer, 0, bytes.length >> 1),
+        });
+      } catch {}
+      return;
+    }
+    if (typeof event.data.returnPath === "boolean") {
+      (event.data.returnPath ? startReturnPath() : stopReturnPath()).catch(() => {
+        returnPathState = "error";
+      });
+      return;
+    }
     const next = event.data.captureCurve === true;
     if (curveCapture === next) return;
     curveCapture = next;
+    if (!next) stopRecorders();
+    // Render the content now rather than in the middle of a pass's silence.
+    else setTimeout(() => { const ctx = context(); if (ctx) globalThis.AscendCordLab?.renderContent(ctx.sampleRate); }, 0);
     clearInterval(sampleTimer);
-    sampleTimer = setInterval(sample, curveCapture ? 250 : 2000);
+    // Program 2 tones hold steady for about 0.6 s; a window every 100 ms catches each
+    // of them two or three times without a fade in it.
+    sampleTimer = setInterval(sample, curveCapture ? 100 : 2000);
     sample();
   });
   for (const kind of ["pointerdown", "keydown"]) {

@@ -454,6 +454,7 @@ async fn run_inner(
 	let mut video_tick = tokio::time::interval(Duration::from_millis(1));
 	video_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 	let mut mixer = crate::mixer::Mixer::default();
+	let mut probes: Vec<(u32, Instant)> = Vec::new();
 	let mut stream_playout = crate::stream_playout::Playout::default();
 	let mut seq_ack: i64 = -1;
 	let mut heartbeat_ms: Option<u64> = None;
@@ -691,7 +692,7 @@ async fn run_inner(
 					// Keep the auxiliary stream close to live even if this clock misses a tick.
 					if let Some(aux)=&stream_audio && let Some(extra)=stream_playout.next(aux,control.stream_volume,true,stalled) {
 						match &mut frame {
-							Some(mixed)=>for (out,sample) in mixed.iter_mut().zip(extra.iter()) {*out=(*out+sample).clamp(-1.0,1.0);},
+							Some(mixed)=>for (out,sample) in mixed.iter_mut().zip(extra.iter()) {*out=(*out+sample).clamp(-crate::mixer::MIX_HEADROOM,crate::mixer::MIX_HEADROOM);},
 							None=>frame=Some(extra),
 						}
 					}
@@ -745,8 +746,13 @@ async fn run_inner(
 				}
 				if rtp.payload_type!=120 {continue;}
 				let (source,seq,frame)=(rtp.ssrc,rtp.sequence,rtp.payload);
-				let Some(user)=mixer.user(source) else{continue;};
-				if !dave.ready || !dave.contains(user) || controls.borrow().deafened {continue;}
+				crate::lab::returns::count(crate::lab::returns::Receive::Packets);
+				if !dave.ready {continue;}
+				let user=match mixer.user(source) {
+					Some(user)=>user,
+					None=>{let Some(user)=discover_speaker(&mut mixer,&mut dave,&mut probes,source,&frame) else{continue;};user},
+				};
+				if !dave.contains(user) || controls.borrow().deafened {continue;}
 				let Ok(opus)=dave.session.decrypt(user,davey::MediaType::AUDIO,&frame) else{continue;};
 				mixer.push(source,seq,opus);
 				metrics.finish(crate::diagnostics::Stage::Receive, start);
@@ -1598,12 +1604,86 @@ async fn run_stream_inner(
 	}
 }
 
+/// Audio from an SSRC the voice server has not tied to anyone. Discord announces a speaker's
+/// SSRC only once that client reports speaking, which a browser whose outgoing track was
+/// replaced (the audio lab's return path) may never do. The member whose DAVE key opens an
+/// encrypted frame owns the SSRC; silence and unencrypted frames prove nothing, and an SSRC
+/// nobody opens is not tried again for two seconds.
+fn discover_speaker(
+	mixer: &mut crate::mixer::Mixer,
+	dave: &mut Dave,
+	probes: &mut Vec<(u32, Instant)>,
+	ssrc: u32,
+	frame: &[u8],
+) -> Option<u64> {
+	use crate::lab::returns::{Receive, count};
+	count(Receive::Unannounced);
+	if !frame.ends_with(&[0xFA, 0xFA]) {
+		return None;
+	}
+	count(Receive::Encrypted);
+	let now = Instant::now();
+	probes.retain(|(_, at)| now.duration_since(*at) < Duration::from_secs(2));
+	if probes.iter().any(|(probed, _)| *probed == ssrc) {
+		return None;
+	}
+	let candidates: Vec<u64> = dave
+		.others()
+		.filter(|user| !mixer.has_user(*user))
+		.collect();
+	count(Receive::Probed);
+	let owner = candidates.into_iter().find(|user| {
+		dave.session
+			.decrypt(*user, davey::MediaType::AUDIO, frame)
+			.is_ok()
+	});
+	match owner {
+		Some(user) => {
+			mixer.announce(user, ssrc).ok()?;
+			count(Receive::Matched);
+			Some(user)
+		}
+		None => {
+			if probes.len() < 32 {
+				probes.push((ssrc, now));
+			}
+			None
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::diagnostics::Signal;
 	use crate::video_receive::Receivers;
 	use opus2::Decoder;
+
+	#[test]
+	fn unannounced_audio_is_probed_only_when_encrypted_and_not_too_often() {
+		let mut mixer = crate::mixer::Mixer::default();
+		let mut dave = Dave::new(1, Some(2), 3).unwrap();
+		let mut probes = Vec::new();
+		// Silence or an unencrypted frame never ties an SSRC to anyone.
+		assert_eq!(
+			discover_speaker(&mut mixer, &mut dave, &mut probes, 7, &[0xF8, 0xFF, 0xFE]),
+			None
+		);
+		assert!(probes.is_empty());
+		// An encrypted frame nobody can open is remembered and left alone for a while.
+		let frame = [1, 2, 3, 4, 0, 0xFA, 0xFA];
+		assert_eq!(
+			discover_speaker(&mut mixer, &mut dave, &mut probes, 7, &frame),
+			None
+		);
+		assert_eq!(probes.len(), 1);
+		assert_eq!(
+			discover_speaker(&mut mixer, &mut dave, &mut probes, 7, &frame),
+			None
+		);
+		assert_eq!(probes.len(), 1);
+		assert_eq!(mixer.user(7), None);
+	}
 
 	#[test]
 	fn linked_codec_is_pinned_opus_1_6_1() {

@@ -347,6 +347,13 @@ impl Dave {
 	pub fn contains(&self, user: u64) -> bool {
 		self.participants.contains(&user)
 	}
+	/// Call participants other than this device.
+	pub fn others(&self) -> impl Iterator<Item = u64> + '_ {
+		self.participants
+			.iter()
+			.copied()
+			.filter(move |user| *user != self.own)
+	}
 	/// Only this device remains announced in the call.
 	pub fn alone(&self) -> bool {
 		self.announced.len() == 1
