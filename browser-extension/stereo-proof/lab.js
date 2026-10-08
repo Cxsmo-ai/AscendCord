@@ -712,6 +712,10 @@
   // ---- Null test: what arrived minus the known content -------------------------------------
   const NULL_BLOCK = 4_096;
   const NULL_SEARCH = 8; // samples a block may move against the last one
+  // A jitter buffer speeds playback up or slows it down by whole pitch periods (2.5-15 ms):
+  // a block that no longer matches is found again within +-20 ms.
+  const NULL_REACQUIRE = 960;
+  const NULL_MATCH = 0.95;
   const NULL_BANDS_HZ = Object.freeze([100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1_000,
     1_250, 1_600, 2_000, 2_500, 3_150, 4_000, 5_000, 6_300, 8_000, 10_000, 12_500, 16_000]);
 
@@ -810,6 +814,17 @@
     }
 
     // 3. Follow the timing block by block; a moved block marks a jitter-buffer slip.
+    // Normalised correlation of a block against the arrived audio at `candidate`.
+    const match = (start, candidate, refEnergy) => {
+      if (start + candidate < 0 || start + candidate + NULL_BLOCK > length) return -Infinity;
+      let dot = 0, energy = 0;
+      for (let i = start; i < start + NULL_BLOCK; i++) {
+        const l = left[i + candidate], r = right[i + candidate];
+        dot += ref.left[i] * l + ref.right[i] * r;
+        energy += l * l + r * r;
+      }
+      return energy > 0 ? dot / Math.sqrt(refEnergy * energy) : -Infinity;
+    };
     const blocks = [];
     let current = lag;
     for (let start = 0; start + NULL_BLOCK <= ref.frames; start += NULL_BLOCK) {
@@ -819,12 +834,15 @@
       if (refEnergy > 1e-6) {
         let bestScore = -Infinity;
         for (let candidate = current - NULL_SEARCH; candidate <= current + NULL_SEARCH; candidate++) {
-          if (start + candidate < 0 || start + candidate + NULL_BLOCK > length) continue;
-          let dot = 0;
-          for (let i = start; i < start + NULL_BLOCK; i++) {
-            dot += ref.left[i] * left[i + candidate] + ref.right[i] * right[i + candidate];
+          const score = match(start, candidate, refEnergy);
+          if (score > bestScore) { bestScore = score; best = candidate; }
+        }
+        if (bestScore < NULL_MATCH) {
+          for (let candidate = current - NULL_REACQUIRE; candidate <= current + NULL_REACQUIRE; candidate++) {
+            const score = match(start, candidate, refEnergy);
+            if (score > bestScore) { bestScore = score; best = candidate; }
+            if (candidate % 64 === 0) yield;
           }
-          if (dot > bestScore) { bestScore = dot; best = candidate; }
         }
       }
       if (start + best < 0 || start + best + NULL_BLOCK > length) break;
