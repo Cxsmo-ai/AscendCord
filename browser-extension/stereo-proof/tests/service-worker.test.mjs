@@ -651,3 +651,54 @@ test("AscendCord pausing its send while alone does not end the capture", async (
   await send({ kind: "tesktop-read-status" });
   assert.equal((await send({ kind: "tesktop-read-diagnostics" })).test.running, false);
 });
+
+test("a lab capture starts over when the browser leaves and rejoins the call", async () => {
+  const labSource = await readFile(new URL("../lab.js", import.meta.url), "utf8");
+  const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
+  let onMessage;
+  let now = 300_000;
+  const chrome = {
+    runtime: { onMessage: { addListener(listener) { onMessage = listener; } } },
+    tabs: { onRemoved: { addListener() {} }, sendMessage: async () => ({}) },
+  };
+  const context = vm.createContext({
+    chrome, URL, AbortController, setTimeout, clearTimeout,
+    Date: class extends Date { static now() { return now; } },
+    fetch: async url => url.endsWith("/v1/status")
+      ? { ok: true, status: 200, json: async () => ({ sender: { audio_ssrc: 95, test_sweep_active: true, send_enabled: true, test_program: 3 } }) }
+      : { ok: true, status: 204 },
+  });
+  vm.runInContext(labSource, context);
+  vm.runInContext(source, context);
+  const { PROGRAM } = context.AscendCordLab;
+  const sender = { tab: { id: 9, url: "https://discord.com/channels/1/2" } };
+  const send = message => new Promise(resolve => {
+    const result = onMessage(message, sender, resolve);
+    if (result !== true) resolve(undefined);
+  });
+  const tone = (grid, index) => ({ kind: "tone", steady: true, grid, index,
+    left: { peak_dbfs: -12.04 }, right: { peak_dbfs: -12.04 }, correlation: 1 });
+  const silence = { kind: "silence", loudest_dbfs: -120, left_rms_dbfs: -120, right_rms_dbfs: -120 };
+  const deliver = async (windows, present = true) => {
+    for (const window of windows) {
+      now += 120;
+      await send({ kind: "tesktop-receiver-report", report: { protocol: 1, sampled_at_ms: now,
+        peer_connections: present ? 1 : 0,
+        streams: present ? [{ ssrc: 95, codec: "audio/opus", channels: 2, track_channels: 2, active: true,
+          spectrum_dbfs: Array(48).fill(-30), peak_frequency_hz: 1_000, peak_dbfs: -12,
+          analysis_sample_rate_hz: 48_000, lab_window: window }] : [] } });
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+  };
+  const pass = () => [silence, silence, silence, ...PROGRAM.sweep_hz.map((_, i) => tone("sweep", i)),
+    ...[0, 1, 2].flatMap(() => Array.from({ length: 12 }, (_, i) => tone("sweep", i * 4))),
+    ...PROGRAM.ladder_dbfs.map((_, i) => tone("ladder", i))];
+  await deliver([{ kind: "unknown" }, { kind: "unknown" }, ...pass(), ...pass(), silence, silence, silence]);
+  let diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.ok(diagnostics.lab_progress.passes >= 1, `passes ${diagnostics.lab_progress.passes}`);
+  await deliver([null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null], false);
+  await deliver([silence]);
+  diagnostics = await send({ kind: "tesktop-read-diagnostics" });
+  assert.equal(diagnostics.test.running, true);
+  assert.equal(diagnostics.lab_progress.passes, 0, "the incomplete measurement is discarded");
+});

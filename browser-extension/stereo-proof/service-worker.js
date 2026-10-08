@@ -137,6 +137,15 @@ function beginTest(automatic = false, tabId = null) {
   clearCompletedExport();
 }
 
+function restartLabCapture() {
+  activeTest.lab = Lab.createLab();
+  activeTest.content_reports = [];
+  activeTest.samples = [];
+  activeTest.disturbed_until_ms = 0;
+  activeTest.restarts = (activeTest.restarts ?? 0) + 1;
+  if (autoCaptureStartedAt) autoCaptureStartedAt = Date.now();
+}
+
 function finishTest() {
   if (!activeTest) return;
   activeTest.ended_at_ms = Date.now();
@@ -823,6 +832,17 @@ function handleMessage(message, sender, sendResponse) {
         analysis_sample_rate_hz: stream.analysis_sample_rate_hz,
       })),
     };
+    if (curveCaptureActive && activeTest?.lab) {
+      // The browser left the call and joined again (a tab that joined before the test was
+      // armed does that once): what was measured before the gap is incomplete, so start over.
+      const present = latestSpectrum.streams.some(stream => stream.ssrc === activeTest.sender_ssrc);
+      if (!present) {
+        activeTest.stream_lost_at ??= Date.now();
+      } else if (activeTest.stream_lost_at) {
+        if (Date.now() - activeTest.stream_lost_at > 1_000) restartLabCapture();
+        activeTest.stream_lost_at = null;
+      }
+    }
     if (curveCaptureActive) {
       for (const stream of latestSpectrum.streams) {
         if (!activeTest || stream.ssrc !== activeTest.sender_ssrc ||
