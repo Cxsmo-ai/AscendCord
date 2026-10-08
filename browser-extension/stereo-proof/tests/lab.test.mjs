@@ -238,3 +238,66 @@ test("a dropout or a splice inside a window is caught, codec-like noise is not",
   assert.equal(state.windows.glitched, 1);
   assert.equal(state.windows.accepted, 0);
 });
+
+/** The content placed `offset` samples into a longer buffer, through `channel(i, ref)`. */
+function contentPath(channel, { offset = 48_000 + 1_234, tail = 48_000 } = {}) {
+  const ref = lab.renderContent(RATE);
+  const left = new Float32Array(offset + ref.frames + tail), right = new Float32Array(left.length);
+  let out = offset;
+  for (let i = 0; i < ref.frames && out < left.length; i++) {
+    const step = channel(i, ref);
+    if (step === "skip") continue;
+    const [l, r] = step ?? [ref.left[i], ref.right[i]];
+    left[out] = l; right[out] = r; out++;
+  }
+  return { left, right };
+}
+
+test("the null test finds the content and reports a clean path as clean", () => {
+  const { left, right } = contentPath(() => null);
+  const report = lab.analyzeContent(left, right, RATE);
+  assert.equal(report.lag_samples, 48_000 + 1_234);
+  assert.equal(report.slipped_blocks, 0);
+  assert.equal(report.dropout_blocks, 0);
+  for (const [name, section] of Object.entries(report.sections)) assert.equal(section.srr_db, 150, name);
+});
+
+test("the null test follows jitter-buffer jumps and leaves out a dropout", () => {
+  let seed = 5;
+  const noise = () => { seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648; return (seed / 2_147_483_648 - 0.5) * 2e-4; };
+  const removed = new Set();
+  for (let i = 100_000; i < 100_240; i++) removed.add(i); // 5 ms taken out
+  for (let i = 300_000; i < 300_960; i++) removed.add(i); // 20 ms lost
+  const { left, right } = contentPath((i, ref) => {
+    if (i >= 100_000 && i < 100_240) return "skip";
+    if (i >= 300_000 && i < 300_960) return [0, 0];
+    return [ref.left[i] * 0.97 + noise(), ref.right[i] * 0.97 + noise()];
+  });
+  const report = lab.analyzeContent(left, right, RATE);
+  assert.ok(report.slipped_blocks >= 1 && report.slipped_blocks <= 2, `slips ${report.slipped_blocks}`);
+  assert.ok(report.dropout_blocks >= 1, "the 20 ms loss is left out");
+  for (const name of ["noise", "music", "speech"]) {
+    assert.ok(report.sections[name].srr_db > 50, `${name} ${report.sections[name].srr_db}`);
+    near(report.sections[name].gain_db, 20 * Math.log10(0.97), 0.01, `${name} gain`);
+  }
+});
+
+test("the null test takes a fractional-sample delay out", () => {
+  const delay = 0.37, taps = 32;
+  const { left, right } = contentPath((i, ref) => {
+    let l = 0, r = 0;
+    for (let k = -taps; k <= taps; k++) {
+      const j = i + k;
+      if (j < 0 || j >= ref.frames) continue;
+      const x = k + delay;
+      const weight = Math.sin(Math.PI * x) / (Math.PI * x) * (0.5 + 0.5 * Math.cos(Math.PI * x / (taps + 1)));
+      l += ref.left[j] * weight; r += ref.right[j] * weight;
+    }
+    return [l, r];
+  });
+  const report = lab.analyzeContent(left, right, RATE);
+  near(report.delay_samples, delay, 0.01, "fitted delay");
+  assert.ok(report.sections.music.srr_db > 50, `music ${report.sections.music.srr_db}`);
+  assert.ok(report.sections.music.srr_without_delay_db < 40, "without the fit the delay shows as residue");
+  assert.equal(report.slipped_blocks, 0);
+});

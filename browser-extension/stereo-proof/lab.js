@@ -716,6 +716,11 @@
   // a block that no longer matches is found again within +-20 ms.
   const NULL_REACQUIRE = 960;
   const NULL_MATCH = 0.95;
+  const NULL_REACQUIRE_MATCH = 0.8;
+  const NULL_MOVE_MARGIN = 0.02;
+  // A block's delay fit counts only where its spectrum stays coherent with the source;
+  // elsewhere (noise, near-silence) the run's median delay of coherent blocks is used.
+  const DELAY_COHERENCE = 0.9;
   const NULL_BANDS_HZ = Object.freeze([100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1_000,
     1_250, 1_600, 2_000, 2_500, 3_150, 4_000, 5_000, 6_300, 8_000, 10_000, 12_500, 16_000]);
 
@@ -847,12 +852,20 @@
           const score = match(start, candidate, refEnergy);
           if (score > bestScore) { bestScore = score; best = candidate; }
         }
+        // On noisy content the best lag wanders by a sample from noise alone: the timing
+        // moves only for a clearly better match.
+        const stay = match(start, current, refEnergy);
+        if (bestScore < stay + NULL_MOVE_MARGIN) { best = current; bestScore = stay; }
         if (bestScore < NULL_MATCH) {
+          // Content whose waveform the codec does not keep (noise) never matches well; only a
+          // clearly better and good match elsewhere is a real jump.
+          let wideBest = best, wideScore = -Infinity;
           for (let candidate = current - NULL_REACQUIRE; candidate <= current + NULL_REACQUIRE; candidate++) {
             const score = match(start, candidate, refEnergy);
-            if (score > bestScore) { bestScore = score; best = candidate; }
+            if (score > wideScore) { wideScore = score; wideBest = candidate; }
             if (candidate % 64 === 0) yield;
           }
+          if (wideScore > NULL_REACQUIRE_MATCH && wideScore > bestScore + 0.1) best = wideBest;
         }
       }
       if (start + best < 0 || start + best + NULL_BLOCK > length) break;
@@ -868,6 +881,57 @@
     const bands = binBands(NULL_BLOCK, rate);
     const delayLow = Math.max(1, Math.round(DELAY_LOW_HZ * NULL_BLOCK / rate));
     const delayHigh = Math.min(NULL_BLOCK / 2, Math.round(DELAY_HIGH_HZ * NULL_BLOCK / rate));
+    // Fractional delay: X = Y e^{-j w d}, so the cross-spectrum phase is -w d. Coherence is
+    // how well the delayed source explains what arrived over the fitted band.
+    const fitDelay = channels => {
+      let num = 0, den = 0;
+      for (const { x, y } of channels) {
+        for (let k = delayLow; k <= delayHigh; k++) {
+          const cr = x.re[k] * y.re[k] + x.im[k] * y.im[k], ci = x.im[k] * y.re[k] - x.re[k] * y.im[k];
+          const weight = Math.hypot(cr, ci);
+          if (!(weight > 0)) continue;
+          const w = 2 * Math.PI * k / NULL_BLOCK;
+          num += weight * Math.atan2(ci, cr) * w;
+          den += weight * w * w;
+        }
+      }
+      // The integer lag is the best match, so the rest is within about half a sample; allow
+      // a whole sample so a delay near one half is not cut off.
+      const delay = den > 0 ? Math.max(-1, Math.min(1, -num / den)) : 0;
+      let dot = 0, xx = 0, yy = 0;
+      for (const { x, y } of channels) {
+        for (let k = delayLow; k <= delayHigh; k++) {
+          const w = 2 * Math.PI * k / NULL_BLOCK * delay;
+          const c = Math.cos(w), s = Math.sin(w);
+          const yr = y.re[k] * c + y.im[k] * s, yi = y.im[k] * c - y.re[k] * s;
+          dot += x.re[k] * yr + x.im[k] * yi;
+          xx += x.re[k] ** 2 + x.im[k] ** 2;
+          yy += yr * yr + yi * yi;
+        }
+      }
+      return { delay, coherence: xx > 0 && yy > 0 ? dot / Math.sqrt(xx * yy) : 0 };
+    };
+    const blockResidue = (block, section, channels, delay) => {
+      const sigBands = new Float64Array(NULL_BANDS_HZ.length), resBands = new Float64Array(NULL_BANDS_HZ.length);
+      let signal = 0, residue = 0, rawResidue = 0;
+      for (const { gain, x, y } of channels) {
+        for (let k = 1; k <= NULL_BLOCK / 2; k++) {
+          const w = 2 * Math.PI * k / NULL_BLOCK * delay;
+          const c = Math.cos(w), s = Math.sin(w);
+          // g Y e^{-j w d}
+          const yr = gain * (y.re[k] * c + y.im[k] * s), yi = gain * (y.im[k] * c - y.re[k] * s);
+          const sig = yr * yr + yi * yi;
+          const res = (x.re[k] - yr) ** 2 + (x.im[k] - yi) ** 2;
+          signal += sig; residue += res;
+          rawResidue += (x.re[k] - gain * y.re[k]) ** 2 + (x.im[k] - gain * y.im[k]) ** 2;
+          const band = bands[k];
+          if (band >= 0) { sigBands[band] += sig; resBands[band] += res; }
+        }
+      }
+      return { block, section, signal, residue, rawResidue, delay, sigBands, resBands };
+    };
+    let delayOfRun = 0;
+
     // `spectral` false: integer-lag residue in the time domain, enough to find dropouts.
     const measureBlocks = function* (excluded, spectral) {
       const gains = new Map();
@@ -882,6 +946,7 @@
         gains.set(section.name, g);
       }
       const residues = [];
+      const coherentDelays = [], waiting = [];
       for (const block of blocks) {
         if (block.slipped) continue;
         const section = sectionOf(block.start);
@@ -901,40 +966,22 @@
           { gain: g.ly > 0 ? g.lx / g.ly : 0, y: spectrum(ref.left, block.start, NULL_BLOCK), x: spectrum(left, block.start + block.lag, NULL_BLOCK) },
           { gain: g.ry > 0 ? g.rx / g.ry : 0, y: spectrum(ref.right, block.start, NULL_BLOCK), x: spectrum(right, block.start + block.lag, NULL_BLOCK) },
         ];
-        // Fractional delay: X = Y e^{-j w d}, so the cross-spectrum phase is -w d.
-        let num = 0, den = 0;
-        for (const { x, y } of channels) {
-          for (let k = delayLow; k <= delayHigh; k++) {
-            const cr = x.re[k] * y.re[k] + x.im[k] * y.im[k], ci = x.im[k] * y.re[k] - x.re[k] * y.im[k];
-            const weight = Math.hypot(cr, ci);
-            if (!(weight > 0)) continue;
-            const w = 2 * Math.PI * k / NULL_BLOCK;
-            num += weight * Math.atan2(ci, cr) * w;
-            den += weight * w * w;
-          }
+        const fitted = fitDelay(channels);
+        if (fitted.coherence >= DELAY_COHERENCE) {
+          residues.push(blockResidue(block, section.name, channels, fitted.delay));
+          coherentDelays.push(fitted.delay);
+        } else {
+          waiting.push({ block, section: section.name, channels });
         }
-        // The integer lag is the best match, so the rest is within about half a sample; allow
-        // a whole sample so a delay near one half is not cut off.
-        const delay = den > 0 ? Math.max(-1, Math.min(1, -num / den)) : 0;
-        const sigBands = new Float64Array(NULL_BANDS_HZ.length), resBands = new Float64Array(NULL_BANDS_HZ.length);
-        let signal = 0, residue = 0, rawResidue = 0;
-        for (const { gain, x, y } of channels) {
-          for (let k = 1; k <= NULL_BLOCK / 2; k++) {
-            const w = 2 * Math.PI * k / NULL_BLOCK * delay;
-            const c = Math.cos(w), s = Math.sin(w);
-            // g Y e^{-j w d}
-            const yr = gain * (y.re[k] * c + y.im[k] * s), yi = gain * (y.im[k] * c - y.re[k] * s);
-            const sig = yr * yr + yi * yi;
-            const res = (x.re[k] - yr) ** 2 + (x.im[k] - yi) ** 2;
-            signal += sig; residue += res;
-            rawResidue += (x.re[k] - gain * y.re[k]) ** 2 + (x.im[k] - gain * y.im[k]) ** 2;
-            const band = bands[k];
-            if (band >= 0) { sigBands[band] += sig; resBands[band] += res; }
-          }
-        }
-        residues.push({ block, section: section.name, signal, residue, rawResidue, delay, sigBands, resBands });
         yield;
       }
+      coherentDelays.sort((a, b) => a - b);
+      const runDelay = coherentDelays.length ? coherentDelays[coherentDelays.length >> 1] : 0;
+      for (const { block, section, channels } of waiting) {
+        residues.push(blockResidue(block, section, channels, runDelay));
+        yield;
+      }
+      delayOfRun = runDelay;
       // A dropout raises a block's residue both absolutely and against its own signal; a
       // quiet passage only does the latter.
       const middle = values => { const sorted = values.sort((a, b) => a - b); return sorted.length ? sorted[sorted.length >> 1] : 0; };
@@ -991,6 +1038,21 @@
       bandSrr.songs = Array.from(songSig, (s, b) => toDb(s, songRes[b]));
     }
 
+    // The source delayed by `delay` samples at `i`, by a windowed sinc.
+    const shifted = (i, delay) => {
+      if (delay === 0) return [ref.left[i], ref.right[i]];
+      let l = 0, r = 0;
+      for (let k = -32; k <= 32; k++) {
+        const j = i + k;
+        if (j < 0 || j >= ref.frames) continue;
+        const x = -k - delay;
+        const sinc = x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x);
+        const weight = sinc * (0.5 + 0.5 * Math.cos(Math.PI * x / 33));
+        l += ref.left[j] * weight; r += ref.right[j] * weight;
+      }
+      return [l, r];
+    };
+
     // 6. Pre-echo: what arrived in the 20 ms before each burst, against the burst itself.
     const burst = Math.round(rate * TRANSIENTS.burst_ms / 1000);
     const before = Math.round(rate * 0.020), guard = Math.round(rate * 0.0005);
@@ -1005,7 +1067,8 @@
       for (let i = onset - before; i < onset - guard; i++) pre += left[i + block.lag] ** 2 + right[i + block.lag] ** 2;
       for (let i = onset; i < onset + burst; i++) energy += 2 * (gainT * ref.left[i]) ** 2;
       for (let i = onset + burst; i < onset + burst + before; i++) {
-        post += (left[i + block.lag] - gainT * ref.left[i]) ** 2 + (right[i + block.lag] - gainT * ref.right[i]) ** 2;
+        const [sl, sr] = shifted(i, delayOfRun);
+        post += (left[i + block.lag] - gainT * sl) ** 2 + (right[i + block.lag] - gainT * sr) ** 2;
       }
       // Level of what is there before (and after) the burst relative to the burst: lower is better.
       preEcho.push(pre > 0 && energy > 0 ? 10 * Math.log10(pre / energy) : null);
@@ -1023,6 +1086,7 @@
     return {
       version: 1,
       lag_samples: lag,
+      delay_samples: delayOfRun,
       blocks: blocks.length,
       slipped_blocks: blocks.filter(b => b.slipped).length,
       dropout_blocks: residues.length - kept.length,
