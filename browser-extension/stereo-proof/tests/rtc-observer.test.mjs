@@ -113,3 +113,70 @@ test("the return path swaps the outgoing microphone for the program and puts it 
   assert.equal(programTrack.stopped, true);
   assert.deepEqual(replaced.map(track => track.id), ["program", "mic"]);
 });
+
+test("the return path waits for a late microphone and survives Discord replacing it", async () => {
+  const labSource = await readFile(new URL("../lab.js", import.meta.url), "utf8");
+  const source = await readFile(new URL("../rtc-observer.js", import.meta.url), "utf8");
+  const listeners = [];
+  const posted = [];
+  const ticks = [];
+  const window = {
+    addEventListener(kind, listener) { if (kind === "message") listeners.push(listener); },
+    postMessage(message) { posted.push(message); },
+  };
+  const sender = { track: null, async replaceTrack(track) { this.track = track; } };
+  const slots = [];
+  class Peer {
+    addEventListener() {}
+    getSenders() { return slots.map(slot => slot.sender); }
+    getTransceivers() { return slots; }
+    getReceivers() { return []; }
+    getStats() { return Promise.resolve(new Map()); }
+  }
+  const programTrack = { kind: "audio", id: "program", stop() {} };
+  class AudioContext {
+    constructor() { this.state = "running"; this.sampleRate = 48_000; }
+    resume() { return Promise.resolve(); }
+    createBuffer(channels, frames) { return { channels, frames, copyToChannel() {} }; }
+    createBufferSource() { return { connect() {}, start() {}, stop() {} }; }
+    createMediaStreamDestination() { return { stream: { getAudioTracks: () => [programTrack] } }; }
+  }
+  const context = vm.createContext({
+    window, AudioContext, MediaStream: class {},
+    location: { origin: "https://discord.com" },
+    setInterval: callback => { ticks.push(callback); return {}; }, clearInterval() {},
+    setTimeout: callback => { ticks.push(callback); return {}; },
+  });
+  window.RTCPeerConnection = Peer;
+  vm.runInContext(labSource, context);
+  vm.runInContext(source, context);
+  new window.RTCPeerConnection();
+  const control = returnPath => listeners.forEach(listener => listener({
+    source: window, origin: "https://discord.com",
+    data: { source: "tesktop-stereo-proof-control", returnPath },
+  }));
+  const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+  const tick = async () => { for (const callback of ticks) callback(); await settle(); };
+  const state = () => posted.filter(message => message.observer).at(-1)?.observer.return_path;
+
+  control(true);
+  await settle();
+  await tick();
+  assert.equal(state(), "no-microphone-sender");
+
+  // Discord's microphone slot appears without a track, then gets one.
+  slots.push({ direction: "sendrecv", sender, receiver: { track: { kind: "audio" } } });
+  await tick();
+  assert.equal(sender.track, programTrack);
+  await tick();
+  assert.equal(state(), "playing");
+
+  const microphone = { kind: "audio", id: "mic" };
+  sender.track = microphone;
+  await tick();
+  assert.equal(sender.track, programTrack, "the swap is restored after Discord replaces the track");
+
+  control(false);
+  await settle();
+  assert.equal(sender.track, microphone, "the latest Discord track is put back");
+});

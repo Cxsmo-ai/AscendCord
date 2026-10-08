@@ -377,60 +377,100 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
   }
 
   // Return path: while a program 2 test runs, Discord Web's outgoing microphone track is
-  // swapped for the same program so AscendCord can measure what arrives on its side. The
-  // original track is always put back when the test ends.
+  // swapped for the same program so AscendCord can measure what arrives on its side. Discord
+  // may join before its microphone track exists, or replace the track later (unmute, device
+  // change), so the swap is checked again on every sample until the test ends. The latest
+  // track Discord set is always put back.
   let returnPath = null;
+  let returnPathWanted = false;
+  let returnPathBusy = false;
   let returnPathState = "off";
 
-  async function startReturnPath() {
-    if (returnPath || !globalThis.AscendCordLab) return;
-    const ctx = context();
-    if (!ctx || ctx.state !== "running") {
-      returnPathState = "audio-suspended";
-      return;
-    }
-    const senders = [];
+  function audioSenders() {
+    const senders = new Set();
     for (const peer of peers) {
       for (const sender of peer.getSenders?.() ?? []) {
-        if (sender.track?.kind === "audio") senders.push(sender);
+        if (sender.track?.kind === "audio") senders.add(sender);
+      }
+      // An audio transceiver that sends but has no track yet is the microphone slot.
+      for (const transceiver of peer.getTransceivers?.() ?? []) {
+        const direction = transceiver.currentDirection ?? transceiver.direction ?? "";
+        if (transceiver.stopped || !/send/.test(direction) || !transceiver.sender) continue;
+        if (!transceiver.sender.track && transceiver.receiver?.track?.kind === "audio") {
+          senders.add(transceiver.sender);
+        }
       }
     }
-    if (!senders.length) {
-      returnPathState = "no-microphone-sender";
-      return;
+    return [...senders];
+  }
+
+  async function ensureReturnPath() {
+    if (!returnPathWanted || returnPathBusy || !globalThis.AscendCordLab) return;
+    returnPathBusy = true;
+    try {
+      const ctx = context();
+      if (!ctx || ctx.state !== "running") {
+        returnPathState = "audio-suspended";
+        return;
+      }
+      const senders = audioSenders();
+      if (!senders.length) {
+        returnPathState = "no-microphone-sender";
+        return;
+      }
+      if (!returnPath) {
+        const { left, right, frames } = globalThis.AscendCordLab.renderPass(ctx.sampleRate);
+        const buffer = ctx.createBuffer(2, frames, ctx.sampleRate);
+        buffer.copyToChannel(left, 0);
+        buffer.copyToChannel(right, 1);
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.loop = true;
+        const destination = ctx.createMediaStreamDestination();
+        destination.channelCount = 2;
+        source.connect(destination);
+        source.start();
+        returnPath = { source, track: destination.stream.getAudioTracks()[0], replaced: new Map() };
+      }
+      const path = returnPath;
+      for (const sender of senders) {
+        if (sender.track === path.track) continue;
+        const original = sender.track;
+        try {
+          await sender.replaceTrack(path.track);
+        } catch {
+          continue;
+        }
+        if (returnPath !== path) {
+          // The test ended while this swap was in flight.
+          try { await sender.replaceTrack(original); } catch {}
+          return;
+        }
+        path.replaced.set(sender, original ?? path.replaced.get(sender) ?? null);
+      }
+      returnPathState = [...path.replaced.keys()].some(sender => sender.track === path.track)
+        ? "playing" : "replace-failed";
+    } finally {
+      returnPathBusy = false;
     }
-    const { left, right, frames } = globalThis.AscendCordLab.renderPass(ctx.sampleRate);
-    const buffer = ctx.createBuffer(2, frames, ctx.sampleRate);
-    buffer.copyToChannel(left, 0);
-    buffer.copyToChannel(right, 1);
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.loop = true;
-    const destination = ctx.createMediaStreamDestination();
-    destination.channelCount = 2;
-    source.connect(destination);
-    source.start();
-    const track = destination.stream.getAudioTracks()[0];
-    const replaced = [];
-    for (const sender of senders) {
-      const original = sender.track;
-      try {
-        await sender.replaceTrack(track);
-        replaced.push({ sender, original });
-      } catch {}
-    }
-    returnPath = { source, track, replaced };
-    returnPathState = replaced.length ? "playing" : "replace-failed";
+  }
+
+  async function startReturnPath() {
+    returnPathWanted = true;
+    await ensureReturnPath();
   }
 
   async function stopReturnPath() {
+    returnPathWanted = false;
     if (!returnPath) {
       returnPathState = "off";
       return;
     }
     const { source, track, replaced } = returnPath;
     returnPath = null;
-    for (const { sender, original } of replaced) {
+    for (const [sender, original] of replaced) {
+      // Leave a track Discord set after the swap in place.
+      if (sender.track !== track) continue;
       try { await sender.replaceTrack(original); } catch {}
     }
     try { source.stop(); } catch {}
@@ -442,6 +482,7 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
     if (running) return;
     running = true;
     try {
+      await ensureReturnPath().catch(() => { returnPathState = "error"; });
       const activePeers = [...peers].slice(0, 32);
       const streams = [];
       for (const peer of activePeers) {
