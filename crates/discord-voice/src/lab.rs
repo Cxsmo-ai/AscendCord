@@ -1059,9 +1059,22 @@ pub mod returns {
 		lab: Lab,
 	}
 
-	/// Starts measuring every remote speaker for the rest of this process.
+	/// The queue message that starts the measurement over (no frame has an empty buffer).
+	const RESET: u32 = u32::MAX;
+
+	/// Starts measuring every remote speaker, from scratch: a new call is a new measurement.
 	pub fn enable() {
 		ACTIVE.store(true, Ordering::Release);
+		for count in &COUNTS {
+			count.store(0, Ordering::Relaxed);
+		}
+		if let Some(shared) = SHARED.get() {
+			if let Ok(mut report) = shared.report.lock() {
+				*report = None;
+			}
+			let _ = shared.send.send((RESET, Vec::new(), false));
+			return;
+		}
 		SHARED.get_or_init(|| {
 			let (send, receive) = mpsc::sync_channel::<(u32, Vec<f32>, bool)>(256);
 			let report = Arc::new(Mutex::new(None));
@@ -1072,6 +1085,14 @@ pub mod returns {
 					let mut sources: HashMap<u32, Source> = HashMap::new();
 					let mut since_report = 0u32;
 					while let Ok((ssrc, stereo, concealed)) = receive.recv() {
+						if ssrc == RESET && stereo.is_empty() {
+							sources.clear();
+							since_report = 0;
+							if let Ok(mut slot) = output.lock() {
+								*slot = None;
+							}
+							continue;
+						}
 						if !sources.contains_key(&ssrc) && sources.len() >= SOURCES {
 							continue;
 						}
