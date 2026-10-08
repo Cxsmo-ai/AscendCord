@@ -292,6 +292,47 @@ pub(crate) fn analyze_window(left: &[f32], right: &[f32], rate: f64) -> Window {
 	}
 }
 
+/// Least-squares line through the measured points, as `lab.js` `linearFit`.
+fn linear_fit(xs: &[f64], ys: &[Option<f64>]) -> Option<serde_json::Value> {
+	let points: Vec<(f64, f64)> = xs
+		.iter()
+		.zip(ys)
+		.filter_map(|(&x, y)| y.filter(|y| y.is_finite()).map(|y| (x, y)))
+		.collect();
+	if points.len() < 2 {
+		return None;
+	}
+	let n = points.len() as f64;
+	let mx = points.iter().map(|(x, _)| x).sum::<f64>() / n;
+	let my = points.iter().map(|(_, y)| y).sum::<f64>() / n;
+	let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
+	for (x, y) in &points {
+		sxx += (x - mx).powi(2);
+		sxy += (x - mx) * (y - my);
+		syy += (y - my).powi(2);
+	}
+	if sxx <= 0.0 {
+		return None;
+	}
+	let slope = sxy / sxx;
+	let intercept = my - slope * mx;
+	let residuals: Vec<f64> = points
+		.iter()
+		.map(|(x, y)| y - (intercept + slope * x))
+		.collect();
+	let r2 = if syy > 0.0 {
+		(1.0 - residuals.iter().map(|r| r * r).sum::<f64>() / syy).max(0.0)
+	} else {
+		1.0
+	};
+	Some(serde_json::json!({
+		"slope": slope,
+		"intercept": intercept,
+		"r2": r2,
+		"max_residual_db": residuals.iter().map(|r| r.abs()).fold(0.0, f64::max),
+	}))
+}
+
 /// Running mean and spread of a dB value, with the linear-power mean beside it.
 #[derive(Clone, Copy, Debug, Default)]
 struct Stat {
@@ -591,8 +632,21 @@ impl Lab {
 			.flatten()
 			.collect();
 		let antiphase_correlation = median(self.antiphase.iter().filter_map(correlation).collect());
+		let ladder_gain: Vec<Option<f64>> = ladder_out
+			.iter()
+			.zip(LADDER_DBFS)
+			.map(|(out, input)| out.map(|out| out - input))
+			.collect();
+		let ladder_gains: Vec<f64> = ladder_gain.iter().flatten().copied().collect();
+		let fit = linear_fit(&LADDER_DBFS, &ladder_out);
 		serde_json::json!({
 			"version": 2,
+			"program": {
+				"step_ms": 700,
+				"ladder_step_ms": 800,
+				"silence_ms": 1_200,
+				"source_peak_dbfs": SOURCE_PEAK_DBFS,
+			},
 			"passes": self.passes,
 			"windows": {
 				"accepted": self.windows.accepted,
@@ -632,7 +686,9 @@ impl Lab {
 				"frequency_hz": (0..LADDER_DBFS.len()).map(ladder_hz).collect::<Vec<_>>(),
 				"input_dbfs": LADDER_DBFS,
 				"output_dbfs": ladder_out,
-				"gain_db": ladder_out.iter().zip(LADDER_DBFS).map(|(out, input)| out.map(|out| out - input)).collect::<Vec<_>>(),
+				"gain_db": ladder_gain,
+				"thdn_db": self.ladder.iter().map(|cell| cell.left_thdn.db().into_iter().chain(cell.right_thdn.db()).reduce(f64::max)).collect::<Vec<_>>(),
+				"fit": fit,
 			},
 			"noise": {
 				"left_rms_dbfs": self.noise_left.db(),
@@ -649,6 +705,8 @@ impl Lab {
 				"minimum_separation_db": separations.iter().copied().reduce(f64::min),
 				"antiphase_correlation": antiphase_correlation,
 				"stereo_preserved": separations.len() >= 6 && median(separations.clone()).is_some_and(|s| s >= 20.0) && antiphase_correlation.is_some_and(|c| c < -0.9),
+				"linearity_slope": fit.as_ref().map(|fit| fit["slope"].clone()),
+				"level_compression_db": (!ladder_gains.is_empty()).then(|| ladder_gains.iter().copied().fold(f64::MIN, f64::max) - ladder_gains.iter().copied().fold(f64::MAX, f64::min)),
 				"noise_floor_dbfs": self.noise_left.db().into_iter().chain(self.noise_right.db()).reduce(f64::max),
 			},
 		})
@@ -761,6 +819,13 @@ mod tests {
 		for gain in report["linearity"]["gain_db"].as_array().unwrap() {
 			assert!(number(gain).abs() < 0.05);
 		}
+		// The same fields as lab.js, so the popup draws both directions alike.
+		assert!((number(&summary["linearity_slope"]) - 1.0).abs() < 0.001);
+		assert!(number(&summary["level_compression_db"]) < 0.05);
+		assert!(number(&report["linearity"]["fit"]["r2"]) > 0.9999);
+		assert_eq!(report["linearity"]["thdn_db"].as_array().unwrap().len(), 8);
+		assert!(number(&report["linearity"]["thdn_db"][7]) < -80.0);
+		assert_eq!(report["program"]["silence_ms"], 1_200);
 	}
 
 	#[test]

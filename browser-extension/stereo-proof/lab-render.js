@@ -173,14 +173,16 @@
     title = "AscendCord audio lab · AscendCord to Discord to the browser",
     baselineKey = "measurement_lab",
   } = {}) {
-    const panels = 5 + (samples.length ? 1 : 0) + (baseline?.[baselineKey] ? 1 : 0);
-    const top = 470 + (baseline?.[baselineKey] ? 40 : 0);
+    // A baseline run without a measured report for this direction draws nothing, so it is
+    // neither named nor given a difference panel.
+    const candidate = baseline?.[baselineKey];
+    const base = candidate?.summary?.measured_response_bands > 0 ? candidate : null;
+    const panels = 5 + (samples.length ? 1 : 0) + (base ? 1 : 0);
+    const top = 470 + (base ? 40 : 0);
     canvas.width = WIDTH;
     canvas.height = top + panels * PANEL_HEIGHT + 40;
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = COLORS.background; ctx.fillRect(0, 0, canvas.width, canvas.height);
-    const base = baseline?.[baselineKey];
-    // A baseline run without this direction's report draws nothing, so it is not named.
     header(ctx, report, settings, base ? baseline : null, title);
     let y = top;
     const dashed = [14, 10];
