@@ -103,6 +103,8 @@ fn music_dir_from_args(
 /// Reads `manifest.tsv` (`id<TAB>name` per line) and each `<id>.s16` beside it.
 fn load_songs(dir: &std::path::Path) -> Option<Songs> {
 	let manifest = std::fs::read_to_string(dir.join("manifest.tsv")).ok()?;
+	// Some editors save a byte order mark; it is not part of the first clip's id.
+	let manifest = manifest.trim_start_matches('\u{feff}');
 	let mut songs = Songs {
 		names: Vec::new(),
 		clips: Vec::new(),
@@ -496,7 +498,7 @@ mod tests {
 		std::fs::create_dir_all(&dir).unwrap();
 		std::fs::write(
 			dir.join("manifest.tsv"),
-			"01\tFirst\n../x\tEscape\n02\tSecond\n",
+			"\u{feff}01\tFirst\r\n../x\tEscape\r\n02\tSecond\r\n",
 		)
 		.unwrap();
 		let clip: Vec<u8> = (0..960i16)

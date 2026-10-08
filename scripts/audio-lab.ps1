@@ -50,7 +50,7 @@ $deadline = $started.AddMinutes($TimeoutMinutes)
 while ((Get-Date) -lt $deadline) {
 	Start-Sleep -Seconds 10
 	if ((Test-Path $report) -and (Get-Item $report).LastWriteTime -gt $started) { break }
-	$status = Get-Content (Join-Path $bridge "status.json") -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+	$status = Get-Content (Join-Path $bridge "status.json") -Raw -Encoding UTF8 -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
 	if ($status) { Write-Host ("  {0:HH:mm:ss} {1} {2}" -f (Get-Date), $status.call_phase, $status.status) }
 }
 Get-Process ascendcord -ErrorAction SilentlyContinue | Stop-Process
@@ -59,7 +59,7 @@ if (-not ((Test-Path $report) -and (Get-Item $report).LastWriteTime -gt $started
 	exit 1
 }
 
-$run = Get-Content $report -Raw | ConvertFrom-Json
+$run = Get-Content $report -Raw -Encoding UTF8 | ConvertFrom-Json
 $forward = $run.measurement_lab
 $fmt = { param($value, $unit = " dB") if ($null -eq $value) { "-" } else { "{0:N1}{1}" -f [double]$value, $unit } }
 Write-Host ""

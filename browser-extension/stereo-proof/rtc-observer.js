@@ -638,6 +638,8 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
   // the return path sends is still the swapped program track. Outside a lab test, or when
   // the page cannot play audio, Discord gets its real microphone unchanged.
   let labArmed = false;
+  // Whether the microphone Discord holds now is the lab tone (it opened it during a test).
+  let labMicrophoneLive = false;
 
   async function labMicrophone(stream) {
     const original = stream.getAudioTracks()[0];
@@ -660,7 +662,9 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
       stop();
       original.stop();
       try { tone.stop(); } catch {}
+      labMicrophoneLive = false;
     };
+    labMicrophoneLive = true;
     // Discord matches the opened device by these; answer for the real microphone.
     track.getSettings = () => original.getSettings();
     track.getConstraints = () => original.getConstraints();
@@ -705,6 +709,7 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
           error: lastInstallError,
           at_ms: Date.now(),
           return_path: returnPathState,
+          lab_microphone: labMicrophoneLive,
         },
         report: {
           protocol: 1,

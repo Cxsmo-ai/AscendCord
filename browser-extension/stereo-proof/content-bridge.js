@@ -7,6 +7,8 @@
   // visible in the Discord page console instead of silently dropping them.
   const sendRuntimeMessage = (message, onResponse = null) => {
     const warn = error => {
+      // A reloaded extension leaves this script behind and every message fails.
+      if (/context invalidated/i.test(String(error?.message ?? error))) reloadForLab();
       if (Date.now() - lastMessageWarningAt < 10_000) return;
       lastMessageWarningAt = Date.now();
       console.warn("[AscendCord Stereo Proof] Extension message failed:",
@@ -15,8 +17,7 @@
     // A reloaded extension leaves this script behind; during a lab test the page reloads so
     // the new scripts run.
     if (!chrome.runtime?.id) {
-      const channel = labChannel ?? sessionStorage.getItem(LAB_CHANNEL_KEY);
-      if (channel && location.pathname.endsWith(`/${channel}`)) location.reload();
+      reloadForLab();
       return;
     }
     try {
@@ -41,7 +42,15 @@
   // Remembered in this tab, so a reload of the extension between tests still reloads the tab.
   const LAB_CHANNEL_KEY = "ascendcord-lab-channel";
   let labChannel = null;
+  function reloadForLab() {
+    let channel = labChannel;
+    try { channel ??= sessionStorage.getItem(LAB_CHANNEL_KEY); } catch {}
+    if (channel && location.pathname.endsWith(`/${channel}`)) location.reload();
+  }
   let lastJoinAt = 0;
+  let lastLeaveAt = 0;
+  let inVoiceSince = 0;
+  let labMicrophone = null;
   const inVoice = () => [...document.querySelectorAll("button[aria-label]")]
     .some(button => /^disconnect$/i.test(button.getAttribute("aria-label") ?? ""));
   const autoJoin = () => {
@@ -51,7 +60,20 @@
         dialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }));
       }
     }
-    if (inVoice() || Date.now() - lastJoinAt < 10_000) return;
+    if (inVoice()) {
+      inVoiceSince ||= Date.now();
+      // Joined before the test was armed: Discord holds the real (silent) microphone, so the
+      // return path would not be heard. Leave once; joining again opens the lab microphone.
+      if (labMicrophone === false && Date.now() - inVoiceSince > 15_000 && Date.now() - lastLeaveAt > 30_000) {
+        const leave = [...document.querySelectorAll("button[aria-label]")]
+          .find(button => /^disconnect$/i.test(button.getAttribute("aria-label") ?? ""));
+        lastLeaveAt = Date.now();
+        leave?.click();
+      }
+      return;
+    }
+    inVoiceSince = 0;
+    if (Date.now() - lastJoinAt < 10_000) return;
     const join = [...document.querySelectorAll("button")].find(button => /^\s*join voice\s*$/i.test(button.textContent ?? ""));
     if (!join) return;
     lastJoinAt = Date.now();
@@ -66,7 +88,9 @@
       labArmed: response.lab_armed,
     }, location.origin);
     labChannel = typeof response.lab_channel === "string" ? response.lab_channel : null;
-    if (labChannel) sessionStorage.setItem(LAB_CHANNEL_KEY, labChannel);
+    if (labChannel) {
+      try { sessionStorage.setItem(LAB_CHANNEL_KEY, labChannel); } catch {}
+    }
     autoJoin();
   });
   heartbeat();
@@ -76,6 +100,9 @@
     if (event.source !== window || event.origin !== location.origin ||
         event.data?.source !== marker) return;
 
+    if (typeof event.data.observer?.lab_microphone === "boolean") {
+      labMicrophone = event.data.observer.lab_microphone;
+    }
     if (event.data.observer && typeof event.data.observer === "object") {
       sendRuntimeMessage({
         kind: "tesktop-observer-status",
