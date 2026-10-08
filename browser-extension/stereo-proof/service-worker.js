@@ -443,7 +443,8 @@ function refreshLabSongs(manifest) {
   const list = Array.isArray(manifest) ? manifest.slice(0, 16) : [];
   const key = JSON.stringify(list);
   if (!list.length || key === labSongsKey || labSongsRequest) return;
-  labSongsRequest = fetch(`${BASE}/v1/lab/songs`, { cache: "no-store", credentials: "omit" })
+  // A POST: Chromium attaches the extension's Origin to it, which AscendCord requires.
+  labSongsRequest = fetch(`${BASE}/v1/lab/songs`, { method: "POST", cache: "no-store", credentials: "omit" })
     .then(response => response.ok ? response.arrayBuffer() : null)
     .then(buffer => {
       const frames = list.map(item => Math.max(0, Math.floor(Number(item?.frames) || 0)));

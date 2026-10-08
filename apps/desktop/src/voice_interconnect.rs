@@ -564,9 +564,10 @@ fn serve(mut stream: TcpStream, shared: &Arc<Mutex<Shared>>) {
 				);
 			respond(&mut stream, 200, "OK", &body.to_string(), origin.as_deref());
 		}
-		// The song clips of a lab test, for the extension to subtract from what arrives. Only
-		// the pinned extension origin reaches this (see `origin_allowed`).
-		("GET", "/v1/lab/songs") => match discord_voice::test_sweep::songs() {
+		// The song clips of a lab test, for the extension to subtract from what arrives. A POST,
+		// because Chromium sends an extension worker's Origin on POST but not reliably on GET;
+		// only the pinned extension origin reaches this (see `origin_allowed`).
+		("POST", "/v1/lab/songs") => match discord_voice::test_sweep::songs() {
 			Some(songs) if discord_voice::audio::test_sweep_channel().is_some() => {
 				respond_bytes(&mut stream, songs.pcm(), origin.as_deref());
 			}
@@ -712,10 +713,10 @@ mod tests {
 		));
 		assert!(origin_allowed("GET", "/v1/status", Some(EXTENSION_ORIGIN)));
 		// Song clips are the user's audio: only the pinned extension may read them.
-		assert!(!origin_allowed("GET", "/v1/lab/songs", None));
-		assert!(!origin_allowed("GET", "/v1/lab/songs", Some("null")));
+		assert!(!origin_allowed("POST", "/v1/lab/songs", None));
+		assert!(!origin_allowed("POST", "/v1/lab/songs", Some("null")));
 		assert!(origin_allowed(
-			"GET",
+			"POST",
 			"/v1/lab/songs",
 			Some(EXTENSION_ORIGIN)
 		));
