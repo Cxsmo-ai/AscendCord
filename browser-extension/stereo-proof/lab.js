@@ -749,20 +749,30 @@
     }
   }
 
-  /** Power of a Hann-windowed block in each third-octave band. */
-  function bandPowers(block, rate) {
-    const n = block.length;
+  /** Spectrum of a Hann-windowed stretch of `samples` from `start`. */
+  function spectrum(samples, start, n) {
     const re = new Float64Array(n), im = new Float64Array(n);
-    for (let i = 0; i < n; i++) re[i] = block[i] * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / n));
+    for (let i = 0; i < n; i++) re[i] = samples[start + i] * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / n));
     fftInPlace(re, im);
-    return NULL_BANDS_HZ.map(center => {
+    return { re, im };
+  }
+
+  /** Third-octave band of each FFT bin (-1 outside the bands). */
+  function binBands(n, rate) {
+    const bands = new Int16Array(n / 2 + 1).fill(-1);
+    NULL_BANDS_HZ.forEach((center, b) => {
       const low = Math.max(1, Math.round(center / 2 ** (1 / 6) * n / rate));
       const high = Math.min(n / 2, Math.round(center * 2 ** (1 / 6) * n / rate));
-      let power = 0;
-      for (let bin = low; bin <= Math.max(low, high); bin++) power += re[bin] ** 2 + im[bin] ** 2;
-      return power;
+      for (let bin = low; bin <= Math.max(low, high); bin++) bands[bin] = b;
     });
+    return bands;
   }
+
+  // A constant delay of a fraction of a sample (a resampler on the way) is no loss of quality
+  // but leaves a residue that grows with frequency. Each block's delay is fitted from the phase
+  // of the cross-spectrum over 100 Hz-12 kHz and taken out before the residue is measured.
+  const DELAY_LOW_HZ = 100;
+  const DELAY_HIGH_HZ = 12_000;
 
   /**
    * Finds the content inside `left`/`right` (decoded audio that holds it somewhere), follows
@@ -855,7 +865,11 @@
     // that hold a dropout are found on the first round and left out of the second, so they
     // do not bias the gain.
     const sectionOf = start => ref.sections.find(s => start >= s.start && start < s.start + s.frames);
-    const measureBlocks = function* (excluded) {
+    const bands = binBands(NULL_BLOCK, rate);
+    const delayLow = Math.max(1, Math.round(DELAY_LOW_HZ * NULL_BLOCK / rate));
+    const delayHigh = Math.min(NULL_BLOCK / 2, Math.round(DELAY_HIGH_HZ * NULL_BLOCK / rate));
+    // `spectral` false: integer-lag residue in the time domain, enough to find dropouts.
+    const measureBlocks = function* (excluded, spectral) {
       const gains = new Map();
       for (const block of blocks) {
         if (block.slipped || excluded.has(block)) continue;
@@ -872,18 +886,51 @@
         if (block.slipped) continue;
         const section = sectionOf(block.start);
         const g = gains.get(section.name) ?? { lx: 0, ly: 0, rx: 0, ry: 0 };
-        const gl = g.ly > 0 ? g.lx / g.ly : 0, gr = g.ry > 0 ? g.rx / g.ry : 0;
-        const sigL = new Float64Array(NULL_BLOCK), sigR = new Float64Array(NULL_BLOCK);
-        const resL = new Float64Array(NULL_BLOCK), resR = new Float64Array(NULL_BLOCK);
-        let signal = 0, residue = 0;
-        for (let j = 0; j < NULL_BLOCK; j++) {
-          const i = block.start + j;
-          sigL[j] = gl * ref.left[i]; sigR[j] = gr * ref.right[i];
-          resL[j] = left[i + block.lag] - sigL[j]; resR[j] = right[i + block.lag] - sigR[j];
-          signal += sigL[j] ** 2 + sigR[j] ** 2;
-          residue += resL[j] ** 2 + resR[j] ** 2;
+        if (!spectral) {
+          const gl = g.ly > 0 ? g.lx / g.ly : 0, gr = g.ry > 0 ? g.rx / g.ry : 0;
+          let signal = 0, residue = 0;
+          for (let i = block.start; i < block.start + NULL_BLOCK; i++) {
+            const sl = gl * ref.left[i], sr = gr * ref.right[i];
+            signal += sl * sl + sr * sr;
+            residue += (left[i + block.lag] - sl) ** 2 + (right[i + block.lag] - sr) ** 2;
+          }
+          residues.push({ block, section: section.name, signal, residue });
+          continue;
         }
-        residues.push({ block, section: section.name, signal, residue, sigL, sigR, resL, resR });
+        const channels = [
+          { gain: g.ly > 0 ? g.lx / g.ly : 0, y: spectrum(ref.left, block.start, NULL_BLOCK), x: spectrum(left, block.start + block.lag, NULL_BLOCK) },
+          { gain: g.ry > 0 ? g.rx / g.ry : 0, y: spectrum(ref.right, block.start, NULL_BLOCK), x: spectrum(right, block.start + block.lag, NULL_BLOCK) },
+        ];
+        // Fractional delay: X = Y e^{-j w d}, so the cross-spectrum phase is -w d.
+        let num = 0, den = 0;
+        for (const { x, y } of channels) {
+          for (let k = delayLow; k <= delayHigh; k++) {
+            const cr = x.re[k] * y.re[k] + x.im[k] * y.im[k], ci = x.im[k] * y.re[k] - x.re[k] * y.im[k];
+            const weight = Math.hypot(cr, ci);
+            if (!(weight > 0)) continue;
+            const w = 2 * Math.PI * k / NULL_BLOCK;
+            num += weight * Math.atan2(ci, cr) * w;
+            den += weight * w * w;
+          }
+        }
+        const delay = den > 0 ? Math.max(-0.5, Math.min(0.5, -num / den)) : 0;
+        const sigBands = new Float64Array(NULL_BANDS_HZ.length), resBands = new Float64Array(NULL_BANDS_HZ.length);
+        let signal = 0, residue = 0, rawResidue = 0;
+        for (const { gain, x, y } of channels) {
+          for (let k = 1; k <= NULL_BLOCK / 2; k++) {
+            const w = 2 * Math.PI * k / NULL_BLOCK * delay;
+            const c = Math.cos(w), s = Math.sin(w);
+            // g Y e^{-j w d}
+            const yr = gain * (y.re[k] * c + y.im[k] * s), yi = gain * (y.im[k] * c - y.re[k] * s);
+            const sig = yr * yr + yi * yi;
+            const res = (x.re[k] - yr) ** 2 + (x.im[k] - yi) ** 2;
+            signal += sig; residue += res;
+            rawResidue += (x.re[k] - gain * y.re[k]) ** 2 + (x.im[k] - gain * y.im[k]) ** 2;
+            const band = bands[k];
+            if (band >= 0) { sigBands[band] += sig; resBands[band] += res; }
+          }
+        }
+        residues.push({ block, section: section.name, signal, residue, rawResidue, delay, sigBands, resBands });
         yield;
       }
       // A dropout raises a block's residue both absolutely and against its own signal; a
@@ -901,8 +948,8 @@
       }
       return { gains, residues, dropouts };
     };
-    const first = yield* measureBlocks(new Set());
-    const { gains, residues } = yield* measureBlocks(first.dropouts);
+    const first = yield* measureBlocks(new Set(), false);
+    const { gains, residues } = yield* measureBlocks(first.dropouts, true);
     const kept = residues.filter(r => !first.dropouts.has(r.block));
 
     const toDb = (signal, residue) => signal > 0 ? 10 * Math.log10(signal / Math.max(residue, signal * 1e-15)) : null;
@@ -913,22 +960,24 @@
     for (const { name, title } of ref.sections) {
       const mine = kept.filter(r => r.section === name);
       const signal = mine.reduce((s, r) => s + r.signal, 0), residue = mine.reduce((s, r) => s + r.residue, 0);
+      const rawResidue = mine.reduce((s, r) => s + r.rawResidue, 0);
+      const delays = mine.map(r => r.delay).sort((a, b) => a - b);
       const g = gains.get(name);
       sections[name] = {
         blocks: mine.length,
         srr_db: toDb(signal, residue),
+        srr_without_delay_db: toDb(signal, rawResidue),
+        delay_samples: delays.length ? delays[delays.length >> 1] : null,
         gain_db: g && g.ly > 0 && g.lx > 0 ? 20 * Math.log10(g.lx / g.ly) : null,
         ...(title ? { title: String(title).slice(0, 64) } : {}),
       };
       if (name === "transients") continue;
       const sig = new Float64Array(NULL_BANDS_HZ.length), res = new Float64Array(NULL_BANDS_HZ.length);
       for (const r of mine) {
-        for (const [signalBlock, residueBlock] of [[r.sigL, r.resL], [r.sigR, r.resR]]) {
-          bandPowers(signalBlock, rate).forEach((p, b) => { sig[b] += p; });
-          bandPowers(residueBlock, rate).forEach((p, b) => { res[b] += p; });
-        }
-        yield;
+        r.sigBands.forEach((p, b) => { sig[b] += p; });
+        r.resBands.forEach((p, b) => { res[b] += p; });
       }
+      yield;
       bandSrr[name] = Array.from(sig, (s, b) => toDb(s, res[b]));
       if (title) {
         sig.forEach((s, b) => { songSig[b] += s; songRes[b] += res[b]; });
