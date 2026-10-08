@@ -15,7 +15,8 @@
     // A reloaded extension leaves this script behind; during a lab test the page reloads so
     // the new scripts run.
     if (!chrome.runtime?.id) {
-      if (labChannel) location.reload();
+      const channel = labChannel ?? sessionStorage.getItem(LAB_CHANNEL_KEY);
+      if (channel && location.pathname.endsWith(`/${channel}`)) location.reload();
       return;
     }
     try {
@@ -37,6 +38,8 @@
   // Unattended lab runs: while AscendCord runs a sweep test, a tab open on its test channel
   // joins the voice channel by itself (and closes Discord's after-call survey), and when the
   // extension is reloaded the tab reloads so the new scripts take over.
+  // Remembered in this tab, so a reload of the extension between tests still reloads the tab.
+  const LAB_CHANNEL_KEY = "ascendcord-lab-channel";
   let labChannel = null;
   let lastJoinAt = 0;
   const inVoice = () => [...document.querySelectorAll("button[aria-label]")]
@@ -63,6 +66,7 @@
       labArmed: response.lab_armed,
     }, location.origin);
     labChannel = typeof response.lab_channel === "string" ? response.lab_channel : null;
+    if (labChannel) sessionStorage.setItem(LAB_CHANNEL_KEY, labChannel);
     autoJoin();
   });
   heartbeat();
