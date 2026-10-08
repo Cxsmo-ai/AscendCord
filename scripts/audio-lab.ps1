@@ -9,8 +9,9 @@ tab is open on that channel, joins the call by itself, measures both directions 
 the finished run to AscendCord, which writes voice-bridge\lab-report.json. This script waits
 for that file, stops AscendCord and prints the main figures.
 
-Needs, once: the extension loaded unpacked in Edge; one Discord tab of the second account open
-on https://discord.com/channels/<guild>/<channel> (or pass -Guild to open it).
+Needs, once: the extension loaded unpacked in Edge (Developer mode on) and a tab open on
+edge://extensions; one Discord tab of the second account open on
+https://discord.com/channels/<guild>/<channel> (or pass -Guild to open it).
 
 .EXAMPLE
 pwsh scripts\audio-lab.ps1 -Exe .\ascendcord.exe -Channel 1034272505839497270 -Music E:\lab-songs
@@ -22,7 +23,8 @@ param(
 	[string]$Music,
 	[int]$TimeoutMinutes = 12,
 	[switch]$ReloadExtension,
-	[string]$ExtensionId = "jbchdifpgimmmmlnimidbfockpbigfni"
+	# The folder Edge loads the unpacked extension from; its manifest version is checked.
+	[string]$ExtensionFolder
 )
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -31,7 +33,10 @@ $report = Join-Path $bridge "lab-report.json"
 $exePath = (Resolve-Path $Exe).Path
 
 if ($ReloadExtension) {
-	& (Join-Path $PSScriptRoot "edge-reload-extension.ps1") -Id $ExtensionId
+	$reload = @{}
+	if ($ExtensionFolder) { $reload.Folder = $ExtensionFolder }
+	& (Join-Path $PSScriptRoot "edge-reload-extension.ps1") @reload
+	if ($LASTEXITCODE) { throw "The extension did not reload." }
 }
 
 Get-Process ascendcord -ErrorAction SilentlyContinue | Stop-Process

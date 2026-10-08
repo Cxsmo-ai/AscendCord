@@ -42,10 +42,15 @@
   // Remembered in this tab, so a reload of the extension between tests still reloads the tab.
   const LAB_CHANNEL_KEY = "ascendcord-lab-channel";
   let labChannel = null;
+  let reloadScheduled = false;
   function reloadForLab() {
     let channel = labChannel;
     try { channel ??= sessionStorage.getItem(LAB_CHANNEL_KEY); } catch {}
-    if (channel && location.pathname.endsWith(`/${channel}`)) location.reload();
+    if (reloadScheduled || !channel || !location.pathname.endsWith(`/${channel}`)) return;
+    // The extension may be switched off for a moment while it reloads; a page loaded in
+    // that moment gets no scripts at all.
+    reloadScheduled = true;
+    setTimeout(() => location.reload(), 5_000);
   }
   let lastJoinAt = 0;
   let lastLeaveAt = 0;
