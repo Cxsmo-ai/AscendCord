@@ -301,7 +301,7 @@
    * Windows overlapping packet concealment are counted but not measured.
    */
   function beginPass(lab) {
-    if (lab.section === "ladder") lab.passes++;
+    if (lab.started_pass && lab.section === "ladder") lab.passes++;
     lab.section = "silence";
     lab.last_index = -1;
     lab.ladder_top = -1;
@@ -335,6 +335,12 @@
       if (window.grid === "sweep" && window.index <= 1) beginPass(lab);
     }
     if (!lab.started_pass) {
+      // A path that filters out the lowest sweep tones (Opus in voice mode) still shows the
+      // ladder, and the silence after it starts the first pass.
+      if (window.grid === "ladder") {
+        lab.section = "ladder";
+        lab.ladder_top = Math.max(lab.ladder_top, window.index);
+      }
       lab.windows.out_of_order++;
       return;
     }

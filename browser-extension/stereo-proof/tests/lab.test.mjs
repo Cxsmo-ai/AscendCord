@@ -188,3 +188,28 @@ test("a path with comfort noise still finds every pass without false starts in t
   for (const gain of report.linearity.gain_db.slice(2)) near(gain, 0, 0.5, "ladder gain above the noise");
   assert.equal(report.summary.stereo_preserved, true);
 });
+
+test("a path that filters out the lowest tones still starts after the ladder", () => {
+  // Four one-pole high-pass stages at 150 Hz remove 20-30 Hz almost entirely, as Opus in
+  // voice mode does, plus comfort noise.
+  const highPass = () => {
+    const a = 1 / (1 + 2 * Math.PI * 150 / RATE);
+    const x = [0, 0, 0, 0], y = [0, 0, 0, 0];
+    return input => {
+      let value = input;
+      for (let stage = 0; stage < 4; stage++) {
+        const out = a * (y[stage] + value - x[stage]);
+        x[stage] = value; y[stage] = out; value = out;
+      }
+      return value;
+    };
+  };
+  const left = highPass(), right = highPass();
+  const report = analyze(render(3, (l, r, _hz, noise) =>
+    [left(l) + noise() * 0.0035, right(r) + noise() * 0.0035]));
+  assert.ok(report.passes >= 1, `passes ${report.passes}`);
+  assert.ok(report.summary.measured_response_bands >= 40, `bands ${report.summary.measured_response_bands}`);
+  const lowest = report.response.left_gain_db[0];
+  assert.ok(lowest === null || lowest < -40, `20 Hz is missing or far down, not invented: ${lowest}`);
+  near(report.response.left_gain_db[30], 0, 0.5, "mid band gain");
+});

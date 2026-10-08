@@ -413,7 +413,7 @@ impl Default for Lab {
 
 impl Lab {
 	fn begin_pass(&mut self) {
-		if self.section == Section::Ladder {
+		if self.started && self.section == Section::Ladder {
 			self.passes += 1;
 		}
 		self.section = Section::Silence;
@@ -469,6 +469,12 @@ impl Lab {
 			}
 		}
 		if !self.started {
+			// A path that filters out the lowest sweep tones (Opus in voice mode) still shows
+			// the ladder, and the silence after it starts the first pass.
+			if grid == Grid::Ladder {
+				self.section = Section::Ladder;
+				self.ladder_top = Some(self.ladder_top.map_or(index, |top| top.max(index)));
+			}
 			self.windows.out_of_order += 1;
 			return;
 		}
@@ -709,6 +715,37 @@ mod tests {
 		for gain in &report["linearity"]["gain_db"].as_array().unwrap()[2..] {
 			assert!(number(gain).abs() < 0.5, "{gain}");
 		}
+	}
+
+	#[test]
+	fn a_path_that_filters_out_the_lowest_tones_still_starts_after_the_ladder() {
+		// Four one-pole high-pass stages at 150 Hz remove 20-30 Hz almost entirely, as Opus
+		// in voice mode does.
+		let a = 1.0 / (1.0 + std::f64::consts::TAU * 150.0 / RATE);
+		let state = std::cell::RefCell::new([[0.0f64; 8]; 2]);
+		let filter = |channel: usize, input: f32| {
+			let mut state = state.borrow_mut();
+			let stages = &mut state[channel];
+			let mut value = f64::from(input);
+			for stage in 0..4 {
+				let out = a * (stages[4 + stage] + value - stages[stage]);
+				stages[stage] = value;
+				stages[4 + stage] = out;
+				value = out;
+			}
+			value as f32
+		};
+		let report = measure(3, |l, r| (filter(0, l), filter(1, r)));
+		assert!(
+			number(&report["passes"]) >= 1.0,
+			"passes {}",
+			report["passes"]
+		);
+		assert!(number(&report["summary"]["measured_response_bands"]) >= 40.0);
+		// 20 Hz is either missing or measured far down, never at full level.
+		let lowest = &report["response"]["left_gain_db"][0];
+		assert!(lowest.is_null() || number(lowest) < -40.0, "{lowest}");
+		assert!(number(&report["response"]["left_gain_db"][30]).abs() < 0.5);
 	}
 
 	#[test]
