@@ -1049,6 +1049,8 @@
       return [name, {
         blocks: mine.reduce((sum, s) => sum + (s.blocks ?? 0), 0),
         srr_db: median(mine.map(s => s.srr_db)),
+        srr_without_delay_db: median(mine.map(s => s.srr_without_delay_db)),
+        delay_samples: median(mine.map(s => s.delay_samples)),
         gain_db: median(mine.map(s => s.gain_db)),
         ...(mine.find(s => s.title) ? { title: mine.find(s => s.title).title } : {}),
       }];
