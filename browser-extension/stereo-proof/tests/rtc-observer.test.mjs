@@ -180,3 +180,64 @@ test("the return path waits for a late microphone and survives Discord replacing
   await settle();
   assert.equal(sender.track, microphone, "the latest Discord track is put back");
 });
+
+test("during a lab test Discord's microphone is a steady tone that answers for the real device", async () => {
+  const source = await readFile(new URL("../rtc-observer.js", import.meta.url), "utf8");
+  const listeners = [];
+  const window = {
+    addEventListener(kind, listener) { if (kind === "message") listeners.push(listener); },
+    postMessage() {},
+  };
+  let stopped = 0;
+  const microphone = {
+    kind: "audio", label: "Real microphone",
+    stop() { stopped++; },
+    getSettings: () => ({ deviceId: "real" }),
+    getConstraints: () => ({}),
+    applyConstraints: async () => {},
+  };
+  class MediaStream {
+    constructor(tracks = []) { this.tracks = tracks; }
+    getAudioTracks() { return this.tracks.filter(track => track.kind === "audio"); }
+    getVideoTracks() { return this.tracks.filter(track => track.kind === "video"); }
+  }
+  const navigator = { mediaDevices: { getUserMedia: async () => new MediaStream([microphone]) } };
+  let toneStarted = 0;
+  class AudioContext {
+    constructor() { this.state = "running"; this.sampleRate = 48_000; }
+    resume() { return Promise.resolve(); }
+    createOscillator() { return { frequency: {}, connect: node => node, start() { toneStarted++; }, stop() {} }; }
+    createGain() { return { gain: {}, connect: node => node }; }
+    createMediaStreamDestination() {
+      const track = { kind: "audio", label: "MediaStreamAudioDestinationNode", stop() {} };
+      return { stream: new MediaStream([track]) };
+    }
+  }
+  const context = vm.createContext({
+    window, navigator, AudioContext, MediaStream,
+    location: { origin: "https://discord.com" },
+    setInterval: () => ({}), clearInterval() {}, setTimeout() {},
+  });
+  window.RTCPeerConnection = class { addEventListener() {} };
+  vm.runInContext(source, context);
+  const arm = labArmed => listeners.forEach(listener => listener({
+    source: window, origin: "https://discord.com",
+    data: { source: "tesktop-stereo-proof-control", labArmed },
+  }));
+
+  const normal = await navigator.mediaDevices.getUserMedia({ audio: true });
+  assert.equal(normal.getAudioTracks()[0], microphone, "outside a lab test the microphone is untouched");
+
+  arm(true);
+  const lab = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const track = lab.getAudioTracks()[0];
+  assert.notEqual(track, microphone);
+  assert.equal(toneStarted, 1);
+  assert.equal(track.label, "Real microphone");
+  assert.equal(track.getSettings().deviceId, "real");
+  track.stop();
+  assert.equal(stopped, 1, "stopping the tone also releases the real microphone");
+
+  arm(false);
+  assert.equal((await navigator.mediaDevices.getUserMedia({ audio: true })).getAudioTracks()[0], microphone);
+});

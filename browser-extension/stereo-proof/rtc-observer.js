@@ -478,6 +478,60 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
     returnPathState = "off";
   }
 
+  // Discord counts a member as speaking from the microphone stream it opened, and the voice
+  // server forwards a member's audio only while it speaks. While AscendCord runs a lab test
+  // the microphone Discord opens is a steady quiet tone, so Discord keeps speaking; what
+  // the return path sends is still the swapped program track. Outside a lab test, or when
+  // the page cannot play audio, Discord gets its real microphone unchanged.
+  let labArmed = false;
+
+  async function labMicrophone(stream) {
+    const original = stream.getAudioTracks()[0];
+    const ctx = context();
+    if (!original || !ctx) return stream;
+    if (ctx.state !== "running") {
+      try { await ctx.resume(); } catch {}
+    }
+    if (ctx.state !== "running") return stream;
+    const tone = ctx.createOscillator();
+    tone.frequency.value = 1_000;
+    const gain = ctx.createGain();
+    gain.gain.value = 0.03;
+    const destination = ctx.createMediaStreamDestination();
+    tone.connect(gain).connect(destination);
+    tone.start();
+    const track = destination.stream.getAudioTracks()[0];
+    const stop = track.stop.bind(track);
+    track.stop = () => {
+      stop();
+      original.stop();
+      try { tone.stop(); } catch {}
+    };
+    // Discord matches the opened device by these; answer for the real microphone.
+    track.getSettings = () => original.getSettings();
+    track.getConstraints = () => original.getConstraints();
+    track.applyConstraints = constraints => original.applyConstraints(constraints);
+    try { Object.defineProperty(track, "label", { get: () => original.label }); } catch {}
+    return new MediaStream([track, ...stream.getVideoTracks()]);
+  }
+
+  function installMicrophoneHook() {
+    const media = navigator?.mediaDevices;
+    if (!media?.getUserMedia || media.getUserMedia.ascendcordLab) return;
+    const open = media.getUserMedia.bind(media);
+    const hooked = async constraints => {
+      const stream = await open(constraints);
+      if (!labArmed || !constraints?.audio) return stream;
+      try {
+        return await labMicrophone(stream);
+      } catch {
+        return stream;
+      }
+    };
+    hooked.ascendcordLab = true;
+    media.getUserMedia = hooked;
+  }
+
   async function sample() {
     if (running) return;
     running = true;
@@ -518,9 +572,14 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
     if (installPeerConnection() || installAttempts >= 200) clearInterval(installTimer);
   }, 50);
   installPeerConnection();
+  try { installMicrophoneHook(); } catch {}
   window.addEventListener("message", event => {
     if (event.source !== window || event.origin !== location.origin ||
         event.data?.source !== "tesktop-stereo-proof-control") return;
+    if (typeof event.data.labArmed === "boolean") {
+      labArmed = event.data.labArmed;
+      return;
+    }
     if (typeof event.data.returnPath === "boolean") {
       (event.data.returnPath ? startReturnPath() : stopReturnPath()).catch(() => {
         returnPathState = "error";

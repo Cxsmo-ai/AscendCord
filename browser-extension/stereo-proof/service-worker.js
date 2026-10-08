@@ -633,7 +633,10 @@ function handleMessage(message, sender, sendResponse) {
     diagnostics.contentBridgeAt = Date.now();
     refreshSenderStatus().catch(() => null).finally(publishDiagnostics);
     publishDiagnostics();
-    sendResponse({ ok: true });
+    sendResponse({
+      ok: true,
+      lab_armed: latestSender?.test_sweep_active === true && latestSender?.return_lab_supported === true,
+    });
     return;
   }
 

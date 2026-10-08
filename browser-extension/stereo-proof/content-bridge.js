@@ -5,7 +5,7 @@
 
   // Support callback-only and Promise-returning extension APIs. Keep errors
   // visible in the Discord page console instead of silently dropping them.
-  const sendRuntimeMessage = message => {
+  const sendRuntimeMessage = (message, onResponse = null) => {
     const warn = error => {
       if (Date.now() - lastMessageWarningAt < 10_000) return;
       lastMessageWarningAt = Date.now();
@@ -13,9 +13,10 @@
         String(error?.message ?? error).slice(0, 180));
     };
     try {
-      const pending = chrome.runtime.sendMessage(message, () => {
+      const pending = chrome.runtime.sendMessage(message, response => {
         const error = chrome.runtime.lastError;
         if (error) warn(error);
+        else onResponse?.(response);
       });
       if (pending && typeof pending.catch === "function") pending.catch(warn);
     } catch (error) {
@@ -25,8 +26,16 @@
 
   // This heartbeat proves the isolated content script reached the Discord tab,
   // independently of whether the main-world WebRTC observer is working.
+  // The reply says whether AscendCord is running a lab test, which the page needs before
+  // Discord opens the microphone.
   const heartbeat = () => sendRuntimeMessage({
     kind: "tesktop-content-bridge-heartbeat",
+  }, response => {
+    if (typeof response?.lab_armed !== "boolean") return;
+    window.postMessage({
+      source: "tesktop-stereo-proof-control",
+      labArmed: response.lab_armed,
+    }, location.origin);
   });
   heartbeat();
   setInterval(heartbeat, 3000);
