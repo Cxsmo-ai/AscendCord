@@ -692,7 +692,7 @@ async fn run_inner(
 					// Keep the auxiliary stream close to live even if this clock misses a tick.
 					if let Some(aux)=&stream_audio && let Some(extra)=stream_playout.next(aux,control.stream_volume,true,stalled) {
 						match &mut frame {
-							Some(mixed)=>for (out,sample) in mixed.iter_mut().zip(extra.iter()) {*out=(*out+sample).clamp(-1.0,1.0);},
+							Some(mixed)=>for (out,sample) in mixed.iter_mut().zip(extra.iter()) {*out=(*out+sample).clamp(-crate::mixer::MIX_HEADROOM,crate::mixer::MIX_HEADROOM);},
 							None=>frame=Some(extra),
 						}
 					}
