@@ -746,6 +746,7 @@ async fn run_inner(
 				}
 				if rtp.payload_type!=120 {continue;}
 				let (source,seq,frame)=(rtp.ssrc,rtp.sequence,rtp.payload);
+				crate::lab::returns::count(crate::lab::returns::Receive::Packets);
 				if !dave.ready {continue;}
 				let user=match mixer.user(source) {
 					Some(user)=>user,
@@ -1615,9 +1616,12 @@ fn discover_speaker(
 	ssrc: u32,
 	frame: &[u8],
 ) -> Option<u64> {
+	use crate::lab::returns::{Receive, count};
+	count(Receive::Unannounced);
 	if !frame.ends_with(&[0xFA, 0xFA]) {
 		return None;
 	}
+	count(Receive::Encrypted);
 	let now = Instant::now();
 	probes.retain(|(_, at)| now.duration_since(*at) < Duration::from_secs(2));
 	if probes.iter().any(|(probed, _)| *probed == ssrc) {
@@ -1627,6 +1631,7 @@ fn discover_speaker(
 		.others()
 		.filter(|user| !mixer.has_user(*user))
 		.collect();
+	count(Receive::Probed);
 	let owner = candidates.into_iter().find(|user| {
 		dave.session
 			.decrypt(*user, davey::MediaType::AUDIO, frame)
@@ -1635,6 +1640,7 @@ fn discover_speaker(
 	match owner {
 		Some(user) => {
 			mixer.announce(user, ssrc).ok()?;
+			count(Receive::Matched);
 			Some(user)
 		}
 		None => {

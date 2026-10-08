@@ -727,12 +727,44 @@ pub mod returns {
 		collections::HashMap,
 		sync::{
 			Arc, Mutex, OnceLock,
-			atomic::{AtomicBool, Ordering},
+			atomic::{AtomicBool, AtomicU64, Ordering},
 			mpsc,
 		},
 	};
 
 	const WINDOW: usize = 16_384;
+
+	/// Receive-side events that explain an empty report: whether audio from a speaker the
+	/// voice server never announced arrives at all, carries DAVE encryption, and is matched.
+	#[derive(Clone, Copy)]
+	pub(crate) enum Receive {
+		Packets,
+		Unannounced,
+		Encrypted,
+		Probed,
+		Matched,
+	}
+	static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+	const DECODED: usize = 5;
+
+	pub(crate) fn count(event: Receive) {
+		if ACTIVE.load(Ordering::Relaxed) {
+			COUNTS[event as usize].fetch_add(1, Ordering::Relaxed);
+		}
+	}
+
+	/// Totals since the lab was enabled, for the sender status.
+	pub fn receive_counts() -> serde_json::Value {
+		let get = |index: usize| COUNTS[index].load(Ordering::Relaxed);
+		serde_json::json!({
+			"voice_packets": get(Receive::Packets as usize),
+			"unannounced_packets": get(Receive::Unannounced as usize),
+			"unannounced_encrypted": get(Receive::Encrypted as usize),
+			"probed": get(Receive::Probed as usize),
+			"matched": get(Receive::Matched as usize),
+			"decoded_frames": get(DECODED),
+		})
+	}
 	const HOP: usize = 4_800;
 	const SOURCES: usize = 4;
 
@@ -830,6 +862,7 @@ pub mod returns {
 		if !ACTIVE.load(Ordering::Acquire) {
 			return;
 		}
+		COUNTS[DECODED].fetch_add(1, Ordering::Relaxed);
 		if let Some(shared) = SHARED.get() {
 			let _ = shared.send.try_send((ssrc, stereo.to_vec(), concealed));
 		}

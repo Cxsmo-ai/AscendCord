@@ -165,6 +165,7 @@ impl VoiceBridge {
 				// What arrives from a browser that plays the program back (browser to AscendCord).
 				"return_lab_supported": test_sweep,
 				"return_lab": if test_sweep { discord_voice::lab::returns::report() } else { None },
+				"return_receive": if test_sweep { Some(discord_voice::lab::returns::receive_counts()) } else { None },
 				"audio_source": if test_sweep { "synthetic_sweep" } else { "microphone" },
 				"send_enabled": if test_sweep { ui.voice_transmit_status == "Synthetic sweep send is enabled." } else { ui.voice_transmit_status == "Mic send is enabled." },
 				"capture_rate_hz": capture_rate_hz,
