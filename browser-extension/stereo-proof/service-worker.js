@@ -8,6 +8,14 @@ const LAB_HISTORY_LIMIT = 12;
 // A program 2 pass lasts about 66 s; finding the first silence can take one more pass.
 const LAB_MAX_CAPTURE_MS = 230_000;
 const LAB_PASSES = 2;
+const DEV_REQUESTS = Object.freeze({
+  diagnostics: "tesktop-read-diagnostics",
+  history: "tesktop-read-lab-history",
+  start: "tesktop-start-test",
+  stop: "tesktop-stop-test",
+  reset: "tesktop-reset-test",
+  export: "tesktop-read-test-data",
+});
 const BASE = "http://127.0.0.1:43721";
 const MIN_INTERVAL_MS = 1500;
 const MAX_TEST_SAMPLES = 1800;
@@ -627,6 +635,26 @@ function handleMessage(message, sender, sendResponse) {
     publishDiagnostics();
     sendResponse({ ok: true });
     return;
+  }
+
+  // Developer channel: the Discord tab can drive what the popup does, so a test run can
+  // be repeated, read and the extension reloaded without opening extension pages.
+  if (message?.kind === "tesktop-dev") {
+    if (!isDiscordSender(sender)) {
+      sendResponse({ ok: false, error: "Developer requests come only from a Discord tab." });
+      return;
+    }
+    if (message.request === "reload") {
+      sendResponse({ ok: true, version: chrome.runtime.getManifest?.().version ?? null });
+      setTimeout(() => chrome.runtime.reload(), 100);
+      return;
+    }
+    const kind = DEV_REQUESTS[message.request];
+    if (!kind) {
+      sendResponse({ ok: false, error: "Unknown developer request." });
+      return;
+    }
+    return handleMessage({ kind }, sender, sendResponse);
   }
 
   if (message?.kind === "tesktop-observer-status") {

@@ -548,3 +548,40 @@ test("a new AscendCord session after a crash starts a new capture", async () => 
   assert.equal(diagnostics.test.running, true);
   assert.equal(diagnostics.test.sender_ssrc, 301, "the new session gets its own capture");
 });
+
+test("the developer channel answers Discord tabs only and can reload the extension", async () => {
+  const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
+  let onMessage;
+  let reloads = 0;
+  const chrome = {
+    runtime: {
+      onMessage: { addListener(listener) { onMessage = listener; } },
+      reload() { reloads++; },
+      getManifest: () => ({ version: "9.9.9" }),
+    },
+    tabs: { onRemoved: { addListener() {} }, sendMessage: async () => ({}) },
+    storage: { local: {
+      get: async () => ({ ascendcordLabHistory: [{ id: "run" }] }),
+      set: async () => {},
+      remove: async () => {},
+    } },
+  };
+  const context = {
+    chrome, URL, Date, AbortController, setTimeout, clearTimeout,
+    fetch: async () => ({ ok: true, status: 204 }),
+  };
+  vm.runInNewContext(source, context);
+  const ask = (request, url) => new Promise(resolve => {
+    const result = onMessage({ kind: "tesktop-dev", request }, { tab: { id: 3, url } }, resolve);
+    if (result !== true) resolve(undefined);
+  });
+  const discord = "https://discord.com/channels/1/2";
+
+  assert.equal((await ask("history", "https://example.com/")).ok, false);
+  assert.equal((await ask("format-disk", discord)).ok, false);
+  assert.deepEqual((await ask("history", discord)).history.map(entry => entry.id), ["run"]);
+  assert.equal(typeof (await ask("diagnostics", discord)).observerState, "string");
+  assert.equal((await ask("reload", discord)).version, "9.9.9");
+  await new Promise(resolve => setTimeout(resolve, 150));
+  assert.equal(reloads, 1);
+});

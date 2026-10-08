@@ -49,6 +49,26 @@
     sendRuntimeMessage({ kind: "tesktop-receiver-report", report });
   });
 
+  // Developer requests from the page: { source: "tesktop-stereo-proof-dev", id, request }.
+  // The reply comes back as { source: "tesktop-stereo-proof-dev-reply", id, response }.
+  window.addEventListener("message", event => {
+    if (event.source !== window || event.origin !== location.origin ||
+        event.data?.source !== "tesktop-stereo-proof-dev" ||
+        typeof event.data.request !== "string") return;
+    const { id, request } = event.data;
+    const reply = response => window.postMessage({
+      source: "tesktop-stereo-proof-dev-reply", id, response,
+    }, location.origin);
+    try {
+      chrome.runtime.sendMessage({ kind: "tesktop-dev", request: request.slice(0, 32) }, response => {
+        const error = chrome.runtime.lastError;
+        reply(error ? { ok: false, error: String(error.message ?? error) } : response);
+      });
+    } catch (error) {
+      reply({ ok: false, error: String(error?.message ?? error) });
+    }
+  });
+
   chrome.runtime.onMessage.addListener(message => {
     if (message?.kind === "tesktop-return-path") {
       window.postMessage({
