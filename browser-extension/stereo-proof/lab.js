@@ -913,7 +913,9 @@
             den += weight * w * w;
           }
         }
-        const delay = den > 0 ? Math.max(-0.5, Math.min(0.5, -num / den)) : 0;
+        // The integer lag is the best match, so the rest is within about half a sample; allow
+        // a whole sample so a delay near one half is not cut off.
+        const delay = den > 0 ? Math.max(-1, Math.min(1, -num / den)) : 0;
         const sigBands = new Float64Array(NULL_BANDS_HZ.length), resBands = new Float64Array(NULL_BANDS_HZ.length);
         let signal = 0, residue = 0, rawResidue = 0;
         for (const { gain, x, y } of channels) {
