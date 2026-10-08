@@ -31,9 +31,12 @@
   const SILENCE_DBFS = -40;
   // The program's silence lasts 1.2 s and decodes far below any tone (the quietest step is
   // -63 dBFS RMS). A noisier path must stay quiet longer than any gap between two tones.
+  // Comfort noise from a codec makes the silence merely quiet, and then the ladder's quietest
+  // steps look the same. Quiet after the ladder has reached -36 dBFS is the silence; any
+  // other quiet stretch counts only if the next tone is the start of the sweep.
   const SILENT_DBFS = -70;
   const SILENCE_WINDOWS = 3;
-  const QUIET_WINDOWS = 8;
+  const LADDER_LOUD_INDEX = 2;
   const MIN_EXPLAINED = 0.8;
   const STEADY_DB = 0.1;
   const MAX_HARMONIC = 10;
@@ -262,6 +265,8 @@
       section: null,
       last_index: -1,
       silence_streak: 0,
+      ladder_top: -1,
+      pending_silence: false,
       passes: 0,
       started_pass: false,
       windows: { accepted: 0, unknown: 0, contaminated: 0, transitional: 0, silence: 0, out_of_order: 0 },
@@ -295,6 +300,15 @@
    * tones, and each drop back to a low tone moves on to the left, right and antiphase sweeps.
    * Windows overlapping packet concealment are counted but not measured.
    */
+  function beginPass(lab) {
+    if (lab.section === "ladder") lab.passes++;
+    lab.section = "silence";
+    lab.last_index = -1;
+    lab.ladder_top = -1;
+    lab.pending_silence = false;
+    lab.started_pass = true;
+  }
+
   function addWindow(lab, window, contaminated = false) {
     if (!window || window.kind === "unknown") {
       lab.windows.unknown++;
@@ -302,12 +316,13 @@
     }
     if (window.kind === "silence") {
       lab.windows.silence++;
-      const needed = window.loudest_dbfs < SILENT_DBFS ? SILENCE_WINDOWS : QUIET_WINDOWS;
-      if (++lab.silence_streak < needed) return;
-      if (lab.section === "ladder") lab.passes++;
-      lab.section = "silence";
-      lab.last_index = -1;
-      lab.started_pass = true;
+      if (++lab.silence_streak < SILENCE_WINDOWS) return;
+      const afterLadder = lab.section === "ladder" && lab.ladder_top >= LADDER_LOUD_INDEX;
+      if (window.loudest_dbfs >= SILENT_DBFS && !afterLadder) {
+        lab.pending_silence = true;
+        return;
+      }
+      beginPass(lab);
       if (!contaminated) {
         add(lab.noise.left, window.left_rms_dbfs);
         add(lab.noise.right, window.right_rms_dbfs);
@@ -315,6 +330,10 @@
       return;
     }
     lab.silence_streak = 0;
+    if (lab.pending_silence) {
+      lab.pending_silence = false;
+      if (window.grid === "sweep" && window.index <= 1) beginPass(lab);
+    }
     if (!lab.started_pass) {
       lab.windows.out_of_order++;
       return;
@@ -325,6 +344,7 @@
         return;
       }
       lab.section = "ladder";
+      lab.ladder_top = Math.max(lab.ladder_top, window.index);
       if (contaminated) { lab.windows.contaminated++; return; }
       if (!window.steady) { lab.windows.transitional++; return; }
       record(lab.ladder[window.index], window);

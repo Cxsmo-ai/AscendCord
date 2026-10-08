@@ -8,9 +8,12 @@ const CHANNEL_STRIDE: usize = 4;
 const LADDER_DBFS: [f64; 8] = [-60.0, -48.0, -36.0, -24.0, -18.0, -12.0, -6.0, -1.0];
 const SOURCE_PEAK_DBFS: f64 = -12.041_199_826_559_248;
 const SILENCE_DBFS: f64 = -40.0;
+// Comfort noise from a codec makes the silence merely quiet, and then the ladder's quietest
+// steps look the same. Quiet after the ladder has reached -36 dBFS is the silence; any
+// other quiet stretch counts only if the next tone is the start of the sweep.
 const SILENT_DBFS: f64 = -70.0;
 const SILENCE_WINDOWS: u32 = 3;
-const QUIET_WINDOWS: u32 = 8;
+const LADDER_LOUD_INDEX: usize = 2;
 const MIN_EXPLAINED: f64 = 0.8;
 const STEADY_DB: f64 = 0.1;
 const MAX_HARMONIC: usize = 10;
@@ -372,6 +375,8 @@ pub(crate) struct Lab {
 	section: Section,
 	last_index: Option<usize>,
 	silence_streak: u32,
+	ladder_top: Option<usize>,
+	pending_silence: bool,
 	started: bool,
 	pub passes: u32,
 	pub windows: Windows,
@@ -390,6 +395,8 @@ impl Default for Lab {
 			section: Section::None,
 			last_index: None,
 			silence_streak: 0,
+			ladder_top: None,
+			pending_silence: false,
 			started: false,
 			passes: 0,
 			windows: Windows::default(),
@@ -405,6 +412,17 @@ impl Default for Lab {
 }
 
 impl Lab {
+	fn begin_pass(&mut self) {
+		if self.section == Section::Ladder {
+			self.passes += 1;
+		}
+		self.section = Section::Silence;
+		self.last_index = None;
+		self.ladder_top = None;
+		self.pending_silence = false;
+		self.started = true;
+	}
+
 	pub(crate) fn add(&mut self, window: Window, contaminated: bool) {
 		let (steady, grid, index, left, right, correlation) = match window {
 			Window::Unknown => {
@@ -418,20 +436,16 @@ impl Lab {
 			} => {
 				self.windows.silence += 1;
 				self.silence_streak += 1;
-				let needed = if loudest_dbfs < SILENT_DBFS {
-					SILENCE_WINDOWS
-				} else {
-					QUIET_WINDOWS
-				};
-				if self.silence_streak < needed {
+				if self.silence_streak < SILENCE_WINDOWS {
 					return;
 				}
-				if self.section == Section::Ladder {
-					self.passes += 1;
+				let after_ladder = self.section == Section::Ladder
+					&& self.ladder_top.is_some_and(|top| top >= LADDER_LOUD_INDEX);
+				if loudest_dbfs >= SILENT_DBFS && !after_ladder {
+					self.pending_silence = true;
+					return;
 				}
-				self.section = Section::Silence;
-				self.last_index = None;
-				self.started = true;
+				self.begin_pass();
 				if !contaminated {
 					self.noise_left.add(Some(left_rms_dbfs));
 					self.noise_right.add(Some(right_rms_dbfs));
@@ -448,6 +462,12 @@ impl Lab {
 			} => (steady, grid, index, left, right, correlation),
 		};
 		self.silence_streak = 0;
+		if self.pending_silence {
+			self.pending_silence = false;
+			if grid == Grid::Sweep && index <= 1 {
+				self.begin_pass();
+			}
+		}
 		if !self.started {
 			self.windows.out_of_order += 1;
 			return;
@@ -458,6 +478,7 @@ impl Lab {
 				return;
 			}
 			self.section = Section::Ladder;
+			self.ladder_top = Some(self.ladder_top.map_or(index, |top| top.max(index)));
 			if contaminated {
 				self.windows.contaminated += 1;
 			} else if !steady {
@@ -661,6 +682,33 @@ mod tests {
 
 	fn number(value: &serde_json::Value) -> f64 {
 		value.as_f64().expect("a measured number")
+	}
+
+	#[test]
+	fn comfort_noise_neither_hides_the_silence_nor_starts_a_pass_in_the_ladder() {
+		// Uniform noise of this width is about -60 dBFS RMS, like decoded Opus comfort noise.
+		let seed = std::cell::Cell::new(7u64);
+		let noise = || {
+			let next = seed
+				.get()
+				.wrapping_mul(6_364_136_223_846_793_005)
+				.wrapping_add(1);
+			seed.set(next);
+			((next >> 33) as f64 / f64::from(1u32 << 31) - 0.5) as f32 * 0.0035
+		};
+		let report = measure(3, |l, r| (l + noise(), r + noise()));
+		assert!(
+			number(&report["passes"]) >= 2.0,
+			"passes {}",
+			report["passes"]
+		);
+		let summary = &report["summary"];
+		assert_eq!(summary["measured_response_bands"], 48);
+		assert_eq!(summary["stereo_preserved"], true);
+		assert!((number(&report["noise"]["left_rms_dbfs"]) + 60.0).abs() < 2.0);
+		for gain in &report["linearity"]["gain_db"].as_array().unwrap()[2..] {
+			assert!(number(gain).abs() < 0.5, "{gain}");
+		}
 	}
 
 	#[test]

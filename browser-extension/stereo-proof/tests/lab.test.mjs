@@ -178,3 +178,13 @@ test("distortion separates harmonics from noise", () => {
   assert.ok(noisy.thd_db < -75, `harmonic THD stays low under noise: ${noisy.thd_db}`);
   near(noisy.thdn_db, -60, 0.5, "THD+N of -60 dB noise");
 });
+
+test("a path with comfort noise still finds every pass without false starts in the ladder", () => {
+  // Uniform noise of this width is about -60 dBFS RMS, like decoded Opus comfort noise.
+  const report = analyze(render(3, (l, r, _hz, noise) => [l + noise() * 0.0035, r + noise() * 0.0035]));
+  assert.ok(report.passes >= 2, `passes ${report.passes}`);
+  assert.equal(report.summary.measured_response_bands, 48);
+  near(report.noise.left_rms_dbfs, -60, 2, "noise floor");
+  for (const gain of report.linearity.gain_db.slice(2)) near(gain, 0, 0.5, "ladder gain above the noise");
+  assert.equal(report.summary.stereo_preserved, true);
+});
