@@ -16,6 +16,12 @@ const SILENCE_WINDOWS: u32 = 3;
 const LADDER_LOUD_INDEX: usize = 2;
 const MIN_EXPLAINED: f64 = 0.8;
 const STEADY_DB: f64 = 0.1;
+// A discontinuity (dropout, splice, time stretch) moves the tone's amplitude or phase in
+// part of a window. Each eighth must match the whole-window fit to 5% (-26 dB); codec
+// noise moves it by about -75 dB. Eighths shorter than two cycles are not judged.
+const BURST_PARTS: usize = 8;
+const BURST_LIMIT: f64 = 0.05;
+const BURST_MIN_CYCLES: f64 = 2.0;
 const MAX_HARMONIC: usize = 10;
 
 fn grid_hz(step: f64) -> f64 {
@@ -182,6 +188,7 @@ pub(crate) enum Window {
 	},
 	Tone {
 		steady: bool,
+		glitch: bool,
 		grid: Grid,
 		index: usize,
 		left: Channel,
@@ -189,6 +196,35 @@ pub(crate) enum Window {
 		correlation: Option<f64>,
 	},
 	Unknown,
+}
+
+fn residual_burst(samples: &[f32], hz: f64, rate: f64, fit: &Fit) -> bool {
+	let size = samples.len() / BURST_PARTS;
+	if hz * size as f64 / rate < BURST_MIN_CYCLES {
+		return false;
+	}
+	let step = std::f64::consts::TAU * hz / rate;
+	let amplitude = fit.amplitude();
+	(0..BURST_PARTS).any(|part| {
+		// The tone's cosine and sine weights over this part, on the window's own time axis.
+		let (mut cc, mut ss, mut cs, mut yc, mut ys) = (0.0, 0.0, 0.0, 0.0, 0.0);
+		for (i, &sample) in samples.iter().enumerate().skip(part * size).take(size) {
+			let (s, c) = (step * i as f64).sin_cos();
+			let y = f64::from(sample) - fit.mean;
+			cc += c * c;
+			ss += s * s;
+			cs += c * s;
+			yc += y * c;
+			ys += y * s;
+		}
+		let determinant = cc * ss - cs * cs;
+		if determinant <= 0.0 {
+			return false;
+		}
+		let a = (yc * ss - ys * cs) / determinant;
+		let b = (ys * cc - yc * cs) / determinant;
+		(a - fit.a).hypot(b - fit.b) > amplitude * BURST_LIMIT
+	})
 }
 
 fn rms(samples: &[f32]) -> f64 {
@@ -284,6 +320,7 @@ pub(crate) fn analyze_window(left: &[f32], right: &[f32], rate: f64) -> Window {
 	};
 	Window::Tone {
 		steady,
+		glitch: steady && residual_burst(dominant_samples, hz, rate, &dominant),
 		grid,
 		index,
 		left: channel(left_fit, left),
@@ -407,6 +444,7 @@ pub(crate) struct Windows {
 	pub unknown: u32,
 	pub contaminated: u32,
 	pub transitional: u32,
+	pub glitched: u32,
 	pub silence: u32,
 	pub out_of_order: u32,
 }
@@ -465,7 +503,7 @@ impl Lab {
 	}
 
 	pub(crate) fn add(&mut self, window: Window, contaminated: bool) {
-		let (steady, grid, index, left, right, correlation) = match window {
+		let (steady, glitch, grid, index, left, right, correlation) = match window {
 			Window::Unknown => {
 				self.windows.unknown += 1;
 				return;
@@ -495,12 +533,13 @@ impl Lab {
 			}
 			Window::Tone {
 				steady,
+				glitch,
 				grid,
 				index,
 				left,
 				right,
 				correlation,
-			} => (steady, grid, index, left, right, correlation),
+			} => (steady, glitch, grid, index, left, right, correlation),
 		};
 		self.silence_streak = 0;
 		if self.pending_silence {
@@ -530,6 +569,8 @@ impl Lab {
 				self.windows.contaminated += 1;
 			} else if !steady {
 				self.windows.transitional += 1;
+			} else if glitch {
+				self.windows.glitched += 1;
 			} else {
 				self.ladder[index].record(&left, &right, correlation);
 				self.windows.accepted += 1;
@@ -564,6 +605,10 @@ impl Lab {
 		}
 		if !steady {
 			self.windows.transitional += 1;
+			return;
+		}
+		if glitch {
+			self.windows.glitched += 1;
 			return;
 		}
 		let cell = match section {
@@ -653,6 +698,7 @@ impl Lab {
 				"unknown": self.windows.unknown,
 				"contaminated": self.windows.contaminated,
 				"transitional": self.windows.transitional,
+				"glitched": self.windows.glitched,
 				"silence": self.windows.silence,
 				"out_of_order": self.windows.out_of_order,
 			},
@@ -804,6 +850,43 @@ mod tests {
 		let lowest = &report["response"]["left_gain_db"][0];
 		assert!(lowest.is_null() || number(lowest) < -40.0, "{lowest}");
 		assert!(number(&report["response"]["left_gain_db"][30]).abs() < 0.5);
+	}
+
+	#[test]
+	fn a_dropout_or_a_splice_inside_a_window_is_caught_and_noise_is_not() {
+		let hz = sweep_hz(30);
+		let seed = std::cell::Cell::new(3u64);
+		let noise = || {
+			let next = seed
+				.get()
+				.wrapping_mul(6_364_136_223_846_793_005)
+				.wrapping_add(1);
+			seed.set(next);
+			((next >> 33) as f64 / f64::from(1u32 << 31) - 0.5) * 0.003
+		};
+		let tone = |skip_at: usize, skip: usize, drop_at: usize, drop: usize| -> Vec<f32> {
+			(0..WINDOW)
+				.map(|i| {
+					if i >= drop_at && i < drop_at + drop {
+						return 0.0;
+					}
+					let t = if i >= skip_at { i + skip } else { i };
+					(0.25 * (std::f64::consts::TAU * hz * t as f64 / RATE).sin() + noise()) as f32
+				})
+				.collect()
+		};
+		let glitch = |samples: &[f32]| match analyze_window(samples, samples, RATE) {
+			Window::Tone { steady, glitch, .. } => (steady, glitch),
+			_ => panic!("a tone window"),
+		};
+		assert_eq!(glitch(&tone(usize::MAX, 0, usize::MAX, 0)), (true, false));
+		// A dropout already changes the level of its quarter; either way it is not measured.
+		let (steady, caught) = glitch(&tone(usize::MAX, 0, 8_000, 96));
+		assert!(!steady || caught, "a 2 ms dropout");
+		assert!(
+			glitch(&tone(8_000, 1, usize::MAX, 0)).1,
+			"a 1-sample splice"
+		);
 	}
 
 	#[test]

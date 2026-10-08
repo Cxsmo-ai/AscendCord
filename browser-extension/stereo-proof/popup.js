@@ -441,7 +441,7 @@ async function renderLab(diagnostics) {
   const status = byId("lab-status");
   if (progress) {
     const w = progress.windows;
-    text(status, `CAPTURING · pass ${Math.min(progress.passes + 1, progress.passes_needed)} of ${progress.passes_needed} · ${progress.section ?? "waiting for the program's silence"} · ${w.accepted} measured · ${w.transitional} transitional · ${w.contaminated} with concealment · ${w.unknown} unidentified`);
+    text(status, `CAPTURING · pass ${Math.min(progress.passes + 1, progress.passes_needed)} of ${progress.passes_needed} · ${progress.section ?? "waiting for the program's silence"} · ${w.accepted} measured · ${w.transitional} transitional · ${w.contaminated} disturbed by the network · ${w.glitched ?? 0} glitched · ${w.unknown} unidentified`);
     text(byId("lab-return-status"), progress.return_passes === null
       ? "Return path not offered by this AscendCord build."
       : `RETURN PATH · browser ${diagnostics.return_path_state} · AscendCord measured ${progress.return_passes} of ${progress.passes_needed} passes`);

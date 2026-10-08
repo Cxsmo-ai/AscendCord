@@ -8,6 +8,8 @@ const LAB_HISTORY_LIMIT = 12;
 // A program 2 pass lasts about 66 s; finding the first silence can take one more pass.
 const LAB_MAX_CAPTURE_MS = 230_000;
 const LAB_PASSES = 2;
+// The page analyses 16384 samples (341 ms at 48 kHz) at a time.
+const LAB_WINDOW_HOLD_MS = 400;
 const DEV_REQUESTS = Object.freeze({
   diagnostics: "tesktop-read-diagnostics",
   history: "tesktop-read-lab-history",
@@ -276,6 +278,7 @@ function sanitizeLabWindow(window) {
   return {
     kind: "tone",
     steady: window.steady === true,
+    glitch: window.glitch === true,
     grid: window.grid,
     index: window.index,
     left: channel(window.left),
@@ -472,6 +475,7 @@ function summarizeSamples(samples) {
     concealment_samples_per_second: matched.length ? mean("concealed_samples_per_second") : null,
     concealment_events: matched.reduce((sum, sample) => sum + Number(sample.concealment_events_delta ?? 0), 0),
     discarded_packets: matched.reduce((sum, sample) => sum + Number(sample.discarded_packets_delta ?? 0), 0),
+    time_stretched_samples: matched.reduce((sum, sample) => sum + Number(sample.stretched_samples_delta ?? 0), 0),
   };
 }
 
@@ -508,6 +512,7 @@ function collectTestSamples(report, tabId) {
       concealed_samples_per_second: stream.concealed_samples_per_second ?? 0,
       concealment_events_delta: stream.concealment_events_delta ?? 0,
       discarded_packets_delta: stream.discarded_packets_delta ?? 0,
+      stretched_samples_delta: stream.stretched_samples_delta ?? 0,
       jitter_buffer_delay_ms: stream.jitter_buffer_delay_ms ?? 0,
       audio_level: stream.audio_level ?? 0,
       active: stream.active === true,
@@ -726,8 +731,15 @@ function handleMessage(message, sender, sendResponse) {
           // Program 2: every window goes through the shared lab analysis instead.
           const raw = message.report.streams.find(item => item?.ssrc === stream.ssrc);
           activeTest.analysis_sample_rate_hz ??= stream.analysis_sample_rate_hz;
+          // Concealment, discarded packets or jitter-buffer time stretching change the audio
+          // for as long as the event stays inside the analysis window.
+          const now = Date.now();
+          if (Number(raw?.concealment_events_delta) > 0 || Number(raw?.discarded_packets_delta) > 0 ||
+              Number(raw?.stretched_samples_delta) > 0) {
+            activeTest.disturbed_until_ms = now + LAB_WINDOW_HOLD_MS;
+          }
           Lab.addWindow(activeTest.lab, sanitizeLabWindow(raw?.lab_window),
-            Number(raw?.concealment_events_delta) > 0 || Number(raw?.discarded_packets_delta) > 0);
+            now < (activeTest.disturbed_until_ms ?? 0));
           continue;
         }
         const curveKey = `${sender.tab.id}:${stream.ssrc}`;

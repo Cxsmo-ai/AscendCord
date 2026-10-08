@@ -39,6 +39,12 @@
   const LADDER_LOUD_INDEX = 2;
   const MIN_EXPLAINED = 0.8;
   const STEADY_DB = 0.1;
+  // A discontinuity (dropout, splice, time stretch) moves the tone's amplitude or phase in
+  // part of a window. Each eighth must match the whole-window fit to 5% (-26 dB); codec
+  // noise moves it by about -75 dB. Eighths shorter than two cycles are not judged.
+  const BURST_PARTS = 8;
+  const BURST_LIMIT = 0.05;
+  const BURST_MIN_CYCLES = 2;
   const MAX_HARMONIC = 10;
 
   const db20 = (value, floor = -160) =>
@@ -166,6 +172,26 @@
    * One analysis window of both decoded channels. `peakHz` is the refined FFT peak. Returns
    * a silence reading, a tone reading or an unknown window (transitions, foreign audio).
    */
+  function residualBurst(samples, frequencyHz, sampleRate, fit) {
+    const size = Math.floor(samples.length / BURST_PARTS);
+    if (frequencyHz * size / sampleRate < BURST_MIN_CYCLES) return false;
+    const step = 2 * Math.PI * frequencyHz / sampleRate;
+    const amplitude = Math.hypot(fit.a, fit.b);
+    for (let part = 0; part < BURST_PARTS; part++) {
+      // The tone's cosine and sine weights over this part, on the window's own time axis.
+      let cc = 0, ss = 0, cs = 0, yc = 0, ys = 0;
+      for (let i = part * size; i < (part + 1) * size; i++) {
+        const c = Math.cos(step * i), s = Math.sin(step * i), y = samples[i] - fit.mean;
+        cc += c * c; ss += s * s; cs += c * s; yc += y * c; ys += y * s;
+      }
+      const determinant = cc * ss - cs * cs;
+      if (!(determinant > 0)) return false;
+      const a = (yc * ss - ys * cs) / determinant, b = (ys * cc - yc * cs) / determinant;
+      if (Math.hypot(a - fit.a, b - fit.b) > amplitude * BURST_LIMIT) return true;
+    }
+    return false;
+  }
+
   function analyzeWindow(left, right, sampleRate, peakHz) {
     const leftRms = rms(left), rightRms = rms(right);
     const loudest = db20(Math.max(leftRms, rightRms));
@@ -198,6 +224,7 @@
     });
     const steady = levels.every(Number.isFinite) &&
       Math.max(...levels) - Math.min(...levels) <= STEADY_DB;
+    const glitch = steady && residualBurst(dominantSamples, tone.hz, sampleRate, dominant);
     let ll = 0, rr = 0, lr = 0, side = 0;
     for (let i = 0; i < left.length; i++) {
       const a = left[i] - leftFit.mean, b = right[i] - rightFit.mean;
@@ -217,6 +244,7 @@
     return {
       kind: "tone",
       steady,
+      glitch,
       grid: tone.grid,
       index: tone.index,
       hz: tone.hz,
@@ -269,7 +297,7 @@
       pending_silence: false,
       passes: 0,
       started_pass: false,
-      windows: { accepted: 0, unknown: 0, contaminated: 0, transitional: 0, silence: 0, out_of_order: 0 },
+      windows: { accepted: 0, unknown: 0, contaminated: 0, transitional: 0, glitched: 0, silence: 0, out_of_order: 0 },
       mono: table(PROGRAM.sweep_hz.length),
       left: table(PROGRAM.channel_hz.length),
       right: table(PROGRAM.channel_hz.length),
@@ -353,6 +381,7 @@
       lab.ladder_top = Math.max(lab.ladder_top, window.index);
       if (contaminated) { lab.windows.contaminated++; return; }
       if (!window.steady) { lab.windows.transitional++; return; }
+      if (window.glitch) { lab.windows.glitched++; return; }
       record(lab.ladder[window.index], window);
       lab.windows.accepted++;
       return;
@@ -377,6 +406,7 @@
     lab.last_index = Math.max(lab.last_index, window.index);
     if (contaminated) { lab.windows.contaminated++; return; }
     if (!window.steady) { lab.windows.transitional++; return; }
+    if (window.glitch) { lab.windows.glitched++; return; }
     if (section === "mono") {
       record(lab.mono[window.index], window);
     } else {

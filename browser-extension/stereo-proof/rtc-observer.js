@@ -324,6 +324,9 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
       const discardedDelta = old ? Math.max(0, numeric(stat.packetsDiscarded) - old.discarded) : 0;
       const jitterBufferDelayDelta = old ? Math.max(0, numeric(stat.jitterBufferDelay) - old.jitterBufferDelay) : 0;
       const jitterBufferEmittedDelta = old ? Math.max(0, numeric(stat.jitterBufferEmittedCount) - old.jitterBufferEmitted) : 0;
+      // Samples the jitter buffer removed or inserted to speed playout up or slow it down.
+      const stretched = numeric(stat.removedSamplesForAcceleration) + numeric(stat.insertedSamplesForDeceleration);
+      const stretchedDelta = old ? Math.max(0, stretched - old.stretched) : 0;
 
       previous.set(key, {
         timestamp: numeric(stat.timestamp),
@@ -336,6 +339,7 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
         discarded: numeric(stat.packetsDiscarded),
         jitterBufferDelay: numeric(stat.jitterBufferDelay),
         jitterBufferEmitted: numeric(stat.jitterBufferEmittedCount),
+        stretched,
       });
 
       const stereo = measure(track);
@@ -360,6 +364,7 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
         concealed_samples_per_second: elapsedMs > 0 ? Math.min(384000, concealmentDelta * 1000 / elapsedMs) : 0,
         concealment_events_delta: Math.floor(concealmentEventsDelta),
         discarded_packets_delta: Math.floor(discardedDelta),
+        stretched_samples_delta: Math.min(1_000_000, Math.floor(stretchedDelta)),
         jitter_buffer_delay_ms: jitterBufferEmittedDelta > 0
           ? Math.min(60000, jitterBufferDelayDelta * 1000 / jitterBufferEmittedDelta) : 0,
         sdp_fmtp_stereo: typeof codec?.sdpFmtpLine === "string" ? /(^|;)\s*stereo=1/.test(codec.sdpFmtpLine) : null,

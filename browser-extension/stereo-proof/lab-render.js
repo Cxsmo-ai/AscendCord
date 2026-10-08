@@ -147,7 +147,7 @@
       `Response 100 Hz–16 kHz: median ${fmt(s.median_gain_db, 2, " dB")} · ripple ${fmt(s.ripple_100_16k_db, 2, " dB")} · L−R balance ${fmt(s.left_right_balance_db, 2, " dB")} · ${s.measured_response_bands}/48 bands`,
       `Stereo: separation median ${fmt(s.median_separation_db, 1, " dB")} (worst ${fmt(s.minimum_separation_db, 1, " dB")}) · antiphase correlation ${fmt(s.antiphase_correlation, 3)} · ${s.stereo_preserved ? "stereo preserved" : "STEREO NOT PRESERVED"}`,
       `Distortion: median THD+N ${fmt(s.median_thdn_db, 1, " dB")} · level slope ${fmt(s.linearity_slope, 3)} · compression ${fmt(s.level_compression_db, 2, " dB")} · decoded silence ${fmt(s.noise_floor_dbfs, 1, " dBFS")}`,
-      `Windows: ${report.windows.accepted} measured · ${report.windows.transitional} transitional · ${report.windows.contaminated} with concealment · ${report.windows.unknown} unidentified · ${report.passes} passes`,
+      `Windows: ${report.windows.accepted} measured · ${report.windows.transitional} transitional · ${report.windows.contaminated} disturbed by the network · ${report.windows.glitched ?? 0} glitched · ${report.windows.unknown} unidentified · ${report.passes} passes`,
       `Sender: ${settingsLine(settings)}`,
     ];
     if (baseline) rows.push(`Baseline (dashed): ${settingsLine(baseline.sender_settings)} · finished ${new Date(baseline.finished_at_ms).toLocaleString()}`);

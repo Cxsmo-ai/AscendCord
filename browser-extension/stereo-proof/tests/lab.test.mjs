@@ -213,3 +213,28 @@ test("a path that filters out the lowest tones still starts after the ladder", (
   assert.ok(lowest === null || lowest < -40, `20 Hz is missing or far down, not invented: ${lowest}`);
   near(report.response.left_gain_db[30], 0, 0.5, "mid band gain");
 });
+
+test("a dropout or a splice inside a window is caught, codec-like noise is not", () => {
+  const hz = PROGRAM.sweep_hz[30];
+  let seed = 3;
+  const noise = () => { seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648; return seed / 2_147_483_648 - 0.5; };
+  const tone = (skipAt = -1, skip = 0, dropAt = -1, drop = 0) => Float32Array.from({ length: WINDOW }, (_, i) => {
+    if (i >= dropAt && i < dropAt + drop) return 0;
+    const t = i >= skipAt && skipAt >= 0 ? i + skip : i;
+    return 0.25 * Math.sin(2 * Math.PI * hz * t / RATE) + noise() * 0.003;
+  });
+  const window = samples => lab.analyzeWindow(samples, samples, RATE, hz);
+  const clean = window(tone());
+  assert.equal(clean.steady, true);
+  assert.equal(clean.glitch, false);
+  // A dropout already changes the level of its quarter; either way it is not measured.
+  const dropout = window(tone(-1, 0, 8_000, 96));
+  assert.ok(!dropout.steady || dropout.glitch, "a 2 ms dropout");
+  assert.equal(window(tone(8_000, 1)).glitch, true, "a 1-sample splice");
+
+  const state = lab.createLab();
+  state.started_pass = true; state.section = "silence";
+  lab.addWindow(state, window(tone(8_000, 1)));
+  assert.equal(state.windows.glitched, 1);
+  assert.equal(state.windows.accepted, 0);
+});
