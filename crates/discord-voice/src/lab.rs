@@ -890,6 +890,44 @@ mod tests {
 	}
 
 	#[test]
+	fn the_96_khz_capture_resampler_is_transparent_to_the_lab() {
+		// The microphone path: the program generated at 96 kHz, resampled to 48 kHz.
+		let mut sweep = crate::test_sweep::Sweep::new(96_000);
+		let pass = 96 * (1_200 + 84 * 700 + 8 * 800);
+		let mut input = Vec::with_capacity(pass * 5);
+		for _ in 0..pass * 5 / 2 {
+			input.extend(sweep.next_frame());
+		}
+		let mut resampler = crate::resample::Resampler::new(96_000).unwrap();
+		let mut output = Vec::new();
+		for chunk in input.chunks(1_920) {
+			resampler.process(chunk, &mut output);
+		}
+		let (left, right): (Vec<f32>, Vec<f32>) = output
+			.as_chunks::<2>()
+			.0
+			.iter()
+			.map(|[l, r]| (*l, *r))
+			.unzip();
+		let mut lab = Lab::default();
+		let mut end = WINDOW;
+		while end <= left.len() {
+			lab.add(
+				analyze_window(&left[end - WINDOW..end], &right[end - WINDOW..end], RATE),
+				false,
+			);
+			end += 4_800;
+		}
+		let report = lab.report();
+		let summary = &report["summary"];
+		assert_eq!(summary["measured_response_bands"], 48);
+		assert!(number(&summary["ripple_100_16k_db"]) < 0.001);
+		assert!(number(&summary["median_thdn_db"]) < -120.0);
+		assert!(number(&report["response"]["left_gain_db"][47]).abs() < 0.01);
+		assert_eq!(summary["stereo_preserved"], true);
+	}
+
+	#[test]
 	fn the_real_program_measures_clean_through_a_clean_path() {
 		let report = measure(2, |l, r| (l, r));
 		assert_eq!(report["passes"], 2);
