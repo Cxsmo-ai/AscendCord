@@ -241,6 +241,8 @@ function saveLabHistory(test, report, settings, returned = null) {
     sender_settings: settings,
     measurement_lab: report,
     return_lab: returned,
+    sender_health: test.sender_health ?? null,
+    network: test.samples?.length ? summarizeSamples(test.samples) : null,
   };
   chrome.storage.local.get(LAB_HISTORY_KEY).then(saved => {
     const history = Array.isArray(saved?.[LAB_HISTORY_KEY]) ? saved[LAB_HISTORY_KEY] : [];
@@ -395,10 +397,27 @@ function returnLab() {
   return JSON.stringify(report).length <= 65_536 ? report : null;
 }
 
+// AscendCord's send-side readings are momentary; a lab run keeps the worst of each so a
+// disturbed run shows whether the sender stalled or dropped audio.
+const SENDER_HEALTH_KEYS = Object.freeze([
+  "max_send_gap_ms", "transport_loop_stalls_per_second", "pacing_catchups_per_second",
+  "capture_ring_drops", "capture_worker_drops", "playback_ring_drops",
+]);
+
+function trackSenderHealth(test, sender) {
+  if (!sender || typeof sender !== "object") return;
+  test.sender_health ??= {};
+  for (const key of SENDER_HEALTH_KEYS) {
+    const value = Number(sender[key]);
+    if (Number.isFinite(value)) test.sender_health[key] = Math.max(test.sender_health[key] ?? 0, value);
+  }
+}
+
 function updateSenderStatus(status) {
   latestSenderSsrc = Number.isInteger(status?.sender?.audio_ssrc)
     ? status.sender.audio_ssrc : null;
   latestSender = status?.sender ?? null;
+  if (activeTest?.lab) trackSenderHealth(activeTest, latestSender);
   if (activeTest && activeTest.sender_ssrc == null && latestSenderSsrc != null) {
     activeTest.sender_ssrc = latestSenderSsrc;
   }
