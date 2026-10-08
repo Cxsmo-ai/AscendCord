@@ -4,6 +4,10 @@
 //! small primed cushion, slowly matches the input sample rate to buffer occupancy, and sends
 //! at most one frame per tick. Fractional windowed-sinc resampling avoids whole-frame slips;
 //! a bounded queue discards old audio only for clock errors beyond the correction range.
+//!
+//! Buffer occupancy jumps by a whole frame whenever a callback lands just before or after a
+//! tick, so the rate correction follows only its long-term trend: a fast correction turned
+//! that jitter into audible flutter (the audio lab measured -38 dB THD+N with 3 ms of jitter).
 use crate::CaptureFrame;
 use std::{
 	collections::VecDeque,
@@ -18,9 +22,24 @@ const SAMPLES_PER_FRAME: usize = 960;
 const ASRC_TAPS: usize = 32;
 const ASRC_PHASES: usize = 2_048;
 const ASRC_BETA: f64 = 10.06;
-const TARGET_BUFFER_FRAMES: f64 = 3.0;
-const DRIFT_FILTER_ALPHA: f64 = 0.05;
-const DRIFT_GAIN: f64 = 0.0015;
+/// Occupancy aimed for, as measured before a tick's frame is taken: within the deadband
+/// below, at least about 1.75 frames stay queued after each tick.
+const TARGET_BUFFER_FRAMES: f64 = 3.25;
+/// Occupancy is averaged over about five seconds of 20 ms ticks.
+const DRIFT_FILTER_ALPHA: f64 = 0.004;
+/// Proportional and integral gains of the rate correction, per frame of occupancy error:
+/// a well-damped loop (natural period about a minute) where the proportional part already
+/// covers the whole range and the integral only removes the remaining offset.
+const DRIFT_GAIN: f64 = 0.001;
+const DRIFT_INTEGRAL_GAIN: f64 = 0.000_000_25;
+/// The correction changes by at most 2 ppm per tick (100 ppm a second): never a quick wobble.
+const DRIFT_SLEW: f64 = 0.000_002;
+/// Near empty or full the correction may move ten times faster, so even a clock 0.1% off
+/// is caught before the cushion runs out.
+const DRIFT_URGENT_FRAMES: f64 = 1.5;
+/// Occupancy within half a frame of the target is callback jitter, not clock drift: the
+/// rate is left alone, so a steady clock passes audio at exactly its own rate.
+const DRIFT_DEADBAND: f64 = 0.5;
 const MAX_DRIFT_CORRECTION: f64 = 0.001;
 
 type StereoSample = [f64; 2];
@@ -78,6 +97,7 @@ fn asrc_coefficients() -> &'static [[f64; ASRC_TAPS]] {
 #[derive(Clone, Copy, Debug)]
 struct CaptureClockMatcher {
 	filtered_buffer_frames: f64,
+	integral: f64,
 	input_samples_per_output: f64,
 }
 
@@ -85,6 +105,7 @@ impl Default for CaptureClockMatcher {
 	fn default() -> Self {
 		Self {
 			filtered_buffer_frames: TARGET_BUFFER_FRAMES,
+			integral: 0.0,
 			input_samples_per_output: 1.0,
 		}
 	}
@@ -94,8 +115,19 @@ impl CaptureClockMatcher {
 	fn update(&mut self, buffered_frames: f64) -> f64 {
 		self.filtered_buffer_frames +=
 			DRIFT_FILTER_ALPHA * (buffered_frames - self.filtered_buffer_frames);
-		let correction = ((self.filtered_buffer_frames - TARGET_BUFFER_FRAMES) * DRIFT_GAIN)
+		let offset = self.filtered_buffer_frames - TARGET_BUFFER_FRAMES;
+		let error = offset.signum() * (offset.abs() - DRIFT_DEADBAND).max(0.0);
+		self.integral = (self.integral + error * DRIFT_INTEGRAL_GAIN)
 			.clamp(-MAX_DRIFT_CORRECTION, MAX_DRIFT_CORRECTION);
+		let wanted =
+			(error * DRIFT_GAIN + self.integral).clamp(-MAX_DRIFT_CORRECTION, MAX_DRIFT_CORRECTION);
+		let current = self.input_samples_per_output - 1.0;
+		let slew = if offset.abs() > DRIFT_URGENT_FRAMES {
+			DRIFT_SLEW * 10.0
+		} else {
+			DRIFT_SLEW
+		};
+		let correction = current + (wanted - current).clamp(-slew, slew);
 		self.input_samples_per_output = 1.0 + correction;
 		self.input_samples_per_output
 	}
@@ -382,7 +414,7 @@ mod tests {
 
 	#[test]
 	fn sample_rate_matcher_tracks_both_clock_drift_directions_without_slips() {
-		for drift in [-0.001, 0.001] {
+		for drift in [-0.001, -0.000_2, 0.000_2, 0.001] {
 			let mut matcher = CaptureClockMatcher::default();
 			let mut buffered_frames = TARGET_BUFFER_FRAMES;
 			let (mut minimum, mut maximum) = (buffered_frames, buffered_frames);
@@ -394,14 +426,55 @@ mod tests {
 				minimum = minimum.min(buffered_frames);
 				maximum = maximum.max(buffered_frames);
 			}
+			// The correction waits out the jitter deadband and moves slowly, so the cushion
+			// swings further than one frame but stays well inside the queue.
 			assert!(minimum > 0.5, "buffer underflowed at drift {drift}");
-			assert!(maximum < 3.5, "buffer grew at drift {drift}");
+			assert!(maximum < (MAX - 2) as f64, "buffer grew at drift {drift}");
+			// At the full correction range the cushion stops drifting but keeps its offset.
+			// Occupancy is measured before the tick's frame is taken, as the pacer does.
+			if drift.abs() < MAX_DRIFT_CORRECTION {
+				let measured = buffered_frames + last_step;
+				assert!(
+					(measured - TARGET_BUFFER_FRAMES).abs() <= DRIFT_DEADBAND + 0.25,
+					"settled near the target at drift {drift}: {measured}"
+				);
+			}
 			if drift > 0.0 {
 				assert!(last_step > 1.0, "fast input must be consumed faster");
 			} else {
 				assert!(last_step < 1.0, "slow input must be consumed slower");
 			}
-			assert!((last_step - 1.0).abs() <= MAX_DRIFT_CORRECTION);
+			assert!((last_step - 1.0).abs() <= MAX_DRIFT_CORRECTION + 1e-12);
+		}
+	}
+
+	#[test]
+	fn callback_jitter_alone_leaves_the_rate_untouched() {
+		// Callbacks landing either side of the tick make occupancy jump by a whole frame;
+		// with no clock drift the audio must pass at exactly its own rate.
+		let mut matcher = CaptureClockMatcher::default();
+		let mut seed = 1u64;
+		for _ in 0..50_000 {
+			seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+			let jump = ((seed >> 62) as f64) - 1.5; // -1.5, -0.5, 0.5 or 1.5 frames
+			assert_eq!(matcher.update(TARGET_BUFFER_FRAMES + jump * 0.6), 1.0);
+		}
+	}
+
+	#[test]
+	fn the_rate_correction_never_changes_quickly() {
+		let mut matcher = CaptureClockMatcher::default();
+		let mut previous = 1.0;
+		for tick in 0..20_000 {
+			// A large, sudden occupancy error: the step still moves at most the slew limit.
+			let level = if tick < 10_000 {
+				TARGET_BUFFER_FRAMES + 4.0
+			} else {
+				0.5
+			};
+			let step = matcher.update(level);
+			assert!((step - previous).abs() <= DRIFT_SLEW * 10.0 + 1e-12);
+			previous = step;
 		}
 	}
 
