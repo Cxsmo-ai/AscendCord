@@ -79,6 +79,10 @@
   });
 
   chrome.runtime.onMessage.addListener(message => {
+    if (message?.kind === "tesktop-lab-songs" && message.songs) {
+      window.postMessage({ source: "tesktop-stereo-proof-control", songs: message.songs }, location.origin);
+      return;
+    }
     if (message?.kind === "tesktop-return-path") {
       window.postMessage({
         source: "tesktop-stereo-proof-control",

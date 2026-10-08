@@ -161,7 +161,8 @@ impl VoiceBridge {
 				"call_connected": call.is_some_and(|call| matches!(call.phase, Phase::Connected | Phase::Waiting)),
 				"test_sweep_active": test_sweep,
 				// The receiver analyses measurement program 2 (see test_sweep.rs and lab.js).
-				"test_program": if test_sweep { 2 } else { 0 },
+				"test_program": if test_sweep { discord_voice::test_sweep::PROGRAM_VERSION } else { 0 },
+				"lab_songs": if test_sweep { discord_voice::test_sweep::songs().map(|songs| songs.manifest()) } else { None },
 				// What arrives from a browser that plays the program back (browser to AscendCord).
 				"return_lab_supported": test_sweep,
 				"return_lab": if test_sweep { discord_voice::lab::returns::report() } else { None },

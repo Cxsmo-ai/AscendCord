@@ -12,7 +12,7 @@
 
   /** One pass, in order. Every tone lasts STEP_MS with 50 ms fades; source peak −12.04 dBFS. */
   const PROGRAM = Object.freeze({
-    version: 2,
+    version: 3,
     step_ms: 700,
     ladder_step_ms: 800,
     silence_ms: 1_200,
@@ -23,8 +23,16 @@
     channel_hz: Object.freeze(Array.from({ length: 12 }, (_, index) => sweepHz(index * 4))),
     // Loudness ladder, each step at its own frequency between two sweep tones so a step is
     // identified by frequency, never by the level that is being measured.
-    ladder_dbfs: Object.freeze([-60, -48, -36, -24, -18, -12, -6, -1]),
-    ladder_hz: Object.freeze(Array.from({ length: 8 }, (_, index) => sweepHz(26 + index + 0.5))),
+    // The last two steps reach full scale and beyond, where peak handling decides.
+    ladder_dbfs: Object.freeze([-60, -48, -36, -24, -18, -12, -6, -1, 0, 3]),
+    ladder_hz: Object.freeze(Array.from({ length: 10 }, (_, index) => sweepHz(26 + index + 0.5))),
+    // Real-signal content after the ladder, measured by subtracting it from what arrives.
+    content: Object.freeze([
+      Object.freeze({ name: "transients", ms: 2_000 }),
+      Object.freeze({ name: "noise", ms: 1_500 }),
+      Object.freeze({ name: "music", ms: 2_000 }),
+      Object.freeze({ name: "speech", ms: 2_000 }),
+    ]),
     sections: Object.freeze(["mono", "left", "right", "antiphase"]),
   });
 
@@ -563,6 +571,467 @@
     };
   }
 
+  // ---- Real-signal content (program 3) ---------------------------------------------------
+  // Every sample is a closed-form function of its index, so AscendCord's test_sweep.rs and
+  // this file produce the same signal without sharing state. Noise comes from an integer
+  // hash, identical in both languages.
+  const TRANSIENTS = Object.freeze({ count: 8, first_ms: 125, spacing_ms: 250, burst_ms: 2, peak: 0.7 });
+  const NOISE_SCALE = 0.436; // uniform noise at about -18 dBFS RMS
+  const MUSIC_HZ = Object.freeze([196, 246.94, 293.66, 392, 587.33, 880]);
+  // Each partial panned to its own place: left and right gains.
+  const MUSIC_PAN = Object.freeze(MUSIC_HZ.map((_, j) => {
+    const angle = (j + 0.5) / MUSIC_HZ.length * Math.PI / 2;
+    return Object.freeze([Math.cos(angle), Math.sin(angle)]);
+  }));
+  const SPEECH_TILT = Object.freeze(Array.from({ length: 41 }, (_, k) => k ? k ** -0.7 : 0));
+  const CONTENT_FADE_MS = 20;
+
+  function hash32(value) {
+    let x = value >>> 0;
+    x ^= x >>> 16; x = Math.imul(x, 0x7feb352d) >>> 0;
+    x ^= x >>> 15; x = Math.imul(x, 0x846ca68b) >>> 0;
+    x ^= x >>> 16;
+    return x >>> 0;
+  }
+
+  /** Uniform noise in [-0.5, 0.5) for stream `seed` at sample `n`. */
+  function noiseAt(seed, n) {
+    return hash32((Math.imul(seed, 0x9e3779b9) + n) >>> 0) / 4_294_967_296 - 0.5;
+  }
+
+  /** Sample offsets of the transient bursts from the start of their section. */
+  function transientOnsets(rate) {
+    return Array.from({ length: TRANSIENTS.count },
+      (_, k) => Math.round(rate * (TRANSIENTS.first_ms + k * TRANSIENTS.spacing_ms) / 1000));
+  }
+
+  function formant(hz) {
+    let weight = 0.05;
+    for (const center of [500, 1_500, 2_500]) weight += 1 / (1 + ((hz - center) / 150) ** 2);
+    return weight;
+  }
+
+  /** One stereo sample of a content section, before its fade. */
+  function contentSample(name, i, rate, onsets) {
+    const t = i / rate;
+    if (name === "transients") {
+      const burst = Math.round(rate * TRANSIENTS.burst_ms / 1000);
+      for (let k = 0; k < onsets.length; k++) {
+        const local = i - onsets[k];
+        if (local >= 0 && local < burst) {
+          const window = 0.5 - 0.5 * Math.cos(2 * Math.PI * (local + 0.5) / burst);
+          const value = window * noiseAt(1_000 + k, local) * 2 * TRANSIENTS.peak;
+          return [value, value];
+        }
+      }
+      return [0, 0];
+    }
+    if (name === "noise") return [noiseAt(2_001, i) * NOISE_SCALE, noiseAt(2_002, i) * NOISE_SCALE];
+    if (name === "music") {
+      // Six plucked partials every 0.5 s, 5.5 Hz vibrato, each panned to its own place.
+      const since = t % 0.5;
+      const envelope = Math.min(1, since / 0.005) * Math.exp(-since / 0.25);
+      const wobble = 0.004 / (2 * Math.PI * 5.5) * (1 - Math.cos(2 * Math.PI * 5.5 * t));
+      let left = 0, right = 0;
+      for (let j = 0; j < MUSIC_HZ.length; j++) {
+        const value = 0.09 * envelope * Math.sin(2 * Math.PI * MUSIC_HZ[j] * (t + wobble));
+        left += value * MUSIC_PAN[j][0];
+        right += value * MUSIC_PAN[j][1];
+      }
+      return [left, right];
+    }
+    // Speech-like: a voice gliding 110-180 Hz, harmonics shaped by three formants, four
+    // syllables a second.
+    const phase = 2 * Math.PI * (145 * t - 35 / Math.PI * Math.sin(Math.PI * t));
+    const f0 = 145 - 35 * Math.cos(Math.PI * t);
+    // sin(k * phase) by the Chebyshev recurrence, the same arithmetic as test_sweep.rs.
+    const twice = 2 * Math.cos(phase);
+    let previous = 0, sine = Math.sin(phase), value = 0;
+    for (let k = 1; k <= 40 && k * f0 < 7_000; k++) {
+      value += formant(k * f0) * SPEECH_TILT[k] * sine;
+      const next = twice * sine - previous;
+      previous = sine;
+      sine = next;
+    }
+    const syllable = (0.5 - 0.5 * Math.cos(2 * Math.PI * 4 * t)) ** 2;
+    return [0.12 * syllable * value, 0.12 * syllable * value];
+  }
+
+  const renderedContent = new Map();
+  // Song clips AscendCord plays after the content (16-bit, 48 kHz, interleaved), if any.
+  let songs = null;
+
+  /** Uses `clips` ({ names, frames, pcm: Int16Array }) as the program's songs; null removes them. */
+  function setSongs(clips) {
+    const valid = clips && Array.isArray(clips.names) && Array.isArray(clips.frames) &&
+      clips.names.length === clips.frames.length && ArrayBuffer.isView(clips.pcm) && clips.pcm.BYTES_PER_ELEMENT === 2 &&
+      clips.frames.reduce((sum, n) => sum + n, 0) * 2 === clips.pcm.length;
+    songs = valid ? clips : null;
+    renderedContent.clear();
+    return songs !== null;
+  }
+
+  /** The content sections in order: float32 samples, section bounds and transient onsets. */
+  function renderContent(rate = 48_000) {
+    const cached = renderedContent.get(rate);
+    if (cached) return cached;
+    const offsets = transientOnsets(rate);
+    const sections = [];
+    let frames = 0;
+    for (const { name, ms } of PROGRAM.content) {
+      const length = Math.floor(rate * ms / 1000);
+      sections.push({ name, start: frames, frames: length });
+      frames += length;
+    }
+    // Song clips are 48 kHz; at another rate they are left out, as AscendCord does.
+    const clips = rate === 48_000 && songs ? songs : null;
+    let pcmAt = 0;
+    for (let index = 0; clips && index < clips.names.length; index++) {
+      sections.push({ name: `song ${index + 1}`, title: clips.names[index], start: frames, frames: clips.frames[index], pcm: pcmAt });
+      frames += clips.frames[index];
+      pcmAt += clips.frames[index] * 2;
+    }
+    const left = new Float32Array(frames), right = new Float32Array(frames);
+    const fade = Math.floor(rate * CONTENT_FADE_MS / 1000);
+    for (const section of sections) {
+      for (let i = 0; i < section.frames; i++) {
+        const ramp = Math.min(1, Math.min(i, section.frames - i) / fade);
+        const [l, r] = section.pcm === undefined
+          ? contentSample(section.name, i, rate, offsets)
+          : [clips.pcm[section.pcm + 2 * i] / 32_768, clips.pcm[section.pcm + 2 * i + 1] / 32_768];
+        left[section.start + i] = Math.fround(l * ramp);
+        right[section.start + i] = Math.fround(r * ramp);
+      }
+    }
+    const onsets = offsets.map(onset => sections[0].start + onset);
+    const rendered = Object.freeze({ left, right, frames, sections, onsets });
+    renderedContent.set(rate, rendered);
+    return rendered;
+  }
+
+  // ---- Null test: what arrived minus the known content -------------------------------------
+  const NULL_BLOCK = 4_096;
+  const NULL_SEARCH = 8; // samples a block may move against the last one
+  const NULL_BANDS_HZ = Object.freeze([100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1_000,
+    1_250, 1_600, 2_000, 2_500, 3_150, 4_000, 5_000, 6_300, 8_000, 10_000, 12_500, 16_000]);
+
+  const twiddles = new Map();
+
+  function fftInPlace(re, im) {
+    const n = re.length;
+    let table = twiddles.get(n);
+    if (!table) {
+      table = { cos: new Float64Array(n / 2), sin: new Float64Array(n / 2) };
+      for (let k = 0; k < n / 2; k++) { table.cos[k] = Math.cos(-2 * Math.PI * k / n); table.sin[k] = Math.sin(-2 * Math.PI * k / n); }
+      twiddles.set(n, table);
+    }
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+    }
+    for (let size = 2; size <= n; size <<= 1) {
+      const stride = n / size;
+      for (let start = 0; start < n; start += size) {
+        for (let k = 0; k < size / 2; k++) {
+          const wr = table.cos[k * stride], wi = table.sin[k * stride];
+          const a = start + k, b = a + size / 2;
+          const xr = re[b] * wr - im[b] * wi, xi = re[b] * wi + im[b] * wr;
+          re[b] = re[a] - xr; im[b] = im[a] - xi;
+          re[a] += xr; im[a] += xi;
+        }
+      }
+    }
+  }
+
+  /** Power of a Hann-windowed block in each third-octave band. */
+  function bandPowers(block, rate) {
+    const n = block.length;
+    const re = new Float64Array(n), im = new Float64Array(n);
+    for (let i = 0; i < n; i++) re[i] = block[i] * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / n));
+    fftInPlace(re, im);
+    return NULL_BANDS_HZ.map(center => {
+      const low = Math.max(1, Math.round(center / 2 ** (1 / 6) * n / rate));
+      const high = Math.min(n / 2, Math.round(center * 2 ** (1 / 6) * n / rate));
+      let power = 0;
+      for (let bin = low; bin <= Math.max(low, high); bin++) power += re[bin] ** 2 + im[bin] ** 2;
+      return power;
+    });
+  }
+
+  /**
+   * Finds the content inside `left`/`right` (decoded audio that holds it somewhere), follows
+   * its timing block by block, and measures what differs from the known signal. Blocks where
+   * the timing slipped or that hold a dropout are counted and left out. Only numbers return.
+   */
+  function* contentSteps(left, right, rate) {
+    const ref = renderContent(rate);
+    const length = Math.min(left.length, right.length);
+    if (length < ref.frames + NULL_BLOCK) return null;
+
+    // 1. Coarse position: correlate 10 ms energy envelopes.
+    const hop = Math.round(rate / 100);
+    const envelope = (l, r, n) => {
+      const out = new Float64Array(Math.floor(n / hop));
+      for (let b = 0; b < out.length; b++) {
+        let sum = 0;
+        for (let i = b * hop; i < (b + 1) * hop; i++) sum += l[i] * l[i] + r[i] * r[i];
+        out[b] = Math.sqrt(sum);
+      }
+      return out;
+    };
+    const refEnvelope = envelope(ref.left, ref.right, ref.frames);
+    const gotEnvelope = envelope(left, right, length);
+    let coarse = -1, coarseScore = 0;
+    for (let offset = 0; offset + refEnvelope.length <= gotEnvelope.length; offset++) {
+      let dot = 0, norm = 0;
+      for (let b = 0; b < refEnvelope.length; b++) {
+        dot += refEnvelope[b] * gotEnvelope[offset + b];
+        norm += gotEnvelope[offset + b] ** 2;
+      }
+      const score = norm > 0 ? dot / Math.sqrt(norm) : 0;
+      if (score > coarseScore) { coarseScore = score; coarse = offset; }
+    }
+    if (coarse < 0) return null;
+
+    // 2. Exact lag from the transient bursts (the only non-zero reference samples there).
+    const burstSamples = [];
+    for (let i = 0; i < ref.sections[0].frames; i++) if (ref.left[i] !== 0) burstSamples.push(i);
+    let lag = coarse * hop, lagScore = -Infinity;
+    for (let candidate = coarse * hop - hop; candidate <= coarse * hop + hop; candidate++) {
+      let dot = 0;
+      for (const i of burstSamples) {
+        const at = i + candidate;
+        if (at < 0 || at >= length) continue;
+        dot += ref.left[i] * left[at] + ref.right[i] * right[at];
+      }
+      if (dot > lagScore) { lagScore = dot; lag = candidate; }
+    }
+
+    // 3. Follow the timing block by block; a moved block marks a jitter-buffer slip.
+    const blocks = [];
+    let current = lag;
+    for (let start = 0; start + NULL_BLOCK <= ref.frames; start += NULL_BLOCK) {
+      let refEnergy = 0;
+      for (let i = start; i < start + NULL_BLOCK; i++) refEnergy += ref.left[i] ** 2 + ref.right[i] ** 2;
+      let best = current;
+      if (refEnergy > 1e-6) {
+        let bestScore = -Infinity;
+        for (let candidate = current - NULL_SEARCH; candidate <= current + NULL_SEARCH; candidate++) {
+          if (start + candidate < 0 || start + candidate + NULL_BLOCK > length) continue;
+          let dot = 0;
+          for (let i = start; i < start + NULL_BLOCK; i++) {
+            dot += ref.left[i] * left[i + candidate] + ref.right[i] * right[i + candidate];
+          }
+          if (dot > bestScore) { bestScore = dot; best = candidate; }
+        }
+      }
+      if (start + best < 0 || start + best + NULL_BLOCK > length) break;
+      blocks.push({ start, lag: best, slipped: best !== current, refEnergy });
+      current = best;
+      yield;
+    }
+
+    // 4-5. Gain per section and channel, then the residue of each block. Done twice: blocks
+    // that hold a dropout are found on the first round and left out of the second, so they
+    // do not bias the gain.
+    const sectionOf = start => ref.sections.find(s => start >= s.start && start < s.start + s.frames);
+    const measureBlocks = function* (excluded) {
+      const gains = new Map();
+      for (const block of blocks) {
+        if (block.slipped || excluded.has(block)) continue;
+        const section = sectionOf(block.start);
+        const g = gains.get(section.name) ?? { lx: 0, ly: 0, rx: 0, ry: 0 };
+        for (let i = block.start; i < block.start + NULL_BLOCK; i++) {
+          g.lx += ref.left[i] * left[i + block.lag]; g.ly += ref.left[i] ** 2;
+          g.rx += ref.right[i] * right[i + block.lag]; g.ry += ref.right[i] ** 2;
+        }
+        gains.set(section.name, g);
+      }
+      const residues = [];
+      for (const block of blocks) {
+        if (block.slipped) continue;
+        const section = sectionOf(block.start);
+        const g = gains.get(section.name) ?? { lx: 0, ly: 0, rx: 0, ry: 0 };
+        const gl = g.ly > 0 ? g.lx / g.ly : 0, gr = g.ry > 0 ? g.rx / g.ry : 0;
+        const sigL = new Float64Array(NULL_BLOCK), sigR = new Float64Array(NULL_BLOCK);
+        const resL = new Float64Array(NULL_BLOCK), resR = new Float64Array(NULL_BLOCK);
+        let signal = 0, residue = 0;
+        for (let j = 0; j < NULL_BLOCK; j++) {
+          const i = block.start + j;
+          sigL[j] = gl * ref.left[i]; sigR[j] = gr * ref.right[i];
+          resL[j] = left[i + block.lag] - sigL[j]; resR[j] = right[i + block.lag] - sigR[j];
+          signal += sigL[j] ** 2 + sigR[j] ** 2;
+          residue += resL[j] ** 2 + resR[j] ** 2;
+        }
+        residues.push({ block, section: section.name, signal, residue, sigL, sigR, resL, resR });
+        yield;
+      }
+      // A dropout raises a block's residue both absolutely and against its own signal; a
+      // quiet passage only does the latter.
+      const middle = values => { const sorted = values.sort((a, b) => a - b); return sorted.length ? sorted[sorted.length >> 1] : 0; };
+      const dropouts = new Set();
+      for (const name of new Set(residues.map(r => r.section))) {
+        const mine = residues.filter(r => r.section === name && r.signal > 0);
+        const usual = { residue: middle(mine.map(r => r.residue)), ratio: middle(mine.map(r => r.residue / r.signal)) };
+        for (const r of mine) {
+          if (usual.residue > 0 && r.residue > usual.residue * 100 && r.residue / r.signal > usual.ratio * 10) {
+            dropouts.add(r.block);
+          }
+        }
+      }
+      return { gains, residues, dropouts };
+    };
+    const first = yield* measureBlocks(new Set());
+    const { gains, residues } = yield* measureBlocks(first.dropouts);
+    const kept = residues.filter(r => !first.dropouts.has(r.block));
+
+    const toDb = (signal, residue) => signal > 0 ? 10 * Math.log10(signal / Math.max(residue, signal * 1e-15)) : null;
+    const sections = {};
+    const bandSrr = {};
+    const songSig = new Float64Array(NULL_BANDS_HZ.length), songRes = new Float64Array(NULL_BANDS_HZ.length);
+    let songSignal = 0, songResidue = 0, songBlocks = 0;
+    for (const { name, title } of ref.sections) {
+      const mine = kept.filter(r => r.section === name);
+      const signal = mine.reduce((s, r) => s + r.signal, 0), residue = mine.reduce((s, r) => s + r.residue, 0);
+      const g = gains.get(name);
+      sections[name] = {
+        blocks: mine.length,
+        srr_db: toDb(signal, residue),
+        gain_db: g && g.ly > 0 && g.lx > 0 ? 20 * Math.log10(g.lx / g.ly) : null,
+        ...(title ? { title: String(title).slice(0, 64) } : {}),
+      };
+      if (name === "transients") continue;
+      const sig = new Float64Array(NULL_BANDS_HZ.length), res = new Float64Array(NULL_BANDS_HZ.length);
+      for (const r of mine) {
+        for (const [signalBlock, residueBlock] of [[r.sigL, r.resL], [r.sigR, r.resR]]) {
+          bandPowers(signalBlock, rate).forEach((p, b) => { sig[b] += p; });
+          bandPowers(residueBlock, rate).forEach((p, b) => { res[b] += p; });
+        }
+        yield;
+      }
+      bandSrr[name] = Array.from(sig, (s, b) => toDb(s, res[b]));
+      if (title) {
+        sig.forEach((s, b) => { songSig[b] += s; songRes[b] += res[b]; });
+        songSignal += signal; songResidue += residue; songBlocks += mine.length;
+      }
+    }
+    if (songBlocks) {
+      sections.songs = { blocks: songBlocks, srr_db: toDb(songSignal, songResidue), gain_db: null };
+      bandSrr.songs = Array.from(songSig, (s, b) => toDb(s, songRes[b]));
+    }
+
+    // 6. Pre-echo: what arrived in the 20 ms before each burst, against the burst itself.
+    const burst = Math.round(rate * TRANSIENTS.burst_ms / 1000);
+    const before = Math.round(rate * 0.020), guard = Math.round(rate * 0.0005);
+    const blockAt = i => blocks.find(b => i >= b.start && i < b.start + NULL_BLOCK);
+    const gT = gains.get("transients");
+    const gainT = gT && gT.ly > 0 ? gT.lx / gT.ly : 1;
+    const preEcho = [], postEcho = [];
+    for (const onset of ref.onsets) {
+      const block = blockAt(onset);
+      if (!block || block.slipped) continue;
+      let pre = 0, post = 0, energy = 0;
+      for (let i = onset - before; i < onset - guard; i++) pre += left[i + block.lag] ** 2 + right[i + block.lag] ** 2;
+      for (let i = onset; i < onset + burst; i++) energy += 2 * (gainT * ref.left[i]) ** 2;
+      for (let i = onset + burst; i < onset + burst + before; i++) {
+        post += (left[i + block.lag] - gainT * ref.left[i]) ** 2 + (right[i + block.lag] - gainT * ref.right[i]) ** 2;
+      }
+      // Level of what is there before (and after) the burst relative to the burst: lower is better.
+      preEcho.push(pre > 0 && energy > 0 ? 10 * Math.log10(pre / energy) : null);
+      postEcho.push(post > 0 && energy > 0 ? 10 * Math.log10(post / energy) : null);
+    }
+    const finiteSorted = values => values.filter(Number.isFinite).sort((a, b) => a - b);
+    const summarize = values => {
+      const sorted = finiteSorted(values);
+      return {
+        values,
+        median_db: sorted.length ? sorted[sorted.length >> 1] : null,
+        worst_db: sorted.length ? sorted[sorted.length - 1] : null,
+      };
+    };
+    return {
+      version: 1,
+      lag_samples: lag,
+      blocks: blocks.length,
+      slipped_blocks: blocks.filter(b => b.slipped).length,
+      dropout_blocks: residues.length - kept.length,
+      sections,
+      bands_hz: [...NULL_BANDS_HZ],
+      band_srr_db: bandSrr,
+      pre_echo_db: summarize(preEcho),
+      post_echo_db: summarize(postEcho),
+    };
+  }
+
+  /**
+   * Several passes' null tests as one: sections and bands by their median across passes,
+   * transient pre- and post-echo pooled, disturbances added up. Failed passes are skipped.
+   */
+  function combineContent(reports) {
+    const good = (reports ?? []).filter(report => report && report.version === 1 && report.sections);
+    if (!good.length) return null;
+    const median = values => {
+      const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
+      return sorted.length ? sorted[sorted.length >> 1] : null;
+    };
+    const names = [...new Set(good.flatMap(report => Object.keys(report.sections)))];
+    const sections = Object.fromEntries(names.map(name => {
+      const mine = good.map(report => report.sections[name]).filter(Boolean);
+      return [name, {
+        blocks: mine.reduce((sum, s) => sum + (s.blocks ?? 0), 0),
+        srr_db: median(mine.map(s => s.srr_db)),
+        gain_db: median(mine.map(s => s.gain_db)),
+        ...(mine.find(s => s.title) ? { title: mine.find(s => s.title).title } : {}),
+      }];
+    }));
+    const bandNames = [...new Set(good.flatMap(report => Object.keys(report.band_srr_db ?? {})))];
+    const bands = good[0].bands_hz ?? [];
+    const band_srr_db = Object.fromEntries(bandNames.map(name => [name,
+      bands.map((_, b) => median(good.map(report => report.band_srr_db?.[name]?.[b])))]));
+    const pool = key => {
+      const values = good.flatMap(report => report[key]?.values ?? []).filter(Number.isFinite);
+      const sorted = [...values].sort((a, b) => a - b);
+      return { values, median_db: sorted.length ? sorted[sorted.length >> 1] : null, worst_db: sorted.length ? sorted[sorted.length - 1] : null };
+    };
+    const total = key => good.reduce((sum, report) => sum + (Number(report[key]) || 0), 0);
+    return {
+      version: 1,
+      passes: good.length,
+      blocks: total("blocks"),
+      slipped_blocks: total("slipped_blocks"),
+      dropout_blocks: total("dropout_blocks"),
+      gaps: total("gaps"),
+      sections,
+      bands_hz: bands,
+      band_srr_db,
+      pre_echo_db: pool("pre_echo_db"),
+      post_echo_db: pool("post_echo_db"),
+    };
+  }
+
+  /** The null test, all at once (tests, the service worker). */
+  function analyzeContent(left, right, rate = 48_000) {
+    const steps = contentSteps(left, right, rate);
+    for (;;) {
+      const step = steps.next();
+      if (step.done) return step.value;
+    }
+  }
+
+  /** The null test in slices of about 15 ms, so a page keeps sampling and responding. */
+  async function analyzeContentInSlices(left, right, rate = 48_000) {
+    const steps = contentSteps(left, right, rate);
+    for (;;) {
+      const until = Date.now() + 15;
+      let step;
+      do step = steps.next(); while (!step.done && Date.now() < until);
+      if (step.done) return step.value;
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+  }
+
   /**
    * One pass of the program as AscendCord's test_sweep.rs renders it: per-segment phase from
    * zero, a linear 50 ms fade at both ends, left and right in float32.
@@ -576,8 +1045,12 @@
     PROGRAM.ladder_dbfs.forEach((dbfs, index) => segments.push({
       kind: "mono", hz: PROGRAM.ladder_hz[index], peak: 10 ** (dbfs / 20), ms: PROGRAM.ladder_step_ms,
     }));
-    const frames = segments.reduce((sum, s) => sum + Math.floor(rate * s.ms / 1000), 0);
+    const tones = segments.reduce((sum, s) => sum + Math.floor(rate * s.ms / 1000), 0);
+    const content = renderContent(rate);
+    const frames = tones + content.frames;
     const left = new Float32Array(frames), right = new Float32Array(frames);
+    left.set(content.left, tones);
+    right.set(content.right, tones);
     const fade = Math.floor(rate * 50 / 1000);
     let at = 0;
     for (const segment of segments) {
@@ -600,7 +1073,7 @@
   }
 
   root.AscendCordLab = Object.freeze({
-    PROGRAM, renderPass, rms, fitTone, distortion, nearestTone, analyzeWindow,
+    PROGRAM, renderPass, renderContent, analyzeContent, analyzeContentInSlices, combineContent, setSongs, rms, fitTone, distortion, nearestTone, analyzeWindow,
     createLab, addWindow, finalizeLab, compare, linearFit, finite, db20,
   });
 })(globalThis);

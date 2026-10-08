@@ -564,6 +564,14 @@ fn serve(mut stream: TcpStream, shared: &Arc<Mutex<Shared>>) {
 				);
 			respond(&mut stream, 200, "OK", &body.to_string(), origin.as_deref());
 		}
+		// The song clips of a lab test, for the extension to subtract from what arrives. Only
+		// the pinned extension origin reaches this (see `origin_allowed`).
+		("GET", "/v1/lab/songs") => match discord_voice::test_sweep::songs() {
+			Some(songs) if discord_voice::audio::test_sweep_channel().is_some() => {
+				respond_bytes(&mut stream, songs.pcm(), origin.as_deref());
+			}
+			_ => respond(&mut stream, 404, "No Lab Songs", "{}", origin.as_deref()),
+		},
 		("POST", "/v1/diagnostics") => {
 			let mut body = vec![0u8; content_length];
 			if reader.read_exact(&mut body).is_err() {
@@ -661,6 +669,18 @@ fn read_line_bounded<R: BufRead>(
 	Ok(())
 }
 
+fn respond_bytes(stream: &mut TcpStream, body: &[u8], origin: Option<&str>) {
+	let cors = origin.map_or_else(String::new, |origin| {
+		format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n")
+	});
+	let head = format!(
+		"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n{cors}\r\n",
+		body.len()
+	);
+	let _ = stream.write_all(head.as_bytes());
+	let _ = stream.write_all(body);
+}
+
 fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &str, origin: Option<&str>) {
 	let cors = origin.map_or_else(String::new, |origin| {
 		format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n")
@@ -691,6 +711,14 @@ mod tests {
 			Some("chrome-extension://another-extension")
 		));
 		assert!(origin_allowed("GET", "/v1/status", Some(EXTENSION_ORIGIN)));
+		// Song clips are the user's audio: only the pinned extension may read them.
+		assert!(!origin_allowed("GET", "/v1/lab/songs", None));
+		assert!(!origin_allowed("GET", "/v1/lab/songs", Some("null")));
+		assert!(origin_allowed(
+			"GET",
+			"/v1/lab/songs",
+			Some(EXTENSION_ORIGIN)
+		));
 	}
 
 	#[test]

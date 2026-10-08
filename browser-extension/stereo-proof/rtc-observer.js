@@ -130,6 +130,125 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
     }
   }
 
+  // Null test: while a capture runs, keep the last 45 s of each analysed track exactly as
+  // decoded, and after each pass measure the program's content against the known signal.
+  // The audio stays in this page; only the resulting numbers are reported.
+  const RECORD_SECONDS = 45;
+  const LOUD_LADDER_INDEX = 8;
+  const recorders = new Map();
+
+  function pushFrames(recorder, left, right) {
+    const size = recorder.left.length;
+    for (let i = 0; i < left.length; i++) {
+      recorder.left[recorder.write] = left[i];
+      recorder.right[recorder.write] = right[i];
+      recorder.write = (recorder.write + 1) % size;
+    }
+    recorder.filled = Math.min(size, recorder.filled + left.length);
+  }
+
+  function takeAudio(recorder, data) {
+    const frames = data.numberOfFrames, rate = data.sampleRate;
+    if (recorder.rate !== rate) {
+      recorder.rate = rate;
+      recorder.left = new Float32Array(rate * RECORD_SECONDS);
+      recorder.right = new Float32Array(rate * RECORD_SECONDS);
+      recorder.write = 0;
+      recorder.filled = 0;
+      recorder.nextTimestamp = null;
+    }
+    // A gap between frames is kept as silence so time stays true.
+    if (recorder.nextTimestamp !== null) {
+      const gap = Math.round((data.timestamp - recorder.nextTimestamp) * rate / 1e6);
+      if (gap > 0 && gap < rate) {
+        recorder.gaps++;
+        pushFrames(recorder, new Float32Array(gap), new Float32Array(gap));
+      }
+    }
+    const left = new Float32Array(frames), right = new Float32Array(frames);
+    data.copyTo(left, { planeIndex: 0, format: "f32-planar" });
+    if (data.numberOfChannels > 1) data.copyTo(right, { planeIndex: 1, format: "f32-planar" });
+    else right.set(left);
+    pushFrames(recorder, left, right);
+    recorder.nextTimestamp = data.timestamp + frames * 1e6 / rate;
+  }
+
+  function startRecorder(track) {
+    if (recorders.has(track.id) || typeof MediaStreamTrackProcessor !== "function" ||
+        !globalThis.AscendCordLab) return;
+    let reader;
+    try {
+      reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+    } catch {
+      return;
+    }
+    const recorder = {
+      reader, rate: 0, left: null, right: null, write: 0, filled: 0, nextTimestamp: null, gaps: 0,
+      loudAt: 0, silent: 0, busy: false, report: null,
+    };
+    recorders.set(track.id, recorder);
+    (async () => {
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          try { takeAudio(recorder, value); } finally { value.close(); }
+        }
+      } catch {}
+    })();
+  }
+
+  function stopRecorders() {
+    for (const recorder of recorders.values()) recorder.reader.cancel().catch(() => {});
+    recorders.clear();
+  }
+
+  function snapshot(recorder, frames) {
+    const size = recorder.left.length;
+    const count = Math.min(frames, recorder.filled);
+    const left = new Float32Array(count), right = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      const at = (recorder.write - count + i + size) % size;
+      left[i] = recorder.left[at];
+      right[i] = recorder.right[at];
+    }
+    return { left, right };
+  }
+
+  /** Follows the program on one track: the loud end of the ladder, the content, then silence. */
+  function noteLabWindow(track, labWindow) {
+    const recorder = recorders.get(track.id);
+    if (!recorder || recorder.busy || !recorder.rate) return;
+    if (labWindow.kind === "tone" && labWindow.grid === "ladder" && labWindow.index >= LOUD_LADDER_INDEX) {
+      recorder.loudAt = Date.now();
+      recorder.silent = 0;
+      return;
+    }
+    if (!recorder.loudAt) return;
+    recorder.silent = labWindow.kind === "silence" ? recorder.silent + 1 : 0;
+    const content = globalThis.AscendCordLab.renderContent(recorder.rate);
+    const contentMs = content.frames * 1000 / recorder.rate;
+    // Silence counts only once the whole content can have passed; a quiet passage inside a
+    // song does not end it.
+    if (recorder.silent < 3 || Date.now() - recorder.loudAt < contentMs - 500) return;
+    recorder.loudAt = 0;
+    recorder.silent = 0;
+    recorder.busy = true;
+    const { left, right } = snapshot(recorder, Math.round(recorder.rate * (contentMs / 1000 + 8)));
+    globalThis.AscendCordLab.analyzeContentInSlices(left, right, recorder.rate)
+      .then(report => { recorder.report = report ?? { error: "content not found" }; })
+      .catch(error => { recorder.report = { error: String(error?.message ?? error).slice(0, 120) }; })
+      .finally(() => { recorder.busy = false; });
+  }
+
+  function takeContentReport(track) {
+    const recorder = track ? recorders.get(track.id) : null;
+    if (!recorder?.report) return null;
+    const report = { ...recorder.report, gaps: recorder.gaps };
+    recorder.report = null;
+    return report;
+  }
+
   function measure(track) {
     const entry = track ? meter(track) : null;
     if (!entry || audioContext?.state !== "running") return null;
@@ -197,6 +316,10 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
     const labWindow = curveCapture && globalThis.AscendCordLab
       ? globalThis.AscendCordLab.analyzeWindow(entry.l, entry.r, audioContext.sampleRate, peakFrequencyHz)
       : null;
+    if (labWindow) {
+      startRecorder(track);
+      noteLabWindow(track, labWindow);
+    }
     return {
       lab_window: labWindow,
       left_dbfs: db(ll),
@@ -377,6 +500,7 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
       peak_dbfs: stereo?.peak_dbfs ?? null,
       analysis_sample_rate_hz: stereo?.analysis_sample_rate_hz ?? null,
       lab_window: stereo?.lab_window ?? null,
+        lab_content: takeContentReport(track),
       });
     }
   }
@@ -609,6 +733,18 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
       labArmed = event.data.labArmed;
       return;
     }
+    if (event.data.songs && typeof event.data.songs.pcm === "string") {
+      try {
+        const binary = atob(event.data.songs.pcm);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        globalThis.AscendCordLab?.setSongs({
+          names: event.data.songs.names, frames: event.data.songs.frames,
+          pcm: new Int16Array(bytes.buffer, 0, bytes.length >> 1),
+        });
+      } catch {}
+      return;
+    }
     if (typeof event.data.returnPath === "boolean") {
       (event.data.returnPath ? startReturnPath() : stopReturnPath()).catch(() => {
         returnPathState = "error";
@@ -618,6 +754,9 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
     const next = event.data.captureCurve === true;
     if (curveCapture === next) return;
     curveCapture = next;
+    if (!next) stopRecorders();
+    // Render the content now rather than in the middle of a pass's silence.
+    else setTimeout(() => { const ctx = context(); if (ctx) globalThis.AscendCordLab?.renderContent(ctx.sampleRate); }, 0);
     clearInterval(sampleTimer);
     // Program 2 tones hold steady for about 0.6 s; a window every 100 ms catches each
     // of them two or three times without a fade in it.

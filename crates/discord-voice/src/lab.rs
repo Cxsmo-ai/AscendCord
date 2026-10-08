@@ -5,7 +5,9 @@
 //! measured the same way. Only numbers leave this module.
 const POINTS: usize = 48;
 const CHANNEL_STRIDE: usize = 4;
-const LADDER_DBFS: [f64; 8] = [-60.0, -48.0, -36.0, -24.0, -18.0, -12.0, -6.0, -1.0];
+const LADDER_DBFS: [f64; 10] = [
+	-60.0, -48.0, -36.0, -24.0, -18.0, -12.0, -6.0, -1.0, 0.0, 3.0,
+];
 const SOURCE_PEAK_DBFS: f64 = -12.041_199_826_559_248;
 const SILENCE_DBFS: f64 = -40.0;
 // Comfort noise from a codec makes the silence merely quiet, and then the ladder's quietest
@@ -685,7 +687,7 @@ impl Lab {
 		let ladder_gains: Vec<f64> = ladder_gain.iter().flatten().copied().collect();
 		let fit = linear_fit(&LADDER_DBFS, &ladder_out);
 		serde_json::json!({
-			"version": 2,
+			"version": 3,
 			"program": {
 				"step_ms": 700,
 				"ladder_step_ms": 800,
@@ -769,7 +771,7 @@ mod tests {
 	/// Runs `passes` passes of the real generator through `channel` and the analysis.
 	fn measure(passes: u32, channel: impl Fn(f32, f32) -> (f32, f32)) -> serde_json::Value {
 		let mut sweep = crate::test_sweep::Sweep::new(48_000);
-		let pass_frames = 48 * (1_200 + 84 * 700 + 8 * 800);
+		let pass_frames = crate::test_sweep::pass_frames(48_000);
 		let total = pass_frames * passes as usize + 48 * 1_200;
 		let (mut left, mut right) = (Vec::with_capacity(total), Vec::with_capacity(total));
 		for _ in 0..total {
@@ -893,7 +895,7 @@ mod tests {
 	fn the_96_khz_capture_resampler_is_transparent_to_the_lab() {
 		// The microphone path: the program generated at 96 kHz, resampled to 48 kHz.
 		let mut sweep = crate::test_sweep::Sweep::new(96_000);
-		let pass = 96 * (1_200 + 84 * 700 + 8 * 800);
+		let pass = crate::test_sweep::pass_frames(96_000);
 		let mut input = Vec::with_capacity(pass * 5);
 		for _ in 0..pass * 5 / 2 {
 			input.extend(sweep.next_frame());
@@ -944,7 +946,7 @@ mod tests {
 		assert!((number(&summary["linearity_slope"]) - 1.0).abs() < 0.001);
 		assert!(number(&summary["level_compression_db"]) < 0.05);
 		assert!(number(&report["linearity"]["fit"]["r2"]) > 0.9999);
-		assert_eq!(report["linearity"]["thdn_db"].as_array().unwrap().len(), 8);
+		assert_eq!(report["linearity"]["thdn_db"].as_array().unwrap().len(), 10);
 		assert!(number(&report["linearity"]["thdn_db"][7]) < -80.0);
 		assert_eq!(report["program"]["silence_ms"], 1_200);
 	}
@@ -953,7 +955,7 @@ mod tests {
 	fn the_return_path_measures_decoded_frames_fed_by_the_mixer() {
 		returns::enable();
 		let mut sweep = crate::test_sweep::Sweep::new(48_000);
-		let frames = 48 * (1_200 + 84 * 700 + 8 * 800) + 48 * 1_200 * 2;
+		let frames = crate::test_sweep::pass_frames(48_000) + 48 * 1_200 * 2;
 		for chunk in 0..frames / 960 {
 			let stereo: Vec<f32> = (0..960).flat_map(|_| sweep.next_frame()).collect();
 			returns::feed(4242, &stereo, false);

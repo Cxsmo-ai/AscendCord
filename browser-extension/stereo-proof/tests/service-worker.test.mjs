@@ -349,7 +349,7 @@ test("automatically persists a completed proof so an MV3 worker restart keeps th
   assert.equal(diagnostics.pipeline_validation.passed, true);
 });
 
-test("program 2 captures until two full passes and keeps a comparable lab report", async () => {
+test("program 3 captures until two full passes and keeps a comparable lab report", async () => {
   const labSource = await readFile(new URL("../lab.js", import.meta.url), "utf8");
   const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
   let onMessage;
@@ -372,7 +372,7 @@ test("program 2 captures until two full passes and keeps a comparable lab report
     fetch: async (url, options) => {
       if (url.endsWith("/v1/status")) {
         return { ok: true, status: 200, json: async () => ({ sender: {
-          audio_ssrc: 91, test_sweep_active: senderSweep, send_enabled: true, test_program: 2,
+          audio_ssrc: 91, test_sweep_active: senderSweep, send_enabled: true, test_program: 3,
           opus_bitrate_target_bps: 510_000, opus_application: "Audio", force_stereo: true,
           audio_ssrc_secret: "not kept",
         } }) };
@@ -405,21 +405,32 @@ test("program 2 captures until two full passes and keeps a comparable lab report
     ...PROGRAM.ladder_dbfs.map((dbfs, i) => tone("ladder", i, dbfs - 0.5, dbfs - 0.5, 1)),
   ];
   const windows = [{ kind: "unknown" }, ...pass(), ...pass(), silence, silence, silence];
-  for (const window of windows) {
+  // The page reports each pass's null test a little after the pass ends.
+  const passLength = pass().length;
+  const contentAfter = new Set([1 + passLength + 2, windows.length - 1]);
+  const nullTest = index => ({
+    version: 1, blocks: 80, slipped_blocks: 0, dropout_blocks: 0, gaps: 0,
+    sections: { music: { blocks: 20, srr_db: index < passLength + 5 ? 28 : 30, gain_db: 0 } },
+    bands_hz: [1_000], band_srr_db: { music: [40] },
+    pre_echo_db: { values: [-50, -48], median_db: -48, worst_db: -48 },
+    post_echo_db: { values: [-40], median_db: -40, worst_db: -40 },
+  });
+  for (const [index, window] of windows.entries()) {
     now += 120;
     await send({ kind: "tesktop-receiver-report", report: {
       protocol: 1, sampled_at_ms: now, peer_connections: 1,
       streams: [{ ssrc: 91, codec: "audio/opus", channels: 2, track_channels: 2,
         sdp_fmtp_stereo: true, active: true, spectrum_dbfs: Array(48).fill(-30),
         peak_frequency_hz: 1_000, peak_dbfs: -12, analysis_sample_rate_hz: 48_000,
-        concealment_events_delta: 0, discarded_packets_delta: 0, lab_window: window }],
+        concealment_events_delta: 0, discarded_packets_delta: 0, stretched_samples_delta: 0,
+        lab_window: window, lab_content: contentAfter.has(index) ? nullTest(index) : undefined }],
     } });
     await new Promise(resolve => setTimeout(resolve, 1));
   }
   const diagnostics = await send({ kind: "tesktop-read-diagnostics" });
-  assert.equal(diagnostics.test.running, false, "two passes complete the capture by themselves");
+  assert.equal(diagnostics.test.running, false, "two passes and their null tests complete the capture");
   const lab = diagnostics.measurement_lab;
-  assert.equal(lab.version, 2);
+  assert.equal(lab.version, 3);
   assert.equal(lab.passes, 2);
   assert.equal(lab.summary.measured_response_bands, 48);
   assert.ok(Math.abs(lab.response.left_gain_db[10]) < 0.01);
@@ -431,14 +442,18 @@ test("program 2 captures until two full passes and keeps a comparable lab report
   assert.equal(diagnostics.sender_settings.opus_bitrate_target_bps, 510_000);
   assert.equal("audio_ssrc_secret" in diagnostics.sender_settings, false);
   assert.equal(diagnostics.pipeline_validation.checks.all_48_sweep_bands_measured, true);
-  assert.equal("lab_window" in forwarded.streams[0], false, "the desktop report keeps its schema");
+  for (const field of ["lab_window", "lab_content", "stretched_samples_delta"]) {
+    assert.equal(field in forwarded.streams[0], false, `the desktop report keeps its schema: ${field}`);
+  }
+  assert.equal(lab.content.passes, 2, "each pass's null test is kept");
+  assert.equal(lab.content.sections.music.srr_db, 30);
   await new Promise(resolve => setTimeout(resolve, 5));
   const history = await send({ kind: "tesktop-read-lab-history" });
   assert.equal(history.history.length, 1);
   assert.equal(history.history[0].measurement_lab.passes, 2);
 });
 
-test("program 2 also plays back from the browser and waits for AscendCord's measurement", async () => {
+test("program 3 also plays back from the browser and waits for AscendCord's measurement", async () => {
   const labSource = await readFile(new URL("../lab.js", import.meta.url), "utf8");
   const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
   let onMessage;
@@ -461,9 +476,9 @@ test("program 2 also plays back from the browser and waits for AscendCord's meas
     fetch: async url => {
       if (url.endsWith("/v1/status")) {
         return { ok: true, status: 200, json: async () => ({ sender: {
-          audio_ssrc: 93, test_sweep_active: true, send_enabled: true, test_program: 2,
+          audio_ssrc: 93, test_sweep_active: true, send_enabled: true, test_program: 3,
           return_lab_supported: true,
-          return_lab: { version: 2, passes: returnPasses, ssrc: 5, summary: { measured_response_bands: 48 } },
+          return_lab: { version: 3, passes: returnPasses, ssrc: 5, summary: { measured_response_bands: 48 } },
         } }) };
       }
       return { ok: true, status: 204 };
@@ -484,17 +499,20 @@ test("program 2 also plays back from the browser and waits for AscendCord's meas
     ...PROGRAM.sweep_hz.map((_, i) => tone("sweep", i)),
     ...[0, 1, 2].flatMap(() => Array.from({ length: 12 }, (_, i) => tone("sweep", i * 4))),
     ...PROGRAM.ladder_dbfs.map((_, i) => tone("ladder", i))];
-  const deliver = async windows => {
-    for (const window of windows) {
+  const nullTest = { version: 1, sections: { noise: { blocks: 10, srr_db: 40, gain_db: 0 } } };
+  const deliver = async (windows, contentAt = new Set()) => {
+    for (const [index, window] of windows.entries()) {
       now += 120;
       await send({ kind: "tesktop-receiver-report", report: { protocol: 1, sampled_at_ms: now,
         peer_connections: 1, streams: [{ ssrc: 93, codec: "audio/opus", channels: 2, track_channels: 2,
           sdp_fmtp_stereo: true, active: true, spectrum_dbfs: Array(48).fill(-30), peak_frequency_hz: 1_000,
-          peak_dbfs: -12, analysis_sample_rate_hz: 48_000, lab_window: window }] } });
+          peak_dbfs: -12, analysis_sample_rate_hz: 48_000, lab_window: window,
+          lab_content: contentAt.has(index) ? nullTest : undefined }] } });
       await new Promise(resolve => setTimeout(resolve, 1));
     }
   };
-  await deliver([{ kind: "unknown" }, ...pass(), ...pass(), silence, silence, silence]);
+  const both = [{ kind: "unknown" }, ...pass(), ...pass(), silence, silence, silence];
+  await deliver(both, new Set([5, both.length - 1]));
   assert.ok(controls.some(message => message.kind === "tesktop-return-path" && message.active === true),
     "the browser is asked to play the program back");
   let diagnostics = await send({ kind: "tesktop-read-diagnostics" });

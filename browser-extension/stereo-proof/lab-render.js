@@ -150,6 +150,11 @@
       `Windows: ${report.windows.accepted} measured · ${report.windows.transitional} transitional · ${report.windows.contaminated} disturbed by the network · ${report.windows.glitched ?? 0} glitched · ${report.windows.unknown} unidentified · ${report.passes} passes`,
       `Sender: ${settingsLine(settings)}`,
     ];
+    const c = report.content;
+    if (c?.sections) {
+      const srr = name => fmt(c.sections[name]?.srr_db, 1, " dB");
+      rows.push(`Null test (signal to residue): songs ${srr("songs")} · speech ${srr("speech")} · music ${srr("music")} · noise ${srr("noise")} · transients ${srr("transients")} · pre-echo ${fmt(c.pre_echo_db?.median_db, 1, " dB")} (worst ${fmt(c.pre_echo_db?.worst_db, 1, " dB")}) · ${c.slipped_blocks} slips · ${c.dropout_blocks} dropouts · ${c.passes} passes`);
+    }
     if (baseline) rows.push(`Baseline (dashed): ${settingsLine(baseline.sender_settings)} · finished ${new Date(baseline.finished_at_ms).toLocaleString()}`);
     rows.forEach((row, index) => ctx.fillText(row, 60, 140 + index * 40));
     return 140 + rows.length * 40 + 10;
@@ -177,8 +182,9 @@
     // neither named nor given a difference panel.
     const candidate = baseline?.[baselineKey];
     const base = candidate?.summary?.measured_response_bands > 0 ? candidate : null;
-    const panels = 5 + (samples.length ? 1 : 0) + (base ? 1 : 0);
-    const top = 470 + (base ? 40 : 0);
+    const content = report.content?.sections ? report.content : null;
+    const panels = 5 + (content ? 2 : 0) + (samples.length ? 1 : 0) + (base ? 1 : 0);
+    const top = 470 + (base ? 40 : 0) + (content ? 40 : 0);
     canvas.width = WIDTH;
     canvas.height = top + panels * PANEL_HEIGHT + 40;
     const ctx = canvas.getContext("2d");
@@ -242,6 +248,49 @@
     line(ctx, map, lin.input_dbfs, lin.thdn_db, COLORS.third);
     legend(ctx, map, [["Gain error", COLORS.left], ["THD+N", COLORS.third]]);
     y += PANEL_HEIGHT;
+
+    if (content) {
+      // 5a. What the content keeps of itself, band by band: higher is closer to the source.
+      const kinds = [["songs", COLORS.left], ["speech", COLORS.right], ["music", COLORS.third], ["noise", COLORS.fourth]]
+        .filter(([name]) => content.band_srr_db?.[name]);
+      map = panel(ctx, y, "Null test by frequency", "  arrived minus the known source · signal to residue per third-octave band",
+        frequencyScale, axisRange(kinds.map(([name]) => content.band_srr_db[name]), [0, 60]), "Signal to residue (dB)");
+      if (base?.content?.band_srr_db?.songs) {
+        line(ctx, map, base.content.bands_hz, base.content.band_srr_db.songs, COLORS.baseline, { width: 3, dash: dashed, points: false });
+      }
+      for (const [name, color] of kinds) line(ctx, map, content.bands_hz, content.band_srr_db[name], color);
+      legend(ctx, map, [...kinds.map(([name, color]) => [name[0].toUpperCase() + name.slice(1), color]),
+        ...(base?.content?.band_srr_db?.songs ? [["Baseline songs", COLORS.baseline, dashed]] : [])]);
+      y += PANEL_HEIGHT;
+
+      // 5b. Each piece of content on its own.
+      const names = Object.keys(content.sections).filter(name => name !== "songs");
+      const pieces = {
+        label: "Content",
+        position: index => (index + 0.5) / names.length,
+        ticks: names.map((name, index) => [index, name]),
+      };
+      map = panel(ctx, y, "Null test by content",
+        `  signal to residue · transients' pre-echo median ${fmt(content.pre_echo_db?.median_db, 1, " dB")}, post-echo ${fmt(content.post_echo_db?.median_db, 1, " dB")}`,
+        pieces, axisRange([names.map(name => content.sections[name].srr_db)], [0, 60]), "Signal to residue (dB)");
+      ctx.font = `22px ${FONT}`; ctx.textAlign = "center"; ctx.textBaseline = "bottom";
+      names.forEach((name, index) => {
+        const value = content.sections[name].srr_db;
+        if (!Number.isFinite(value)) return;
+        ctx.fillStyle = name.startsWith("song") ? COLORS.left : COLORS.third;
+        ctx.beginPath(); ctx.arc(map.x(index), map.y(value), 9, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = COLORS.text;
+        ctx.fillText(value.toFixed(1), map.x(index), map.y(value) - 14);
+        const title = content.sections[name].title;
+        if (title) {
+          ctx.save();
+          ctx.fillStyle = COLORS.muted; ctx.font = `18px ${FONT}`; ctx.textBaseline = "top";
+          ctx.fillText(title.slice(0, 22), map.x(index), map.box.y + 8);
+          ctx.restore();
+        }
+      });
+      y += PANEL_HEIGHT;
+    }
 
     // 6. Network timeline during the capture.
     if (samples.length) {

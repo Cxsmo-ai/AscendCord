@@ -6,10 +6,19 @@ const Lab = globalThis.AscendCordLab ?? null;
 const LAB_HISTORY_KEY = "ascendcordLabHistory";
 const LAB_HISTORY_LIMIT = 12;
 // A program 2 pass lasts about 66 s; finding the first silence can take one more pass.
-const LAB_MAX_CAPTURE_MS = 230_000;
+// Two passes plus up to one more to reach the first silence; program 3 passes run about 76 s
+// without songs and about 100 s with them.
+const LAB_MAX_CAPTURE_MS = 330_000;
 const LAB_PASSES = 2;
 // The page analyses 16384 samples (341 ms at 48 kHz) at a time.
 const LAB_WINDOW_HOLD_MS = 400;
+// Null-test reports from the page are numbers only; anything larger is not a report.
+const LAB_CONTENT_MAX_BYTES = 32_768;
+// Song clips AscendCord plays in a lab test, fetched once per set and handed to the page.
+let labSongs = null;
+let labSongsKey = "";
+let labSongsRequest = null;
+
 const DEV_REQUESTS = Object.freeze({
   diagnostics: "tesktop-read-diagnostics",
   history: "tesktop-read-lab-history",
@@ -116,9 +125,9 @@ function beginTest(automatic = false, tabId = null) {
     sender_ssrc: latestSenderSsrc,
     tab_id: Number.isInteger(tabId) ? tabId : null,
     automatic,
-    program: latestSender?.test_program === 2 && Lab ? 2 : 1,
-    return_path: latestSender?.test_program === 2 && Lab && latestSender?.return_lab_supported === true,
-    lab: latestSender?.test_program === 2 && Lab ? Lab.createLab() : null,
+    program: labProgram() ? Lab.PROGRAM.version : 1,
+    return_path: labProgram() && latestSender?.return_lab_supported === true,
+    lab: labProgram() ? Lab.createLab() : null,
     analysis_sample_rate_hz: null,
     samples: [],
   };
@@ -134,6 +143,7 @@ function finishTest() {
   completedTest = activeTest;
   activeTest = null;
   const measurementLab = completedTest.lab ? Lab.finalizeLab(completedTest.lab) : null;
+  if (measurementLab) measurementLab.content = Lab.combineContent(completedTest.content_reports);
   const curve = measurementLab
     ? curveFromLab(measurementLab, completedTest)
     : [...capturedCurves.values()].find(item =>
@@ -193,6 +203,11 @@ function finishTest() {
 }
 
 /** The settings a run was made with, so two runs can be told apart and compared. */
+/** AscendCord sends the measurement program this extension analyses. */
+function labProgram() {
+  return Boolean(Lab) && latestSender?.test_program === Lab.PROGRAM.version;
+}
+
 function describeSender(sender) {
   if (!sender || typeof sender !== "object") return null;
   const keep = {};
@@ -376,11 +391,13 @@ function setCurveCapture(active, tabId = latestSpectrum?.tabId) {
   curveCaptureActive = active;
   if (active) capturedCurves.clear();
   if (Number.isInteger(tabId)) {
+    // The page needs the songs before it renders the program for the return path.
+    if (active) sendLabSongs(tabId);
     chrome.tabs.sendMessage(tabId, {
       kind: "tesktop-curve-capture", active,
     }).catch(() => {});
     // Program 2 also plays back from the browser so AscendCord measures what it receives.
-    const returnPath = active && activeTest?.program === 2 &&
+    const returnPath = active && activeTest?.program === Lab?.PROGRAM.version &&
       latestSender?.return_lab_supported === true;
     if (returnPath || !active) {
       chrome.tabs.sendMessage(tabId, {
@@ -393,7 +410,7 @@ function setCurveCapture(active, tabId = latestSpectrum?.tabId) {
 /** AscendCord's measurement of the program the browser sent back, bounded before keeping. */
 function returnLab() {
   const report = latestSender?.return_lab;
-  if (!report || typeof report !== "object" || report.version !== 2) return null;
+  if (!report || typeof report !== "object" || report.version !== Lab?.PROGRAM.version) return null;
   return JSON.stringify(report).length <= 65_536 ? report : null;
 }
 
@@ -413,11 +430,57 @@ function trackSenderHealth(test, sender) {
   }
 }
 
+function base64(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+/** Fetches the song clips named in AscendCord's status, once per set. */
+function refreshLabSongs(manifest) {
+  const list = Array.isArray(manifest) ? manifest.slice(0, 16) : [];
+  const key = JSON.stringify(list);
+  if (!list.length || key === labSongsKey || labSongsRequest) return;
+  labSongsRequest = fetch(`${BASE}/v1/lab/songs`, { cache: "no-store", credentials: "omit" })
+    .then(response => response.ok ? response.arrayBuffer() : null)
+    .then(buffer => {
+      const frames = list.map(item => Math.max(0, Math.floor(Number(item?.frames) || 0)));
+      if (!buffer || buffer.byteLength !== frames.reduce((sum, n) => sum + n, 0) * 4) return;
+      labSongs = {
+        names: list.map(item => String(item?.name ?? "").slice(0, 64)),
+        frames,
+        pcm: base64(new Uint8Array(buffer)),
+      };
+      labSongsKey = key;
+      if (curveCaptureActive) sendLabSongs(latestSpectrum?.tabId);
+    })
+    .catch(() => {})
+    .finally(() => { labSongsRequest = null; });
+}
+
+function sendLabSongs(tabId) {
+  if (!labSongs || !Number.isInteger(tabId)) return;
+  chrome.tabs.sendMessage(tabId, { kind: "tesktop-lab-songs", songs: labSongs }).catch(() => {});
+}
+
+function sanitizeLabContent(report) {
+  if (!report || typeof report !== "object") return null;
+  try {
+    const text = JSON.stringify(report);
+    return text.length <= LAB_CONTENT_MAX_BYTES ? JSON.parse(text) : null;
+  } catch {
+    return null;
+  }
+}
+
 function updateSenderStatus(status) {
   latestSenderSsrc = Number.isInteger(status?.sender?.audio_ssrc)
     ? status.sender.audio_ssrc : null;
   latestSender = status?.sender ?? null;
   if (activeTest?.lab) trackSenderHealth(activeTest, latestSender);
+  if (latestSender?.lab_songs) refreshLabSongs(latestSender.lab_songs);
   if (activeTest && activeTest.sender_ssrc == null && latestSenderSsrc != null) {
     activeTest.sender_ssrc = latestSenderSsrc;
   }
@@ -547,8 +610,11 @@ function collectTestSamples(report, tabId) {
   }
   const elapsed = Date.now() - autoCaptureStartedAt;
   const returnDone = activeTest?.return_path !== true || (returnLab()?.passes ?? 0) >= LAB_PASSES;
+  // Program 3 also waits for the null test of each pass's content.
+  const contentDone = activeTest?.program !== 3 ||
+    (activeTest.content_reports ?? []).filter(report => report.version === 1).length >= LAB_PASSES;
   const labDone = activeTest?.lab
-    ? (activeTest.lab.passes >= LAB_PASSES && returnDone) || elapsed >= LAB_MAX_CAPTURE_MS : null;
+    ? (activeTest.lab.passes >= LAB_PASSES && returnDone && contentDone) || elapsed >= LAB_MAX_CAPTURE_MS : null;
   if (autoSweepRunStarted && activeTest && autoCaptureStartedAt > 0 &&
       (labDone ?? elapsed >= AUTO_CAPTURE_DURATION_MS)) {
     finishTest();
@@ -759,6 +825,8 @@ function handleMessage(message, sender, sendResponse) {
           }
           Lab.addWindow(activeTest.lab, sanitizeLabWindow(raw?.lab_window),
             now < (activeTest.disturbed_until_ms ?? 0));
+          const content = sanitizeLabContent(raw?.lab_content);
+          if (content && (activeTest.content_reports ??= []).length < 8) activeTest.content_reports.push(content);
           continue;
         }
         const curveKey = `${sender.tab.id}:${stream.ssrc}`;
@@ -794,10 +862,12 @@ function handleMessage(message, sender, sendResponse) {
     }
     lastSentByTab.set(sender.tab.id, now);
 
+    // AscendCord's receiver schema rejects unknown fields: the lab's extras stay here.
     const desktopReport = {
       ...message.report,
       streams: message.report.streams.map(({
-        spectrum_dbfs, peak_frequency_hz, peak_dbfs, analysis_sample_rate_hz, lab_window, ...stream
+        spectrum_dbfs, peak_frequency_hz, peak_dbfs, analysis_sample_rate_hz, lab_window,
+        lab_content, stretched_samples_delta, ...stream
       }) => stream),
     };
     request("/v1/receiver", {
