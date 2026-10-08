@@ -283,7 +283,8 @@ function sanitizeLabWindow(window) {
   if (window.kind !== "tone" || !["sweep", "ladder"].includes(window.grid)) {
     return { kind: "unknown" };
   }
-  const limit = window.grid === "sweep" ? 48 : 8;
+  const limit = window.grid === "sweep"
+    ? Lab?.PROGRAM.sweep_hz.length ?? 48 : Lab?.PROGRAM.ladder_hz.length ?? 8;
   if (!Number.isInteger(window.index) || window.index < 0 || window.index >= limit) {
     return { kind: "unknown" };
   }

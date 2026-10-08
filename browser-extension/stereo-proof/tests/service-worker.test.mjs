@@ -438,6 +438,8 @@ test("program 3 captures until two full passes and keeps a comparable lab report
   assert.ok(Math.abs(lab.summary.median_separation_db - 50) < 0.01);
   assert.equal(lab.summary.stereo_preserved, true);
   assert.ok(Math.abs(lab.linearity.fit.slope - 1) < 0.001);
+  assert.equal(lab.linearity.gain_db.filter(Number.isFinite).length, PROGRAM.ladder_dbfs.length,
+    "every ladder step, up to +3 dBFS, is measured");
   assert.ok(Math.abs(lab.summary.noise_floor_dbfs + 110) < 0.01);
   assert.equal(diagnostics.sender_settings.opus_bitrate_target_bps, 510_000);
   assert.equal("audio_ssrc_secret" in diagnostics.sender_settings, false);
