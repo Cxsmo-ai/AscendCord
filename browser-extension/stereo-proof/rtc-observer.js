@@ -386,6 +386,29 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
   let returnPathBusy = false;
   let returnPathState = "off";
 
+  // Discord replaces its sender's track on its own (speaking changes, device changes). While
+  // the return path plays, such a call on a swapped sender is kept as the track to restore
+  // instead of being applied; the observer's own swaps use the native method.
+  let nativeReplaceTrack = null;
+
+  function swapTrack(sender, track) {
+    return nativeReplaceTrack && sender instanceof globalThis.RTCRtpSender
+      ? nativeReplaceTrack.call(sender, track)
+      : sender.replaceTrack(track);
+  }
+
+  function hookReplaceTrack() {
+    const prototype = globalThis.RTCRtpSender?.prototype;
+    if (nativeReplaceTrack || typeof prototype?.replaceTrack !== "function") return;
+    const native = prototype.replaceTrack;
+    nativeReplaceTrack = native;
+    prototype.replaceTrack = function (track) {
+      if (!returnPath?.replaced.has(this)) return native.call(this, track);
+      returnPath.replaced.set(this, track ?? null);
+      return Promise.resolve();
+    };
+  }
+
   function audioSenders() {
     const senders = new Set();
     for (const peer of peers) {
@@ -431,19 +454,20 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
         source.connect(destination);
         source.start();
         returnPath = { source, track: destination.stream.getAudioTracks()[0], replaced: new Map() };
+        hookReplaceTrack();
       }
       const path = returnPath;
       for (const sender of senders) {
         if (sender.track === path.track) continue;
         const original = sender.track;
         try {
-          await sender.replaceTrack(path.track);
+          await swapTrack(sender, path.track);
         } catch {
           continue;
         }
         if (returnPath !== path) {
           // The test ended while this swap was in flight.
-          try { await sender.replaceTrack(original); } catch {}
+          try { await swapTrack(sender, original); } catch {}
           return;
         }
         path.replaced.set(sender, original ?? path.replaced.get(sender) ?? null);
@@ -471,7 +495,7 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
     for (const [sender, original] of replaced) {
       // Leave a track Discord set after the swap in place.
       if (sender.track !== track) continue;
-      try { await sender.replaceTrack(original); } catch {}
+      try { await swapTrack(sender, original); } catch {}
     }
     try { source.stop(); } catch {}
     track.stop();

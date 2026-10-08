@@ -241,3 +241,64 @@ test("during a lab test Discord's microphone is a steady tone that answers for t
   arm(false);
   assert.equal((await navigator.mediaDevices.getUserMedia({ audio: true })).getAudioTracks()[0], microphone);
 });
+
+test("Discord replacing its track during the return path is held until the test ends", async () => {
+  const labSource = await readFile(new URL("../lab.js", import.meta.url), "utf8");
+  const source = await readFile(new URL("../rtc-observer.js", import.meta.url), "utf8");
+  const listeners = [];
+  const window = {
+    addEventListener(kind, listener) { if (kind === "message") listeners.push(listener); },
+    postMessage() {},
+  };
+  class RTCRtpSender {
+    constructor(track) { this.track = track; }
+    async replaceTrack(track) { this.track = track; }
+  }
+  const microphone = { kind: "audio", id: "mic" };
+  const sender = new RTCRtpSender(microphone);
+  class Peer {
+    addEventListener() {}
+    getSenders() { return [sender]; }
+    getReceivers() { return []; }
+    getStats() { return Promise.resolve(new Map()); }
+  }
+  const programTrack = { kind: "audio", id: "program", stop() {} };
+  class AudioContext {
+    constructor() { this.state = "running"; this.sampleRate = 48_000; }
+    resume() { return Promise.resolve(); }
+    createBuffer(channels, frames) { return { channels, frames, copyToChannel() {} }; }
+    createBufferSource() { return { connect() {}, start() {}, stop() {} }; }
+    createMediaStreamDestination() { return { stream: { getAudioTracks: () => [programTrack] } }; }
+  }
+  const context = vm.createContext({
+    window, AudioContext, RTCRtpSender, MediaStream: class {},
+    location: { origin: "https://discord.com" },
+    setInterval: () => ({}), clearInterval() {}, setTimeout() {},
+  });
+  window.RTCPeerConnection = Peer;
+  vm.runInContext(labSource, context);
+  vm.runInContext(source, context);
+  new window.RTCPeerConnection();
+  const control = returnPath => listeners.forEach(listener => listener({
+    source: window, origin: "https://discord.com",
+    data: { source: "tesktop-stereo-proof-control", returnPath },
+  }));
+  const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+
+  control(true);
+  await settle();
+  assert.equal(sender.track, programTrack);
+
+  // Discord sets a new microphone track mid-test: the program keeps playing.
+  const newMicrophone = { kind: "audio", id: "new-mic" };
+  await sender.replaceTrack(newMicrophone);
+  assert.equal(sender.track, programTrack);
+
+  control(false);
+  await settle();
+  assert.equal(sender.track, newMicrophone, "Discord's latest track is applied when the test ends");
+
+  // After the test Discord's calls go straight through again.
+  await sender.replaceTrack(microphone);
+  assert.equal(sender.track, microphone);
+});
