@@ -301,3 +301,23 @@ test("the null test takes a fractional-sample delay out", () => {
   assert.ok(report.sections.music.srr_without_delay_db < 40, "without the fit the delay shows as residue");
   assert.equal(report.slipped_blocks, 0);
 });
+
+test("the null test follows slow clock drift without counting it as slips", () => {
+  const ratio = 1 + 30e-6, taps = 24; // a playout clock 30 ppm off: 11 samples over the content
+  const { left, right } = contentPath((o, ref) => {
+    const pos = o * ratio + 0.3, base = Math.floor(pos);
+    let l = 0, r = 0;
+    for (let k = -taps; k <= taps; k++) {
+      const j = base + k;
+      if (j < 0 || j >= ref.frames) continue;
+      const x = pos - j;
+      const weight = (x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x)) * (0.5 + 0.5 * Math.cos(Math.PI * x / (taps + 1)));
+      l += ref.left[j] * weight; r += ref.right[j] * weight;
+    }
+    return [l, r];
+  });
+  const report = lab.analyzeContent(left, right, RATE);
+  assert.equal(report.slipped_blocks, 0);
+  assert.ok(report.sections.music.srr_db > 50, `music ${report.sections.music.srr_db}`);
+  assert.ok(report.sections.speech.srr_db > 45, `speech ${report.sections.speech.srr_db}`);
+});

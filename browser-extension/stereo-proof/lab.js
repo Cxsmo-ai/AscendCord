@@ -718,6 +718,7 @@
   const NULL_MATCH = 0.95;
   const NULL_REACQUIRE_MATCH = 0.8;
   const NULL_MOVE_MARGIN = 0.02;
+  const NULL_DRIFT = 2;
   // A block's delay fit counts only where its spectrum stays coherent with the source;
   // elsewhere (noise, near-silence) the run's median delay of coherent blocks is used.
   const DELAY_COHERENCE = 0.9;
@@ -867,9 +868,23 @@
           }
           if (wideScore > NULL_REACQUIRE_MATCH && wideScore > bestScore + 0.1) best = wideBest;
         }
+        // Slow drift: step toward the correlation peak whenever it lies more than half a
+        // sample away, so the fractional delay fit always has the rest within reach.
+        for (let step = 0; step < 2; step++) {
+          const before = match(start, best - 1, refEnergy), at = match(start, best, refEnergy);
+          const after = match(start, best + 1, refEnergy);
+          const curvature = before - 2 * at + after;
+          if (!(curvature < 0)) break;
+          const peak = (before - after) / (2 * curvature);
+          if (peak > 0.5) best += 1;
+          else if (peak < -0.5) best -= 1;
+          else break;
+        }
       }
       if (start + best < 0 || start + best + NULL_BLOCK > length) break;
-      blocks.push({ start, lag: best, slipped: best !== current, refEnergy });
+      // A clock-drift resampler moves the timing a sample at a time; only a bigger move is a
+      // jitter-buffer jump that leaves the block half in each position.
+      blocks.push({ start, lag: best, slipped: Math.abs(best - current) > NULL_DRIFT, refEnergy });
       current = best;
       yield;
     }
@@ -946,7 +961,7 @@
         gains.set(section.name, g);
       }
       const residues = [];
-      const coherentDelays = [], waiting = [];
+      const coherentDelays = [], waiting = [], coherent = [];
       for (const block of blocks) {
         if (block.slipped) continue;
         const section = sectionOf(block.start);
@@ -970,6 +985,7 @@
         if (fitted.coherence >= DELAY_COHERENCE) {
           residues.push(blockResidue(block, section.name, channels, fitted.delay));
           coherentDelays.push(fitted.delay);
+          coherent.push({ start: block.start, total: block.lag + fitted.delay });
         } else {
           waiting.push({ block, section: section.name, channels });
         }
@@ -977,8 +993,15 @@
       }
       coherentDelays.sort((a, b) => a - b);
       const runDelay = coherentDelays.length ? coherentDelays[coherentDelays.length >> 1] : 0;
+      // An incoherent block takes the total delay of the nearest coherent block: the timing
+      // drifts, so the run's median would be off at the ends.
       for (const { block, section, channels } of waiting) {
-        residues.push(blockResidue(block, section, channels, runDelay));
+        let nearest = null;
+        for (const c of coherent) {
+          if (!nearest || Math.abs(c.start - block.start) < Math.abs(nearest.start - block.start)) nearest = c;
+        }
+        const delay = nearest ? Math.max(-1, Math.min(1, nearest.total - block.lag)) : runDelay;
+        residues.push(blockResidue(block, section, channels, delay));
         yield;
       }
       delayOfRun = runDelay;
@@ -1136,6 +1159,7 @@
       passes: good.length,
       blocks: total("blocks"),
       slipped_blocks: total("slipped_blocks"),
+      delay_samples: median(good.map(report => report.delay_samples)),
       dropout_blocks: total("dropout_blocks"),
       gaps: total("gaps"),
       sections,

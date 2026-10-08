@@ -25,6 +25,7 @@ param(
 	[string]$ExtensionId = "jbchdifpgimmmmlnimidbfockpbigfni"
 )
 $ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 $bridge = Join-Path $env:LOCALAPPDATA "AscendCord\voice-bridge"
 $report = Join-Path $bridge "lab-report.json"
 $exePath = (Resolve-Path $Exe).Path
