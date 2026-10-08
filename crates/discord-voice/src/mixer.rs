@@ -58,6 +58,9 @@ impl Mixer {
 			.find(|s| s.ssrc == ssrc)
 			.map(|s| s.user)
 	}
+	pub fn has_user(&self, user: u64) -> bool {
+		self.speakers.iter().any(|s| s.user == user)
+	}
 	pub fn push(&mut self, ssrc: u32, sequence: u16, opus: Vec<u8>) {
 		if let Some(speaker) = self.speakers.iter_mut().find(|s| s.ssrc == ssrc) {
 			speaker.jitter.push(sequence, opus);
