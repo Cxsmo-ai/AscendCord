@@ -179,8 +179,9 @@
     canvas.height = top + panels * PANEL_HEIGHT + 40;
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = COLORS.background; ctx.fillRect(0, 0, canvas.width, canvas.height);
-    header(ctx, report, settings, baseline, title);
     const base = baseline?.[baselineKey];
+    // A baseline run without this direction's report draws nothing, so it is not named.
+    header(ctx, report, settings, base ? baseline : null, title);
     let y = top;
     const dashed = [14, 10];
 
