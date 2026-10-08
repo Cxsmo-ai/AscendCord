@@ -1139,6 +1139,17 @@ pub mod returns {
 		}
 	}
 
+	/// Frames of a remote speaker that had no audio this tick (DTX silence or loss). They are
+	/// fed as concealed zeros so the analysis keeps real time without measuring them.
+	pub(crate) fn feed_gap(ssrc: u32, frames: usize) {
+		if frames == 0 || !ACTIVE.load(Ordering::Acquire) {
+			return;
+		}
+		if let Some(shared) = SHARED.get() {
+			let _ = shared.send.try_send((ssrc, vec![0.0; frames * 2], true));
+		}
+	}
+
 	/// The best-matching remote speaker's report so far.
 	pub fn report() -> Option<serde_json::Value> {
 		SHARED.get()?.report.lock().ok()?.clone()

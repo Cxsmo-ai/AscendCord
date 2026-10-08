@@ -153,6 +153,8 @@ impl Mixer {
 				filled += count;
 				active |= count != 0;
 			}
+			// Silence sent with DTX arrives as almost no packets; keep the lab's timeline whole.
+			crate::lab::returns::feed_gap(speaker.ssrc, output.len() / 2 - filled);
 			speaker.activity = crate::activity::hold(energy, speaker.activity);
 		}
 		// ponytail: hard limiting bounds simultaneous speakers; add a soft limiter if clipping is audible.
