@@ -12,6 +12,12 @@
       console.warn("[AscendCord Stereo Proof] Extension message failed:",
         String(error?.message ?? error).slice(0, 180));
     };
+    // A reloaded extension leaves this script behind; during a lab test the page reloads so
+    // the new scripts run.
+    if (!chrome.runtime?.id) {
+      if (labChannel) location.reload();
+      return;
+    }
     try {
       const pending = chrome.runtime.sendMessage(message, response => {
         const error = chrome.runtime.lastError;
@@ -28,6 +34,26 @@
   // independently of whether the main-world WebRTC observer is working.
   // The reply says whether AscendCord is running a lab test, which the page needs before
   // Discord opens the microphone.
+  // Unattended lab runs: while AscendCord runs a sweep test, a tab open on its test channel
+  // joins the voice channel by itself (and closes Discord's after-call survey), and when the
+  // extension is reloaded the tab reloads so the new scripts take over.
+  let labChannel = null;
+  let lastJoinAt = 0;
+  const inVoice = () => [...document.querySelectorAll("button[aria-label]")]
+    .some(button => /^disconnect$/i.test(button.getAttribute("aria-label") ?? ""));
+  const autoJoin = () => {
+    if (!labChannel || !location.pathname.endsWith(`/${labChannel}`)) return;
+    for (const dialog of document.querySelectorAll("[role='dialog']")) {
+      if (/how'?d the call go/i.test(dialog.textContent ?? "")) {
+        dialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }));
+      }
+    }
+    if (inVoice() || Date.now() - lastJoinAt < 10_000) return;
+    const join = [...document.querySelectorAll("button")].find(button => /^\s*join voice\s*$/i.test(button.textContent ?? ""));
+    if (!join) return;
+    lastJoinAt = Date.now();
+    join.click();
+  };
   const heartbeat = () => sendRuntimeMessage({
     kind: "tesktop-content-bridge-heartbeat",
   }, response => {
@@ -36,6 +62,8 @@
       source: "tesktop-stereo-proof-control",
       labArmed: response.lab_armed,
     }, location.origin);
+    labChannel = typeof response.lab_channel === "string" ? response.lab_channel : null;
+    autoJoin();
   });
   heartbeat();
   setInterval(heartbeat, 3000);

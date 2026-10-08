@@ -355,6 +355,7 @@ test("program 3 captures until two full passes and keeps a comparable lab report
   let onMessage;
   let now = 50_000;
   let forwarded;
+  let labReport;
   let senderSweep = true;
   const storage = {};
   const chrome = {
@@ -377,7 +378,8 @@ test("program 3 captures until two full passes and keeps a comparable lab report
           audio_ssrc_secret: "not kept",
         } }) };
       }
-      if (!url.endsWith("/v1/diagnostics")) forwarded = JSON.parse(options.body);
+      if (url.endsWith("/v1/lab/report")) labReport = JSON.parse(options.body);
+      else if (!url.endsWith("/v1/diagnostics")) forwarded = JSON.parse(options.body);
       return { ok: true, status: 204 };
     },
   });
@@ -450,6 +452,8 @@ test("program 3 captures until two full passes and keeps a comparable lab report
   assert.equal(lab.content.passes, 2, "each pass's null test is kept");
   assert.equal(lab.content.sections.music.srr_db, 30);
   await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(labReport.measurement_lab.passes, 2, "AscendCord receives the finished run");
+  assert.equal(labReport.measurement_lab.content.passes, 2);
   const history = await send({ kind: "tesktop-read-lab-history" });
   assert.equal(history.history.length, 1);
   assert.equal(history.history[0].measurement_lab.passes, 2);

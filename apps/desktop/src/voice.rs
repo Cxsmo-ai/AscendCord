@@ -162,6 +162,7 @@ impl VoiceBridge {
 				"test_sweep_active": test_sweep,
 				// The receiver analyses measurement program 2 (see test_sweep.rs and lab.js).
 				"test_program": if test_sweep { discord_voice::test_sweep::PROGRAM_VERSION } else { 0 },
+				"test_channel_id": if test_sweep { discord_voice::audio::test_sweep_channel().map(|id| id.to_string()) } else { None },
 				"lab_songs": if test_sweep { discord_voice::test_sweep::songs().map(|songs| songs.manifest()) } else { None },
 				// What arrives from a browser that plays the program back (browser to AscendCord).
 				"return_lab_supported": test_sweep,

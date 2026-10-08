@@ -249,7 +249,6 @@ function curveFromLab(report, test) {
 }
 
 function saveLabHistory(test, report, settings, returned = null) {
-  if (!chrome.storage?.local?.get || !chrome.storage?.local?.set) return;
   const entry = {
     id: test.id,
     finished_at_ms: test.ended_at_ms,
@@ -259,6 +258,13 @@ function saveLabHistory(test, report, settings, returned = null) {
     sender_health: test.sender_health ?? null,
     network: test.samples?.length ? summarizeSamples(test.samples) : null,
   };
+  // AscendCord keeps the finished run as lab-report.json, for scripts that run tests unattended.
+  request("/v1/lab/report", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(entry),
+  }).catch(error => { diagnostics.forwardError = String(error?.message ?? error).slice(0, 180); });
+  if (!chrome.storage?.local?.get || !chrome.storage?.local?.set) return;
   chrome.storage.local.get(LAB_HISTORY_KEY).then(saved => {
     const history = Array.isArray(saved?.[LAB_HISTORY_KEY]) ? saved[LAB_HISTORY_KEY] : [];
     const next = [entry, ...history.filter(item => item?.id !== entry.id)].slice(0, LAB_HISTORY_LIMIT);
@@ -728,6 +734,9 @@ function handleMessage(message, sender, sendResponse) {
     sendResponse({
       ok: true,
       lab_armed: latestSender?.test_sweep_active === true && latestSender?.return_lab_supported === true,
+      // The channel AscendCord tests in, so the tab can join it without anyone clicking.
+      lab_channel: latestSender?.test_sweep_active === true && /^\d{1,20}$/.test(latestSender?.test_channel_id ?? "")
+        ? latestSender.test_channel_id : null,
     });
     return;
   }
