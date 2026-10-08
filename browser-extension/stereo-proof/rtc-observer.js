@@ -157,10 +157,11 @@ function fitSinePeak(samples, frequencyHz, sampleRate) {
       recorder.filled = 0;
       recorder.nextTimestamp = null;
     }
-    // A gap between frames is kept as silence so time stays true.
+    // Frame timestamps wobble by a few milliseconds; only a missing stretch of 20 ms or more
+    // is a real gap, kept as silence so time stays true.
     if (recorder.nextTimestamp !== null) {
       const gap = Math.round((data.timestamp - recorder.nextTimestamp) * rate / 1e6);
-      if (gap > 0 && gap < rate) {
+      if (gap >= rate / 50 && gap < rate) {
         recorder.gaps++;
         pushFrames(recorder, new Float32Array(gap), new Float32Array(gap));
       }
