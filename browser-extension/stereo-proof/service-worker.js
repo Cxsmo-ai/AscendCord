@@ -492,7 +492,11 @@ function updateSenderStatus(status) {
   if (activeTest && activeTest.sender_ssrc == null && latestSenderSsrc != null) {
     activeTest.sender_ssrc = latestSenderSsrc;
   }
-  const sweepNow = latestSender?.test_sweep_active === true && latestSender?.send_enabled === true;
+  // A test starts once AscendCord sends the program, and ends only when its sweep mode ends:
+  // AscendCord pauses sending while it is alone in the call (the browser rejoining), and
+  // that pause is not the end of the test.
+  const sweepActive = latestSender?.test_sweep_active === true;
+  const sweepNow = sweepActive && latestSender?.send_enabled === true;
   // AscendCord closed mid-sweep never reports the sweep ending; its next session has a new
   // sender SSRC. Close what was left of the old run and arm for the new one.
   if (sweepNow && autoSweepActive && latestSenderSsrc != null && autoSweepSsrc != null &&
@@ -510,7 +514,7 @@ function updateSenderStatus(status) {
     completedExport = null;
     completedExportPersisted = false;
     clearCompletedExport();
-  } else if (!sweepNow && autoSweepActive) {
+  } else if (!sweepActive && autoSweepActive) {
     autoSweepActive = false;
     if (autoSweepRunStarted) finishTest();
     autoSweepRunStarted = false;

@@ -609,3 +609,45 @@ test("the developer channel answers Discord tabs only and can reload the extensi
   await new Promise(resolve => setTimeout(resolve, 150));
   assert.equal(reloads, 1);
 });
+
+test("AscendCord pausing its send while alone does not end the capture", async () => {
+  const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
+  let onMessage;
+  let now = 200_000;
+  let sending = true, sweeping = true;
+  const chrome = {
+    runtime: { onMessage: { addListener(listener) { onMessage = listener; } } },
+    tabs: { onRemoved: { addListener() {} }, sendMessage: async () => ({}) },
+  };
+  vm.runInNewContext(source, {
+    chrome, URL, AbortController, setTimeout, clearTimeout,
+    Date: class extends Date { static now() { return now; } },
+    fetch: async url => url.endsWith("/v1/status")
+      ? { ok: true, status: 200, json: async () => ({ sender: { audio_ssrc: 400, test_sweep_active: sweeping, send_enabled: sending } }) }
+      : { ok: true, status: 204 },
+  });
+  const sender = { tab: { id: 6, url: "https://discord.com/channels/1/2" } };
+  const send = message => new Promise(resolve => {
+    const result = onMessage(message, sender, resolve);
+    if (result !== true) resolve(undefined);
+  });
+  const report = () => ({ protocol: 1, sampled_at_ms: now, peer_connections: 1,
+    streams: [{ ssrc: 400, codec: "audio/opus", channels: 2, track_channels: 2, active: true }] });
+  await send({ kind: "tesktop-receiver-report", report: report() });
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal((await send({ kind: "tesktop-read-diagnostics" })).test.running, true);
+  // The browser leaves and rejoins: AscendCord is alone for a moment and pauses sending.
+  sending = false;
+  now += 2_000;
+  await send({ kind: "tesktop-read-status" });
+  assert.equal((await send({ kind: "tesktop-read-diagnostics" })).test.running, true, "a send pause keeps the test");
+  sending = true;
+  now += 2_000;
+  await send({ kind: "tesktop-read-status" });
+  assert.equal((await send({ kind: "tesktop-read-diagnostics" })).test.running, true);
+  // AscendCord ending its sweep ends the test.
+  sweeping = false;
+  now += 2_000;
+  await send({ kind: "tesktop-read-status" });
+  assert.equal((await send({ kind: "tesktop-read-diagnostics" })).test.running, false);
+});
